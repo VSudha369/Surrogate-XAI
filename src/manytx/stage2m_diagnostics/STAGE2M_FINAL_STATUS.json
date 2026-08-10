@@ -1,0 +1,21 @@
+{
+  "artifact_hash_manifest_sha256": "0a8853d782006ce8af2d7b798a61c1e141afbeb55066cb70115ae41c8d24f16a",
+  "benchmark_sha256": "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9",
+  "completed_utc": "2026-08-09T19:33:11.692466+00:00",
+  "failed_gates": [],
+  "final_test_model_evaluation_performed": false,
+  "final_test_threshold_selection_performed": false,
+  "recommendation": "PROCEED_STAGE_2_6M_WITH_CAUTION",
+  "script_sha256": "46c95bbf9fb6806a5f463b4e173434a5f03f013367b1bcd38ebb73c07d0f67ba",
+  "stage_version": "1.0.5",
+  "status": "MANYTX_STAGE2M_READY",
+  "strict_test_guard": {
+    "events": [],
+    "policy": "strict zero-day signals, labels, indices, and features are forbidden",
+    "status": "PASS",
+    "strict_index_arrays_loaded": false,
+    "strict_test_feature_reads": 0,
+    "strict_test_label_reads": 0,
+    "strict_test_signal_reads": 0
+  }
+}

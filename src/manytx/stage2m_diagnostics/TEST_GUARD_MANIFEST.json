@@ -1,0 +1,9 @@
+{
+  "events": [],
+  "policy": "strict zero-day signals, labels, indices, and features are forbidden",
+  "status": "PASS",
+  "strict_index_arrays_loaded": false,
+  "strict_test_feature_reads": 0,
+  "strict_test_label_reads": 0,
+  "strict_test_signal_reads": 0
+}

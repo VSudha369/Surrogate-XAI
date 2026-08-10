@@ -1,0 +1,219 @@
+    def _indices(self, mask: pd.Series) -> np.ndarray:
+        return np.flatnonzero(mask.to_numpy()).astype(np.int64)
+
+    def _choose_holdout_value(self, column: str, mask: pd.Series) -> Optional[str]:
+        values = self.meta.loc[mask, column]
+        counts = values.value_counts()
+        counts = counts[~counts.index.astype(str).isin(["NOT_REPRESENTED", "nan", "None"])]
+        if len(counts) < 2:
+            return None
+        ranked = sorted(
+            counts.index.astype(str),
+            key=lambda v: (
+                abs(int(counts.loc[v]) - int(counts.median())),
+                sha256_bytes(f"{self.cfg.partition_seed}:{column}:{v}".encode("utf-8")),
+            ),
+        )
+        return ranked[0]
+
+    def stage08_tensorization(self) -> None:
+        stage = "stage_08_preprocessing_tensorization"
+        assert self.accessor is not None
+        known_txs = sorted(self.meta.loc[self.meta["tx_partition"].eq("KNOWN_TRAIN_TX"), "transmitter_id"].unique().astype(str))
+        self.mappings = {
+            "transmitter_id_to_index": {tx: i for i, tx in enumerate(known_txs)},
+            "receiver_id_to_index": {rx: i for i, rx in enumerate(sorted(self.meta["receiver_id"].unique().astype(str)))},
+            "day_id_to_index": {day: i for i, day in enumerate(sorted(self.meta["day_id"].unique().astype(str)))},
+        }
+        for name, mapping in self.mappings.items():
+            atomic_write_json(self.dirs["mappings"] / f"{name}.json", mapping)
+        self.meta["known_class_index"] = self.meta["transmitter_id"].map(self.mappings["transmitter_id_to_index"]).fillna(-1).astype(int)
+        first = canonicalize_iq(self.accessor.raw_sample(0))
+        n, c, l = len(self.meta), int(first.shape[0]), int(first.shape[1])
+        with atomic_output(self.h5_path) as tmp:
+            with h5py.File(tmp, "w") as h5:
+                sig = h5.create_group("signals")
+                meta_group = h5.create_group("metadata")
+                splits = h5.create_group("splits")
+                mappings = h5.create_group("mappings")
+                provenance = h5.create_group("provenance")
+                x_ds = sig.create_dataset(
+                    "X",
+                    shape=(n, c, l),
+                    dtype="float32",
+                    chunks=(min(self.cfg.chunk_rows, n), c, l),
+                    compression=self.cfg.compression,
+                    compression_opts=self.cfg.compression_level,
+                    shuffle=True,
+                )
+                str_dtype = h5py.string_dtype(encoding="utf-8")
+                for start in range(0, n, self.cfg.chunk_rows):
+                    stop = min(n, start + self.cfg.chunk_rows)
+                    block = np.empty((stop - start, c, l), dtype=np.float32)
+                    for offset, i in enumerate(range(start, stop)):
+                        x = canonicalize_iq(self.accessor.raw_sample(i))
+                        if x.shape != (c, l):
+                            raise ScientificAbort(f"Signal shape changed at sample {i}: expected {(c, l)}, got {x.shape}")
+                        block[offset] = per_sample_normalize(x)
+                    x_ds[start:stop] = block
+                for column in [
+                    "sample_id",
+                    "transmitter_id",
+                    "receiver_id",
+                    "day_id",
+                    "session_id",
+                    "equalization_state",
+                    "sample_sha256",
+                    "partition",
+                    "protocol",
+                    "tx_partition",
+                ]:
+                    meta_group.create_dataset(column, data=self.meta[column].astype(str).to_numpy(), dtype=str_dtype)
+                for column in ["source_index", "signal_length", "channels", "known_class_index"]:
+                    meta_group.create_dataset(column, data=self.meta[column].astype(np.int64).to_numpy(), dtype="int64")
+                for column in ["is_train", "is_validation", "is_test", "is_calibration_unknown", "is_strict_zero_day"]:
+                    meta_group.create_dataset(column, data=self.meta[column].astype(bool).to_numpy(), dtype="bool")
+                for name, values in self.protocol_indices.items():
+                    splits.create_dataset(name, data=values.astype(np.int64), dtype="int64")
+                for name, mapping in self.mappings.items():
+                    mappings.attrs[name] = stable_json(mapping)
+                provenance.attrs["benchmark_version"] = BENCHMARK_VERSION
+                provenance.attrs["stage_version"] = STAGE_VERSION
+                provenance.attrs["source_sha256"] = self.source_hash
+                provenance.attrs["config_sha256"] = self.config_hash
+                provenance.attrs["normalization"] = "per_sample_rms_v1_train_independent"
+                provenance.attrs["test_model_evaluation_performed"] = "NO"
+        for name, values in self.protocol_indices.items():
+            atomic_save_npy(self.dirs["splits"] / f"{name}.npy", values)
+        self._write_sample_manifest()
+        policy = {
+            "test_training_access": False,
+            "test_model_selection_access": False,
+            "test_threshold_selection_access": False,
+            "test_diagnostics_access": False,
+            "test_final_evaluation_only": True,
+            "future_stage_requirement": "FINAL_SELECTION_LOCK required before final-test labels are exposed.",
+        }
+        atomic_write_json(self.dirs["manifests"] / "TEST_ACCESS_POLICY.json", policy)
+        self._checkpoint(stage, "PASS", {"summary": "Benchmark tensorization complete", "hdf5_path": str(self.h5_path)})
+
+    def _write_sample_manifest(self) -> None:
+        manifest_cols = [
+            "sample_id",
+            "source_archive",
+            "source_member",
+            "source_index",
+            "transmitter_id",
+            "receiver_id",
+            "day_id",
+            "session_id",
+            "equalization_state",
+            "signal_length",
+            "channels",
+            "dtype",
+            "sample_sha256",
+            "partition",
+            "protocol",
+            "known_or_unknown",
+            "is_train",
+            "is_validation",
+            "is_test",
+            "is_calibration_unknown",
+            "is_strict_zero_day",
+            "normalization_version",
+            "known_class_index",
+        ]
+        sample_manifest = self.meta[manifest_cols].copy()
+        sample_manifest.to_csv(self.dirs["manifests"] / "SAMPLE_MANIFEST.csv", index=False)
+        sample_manifest.to_parquet(self.dirs["manifests"] / "SAMPLE_MANIFEST.parquet", index=False)
+
+    def stage09_verification(self) -> None:
+        stage = "stage_09_frozen_benchmark_verification"
+        if not self.h5_path.exists():
+            raise ScientificAbort("HDF5 benchmark was not written.")
+        with h5py.File(self.h5_path, "r") as h5:
+            x = h5["signals/X"]
+            if x.shape[0] != len(self.meta) or x.shape[1] != 2:
+                raise ScientificAbort(f"HDF5 signal shape verification failed: {x.shape}")
+            for name in self.protocol_indices:
+                if name not in h5["splits"]:
+                    raise ScientificAbort(f"Missing split in HDF5: {name}")
+        train_tx = set(self.meta.loc[self.protocol_indices["train_known_indices"], "transmitter_id"].astype(str))
+        strict_tx = set(self.meta.loc[self.protocol_indices["strict_zero_day_test_indices"], "transmitter_id"].astype(str))
+        cal_tx = set(self.meta.loc[self.protocol_indices["calibration_unknown_indices"], "transmitter_id"].astype(str))
+        if train_tx.intersection(strict_tx):
+            raise ScientificAbort("Strict zero-day transmitter identities appear in Train.")
+        if strict_tx.intersection(cal_tx):
+            raise ScientificAbort("Strict zero-day identities overlap calibration-unknown identities.")
+        split_names = ["train_known_indices", "validation_known_indices", "calibration_unknown_indices", "strict_zero_day_test_indices"]
+        split_hashes: Dict[str, set] = {}
+        for name in split_names:
+            idx = self.protocol_indices[name]
+            split_hashes[name] = set(self.meta.loc[idx, "sample_sha256"].astype(str))
+        cross_leaks = []
+        for i, name_a in enumerate(split_names):
+            for name_b in split_names[i + 1 :]:
+                overlap = split_hashes[name_a].intersection(split_hashes[name_b])
+                if overlap:
+                    cross_leaks.append({"a": name_a, "b": name_b, "overlap_hash_count": len(overlap)})
+        if cross_leaks:
+            atomic_write_json(self.dirs["source_audit"] / "cross_partition_duplicate_leakage.json", cross_leaks)
+            raise ScientificAbort("Cross-partition exact duplicate leakage was detected.")
+        self._checkpoint(
+            stage,
+            "PASS",
+            {
+                "summary": "Frozen benchmark verification complete",
+                "hdf5_shape": list(h5py.File(self.h5_path, "r")["signals/X"].shape),
+                "strict_zero_day_tx_count": len(strict_tx),
+                "known_train_tx_count": len(train_tx),
+                "calibration_unknown_tx_count": len(cal_tx),
+            },
+        )
+
+    def stage10_freeze_reports(self) -> None:
+        stage = "stage_10_freeze_reports_publication"
+        benchmark_sha = sha256_file(self.h5_path)
+        provenance = {
+            "benchmark_version": BENCHMARK_VERSION,
+            "stage_version": STAGE_VERSION,
+            "created_utc": utc_stamp(),
+            "source_archive": str(self.source_path),
+            "source_archive_sha256": self.source_hash,
+            "source_member": self.source_member,
+            "benchmark_hdf5": str(self.h5_path),
+            "benchmark_hdf5_sha256": benchmark_sha,
+            "configuration_sha256": self.config_hash,
+            "python_seed": self.cfg.python_seed,
+            "numpy_seed": self.cfg.numpy_seed,
+            "partition_seed": self.cfg.partition_seed,
+            "package_versions": package_versions(["numpy", "pandas", "h5py", "matplotlib", "scikit-learn", "pyarrow", "openpyxl", "xlsxwriter"]),
+            "platform": platform.platform(),
+            "test_model_evaluation_performed": "NO",
+            "final_status": READY,
+        }
+        atomic_write_json(self.dirs["manifests"] / "BENCHMARK_PROVENANCE.json", provenance)
+        atomic_write_json(self.cfg.snapshot_root / "PROJECT_SNAPSHOT.json", provenance)
+        self._write_reports(benchmark_sha)
+        self._write_figures()
+        self._write_publication_artifacts(benchmark_sha)
+        file_manifest = self._create_file_manifest()
+        atomic_write_json(self.dirs["manifests"] / "FILE_MANIFEST.json", file_manifest)
+        hash_manifest = {rel: item["sha256"] for rel, item in file_manifest.items()}
+        atomic_write_json(self.dirs["manifests"] / "HASH_MANIFEST.json", hash_manifest)
+        atomic_write_text(self.stage_root / "MANYTX_BENCHMARK_READY.txt", READY + "\n")
+        self._checkpoint(stage, "PASS", {"summary": "Reports/manifests generated", "benchmark_sha256": benchmark_sha})
+        self._print_success(benchmark_sha)
+
+    def _create_file_manifest(self) -> Dict[str, Dict[str, Any]]:
+        manifest: Dict[str, Dict[str, Any]] = {}
+        for path in sorted(self.stage_root.rglob("*")):
+            if path.is_file() and not path.name.endswith(".tmp"):
+                rel = str(path.relative_to(self.stage_root)).replace("\\", "/")
+                manifest[rel] = {"size_bytes": path.stat().st_size, "sha256": sha256_file(path)}
+        return manifest
+
+    def _write_reports(self, benchmark_sha: str) -> None:
+        counts = self.meta.groupby("tx_partition").agg(samples=("sample_id", "size"), tx=("transmitter_id", "nunique"))
+        train_count = int(len(self.protocol_indices["train_known_indices"]))
+        val_count = int(len(self.protocol_indices["validation_known_indices"]))

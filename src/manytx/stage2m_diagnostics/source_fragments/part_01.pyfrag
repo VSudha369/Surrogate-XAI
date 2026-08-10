@@ -1,0 +1,224 @@
+    """Capability guard: raw HDF5 reads require an explicitly allowed split role."""
+
+    def __init__(self) -> None:
+        self.strict_test_signal_reads = 0
+        self.strict_test_label_reads = 0
+        self.strict_test_feature_reads = 0
+        self.events: list[dict[str, Any]] = []
+
+    def authorize(self, split: SplitRef | str, kind: str) -> None:
+        role = split.role if isinstance(split, SplitRef) else str(split)
+        if role in STRICT_ROLES or role not in ALLOWED_SPLITS:
+            attr = {"signal": "strict_test_signal_reads", "label": "strict_test_label_reads", "feature": "strict_test_feature_reads"}[kind]
+            setattr(self, attr, getattr(self, attr) + 1)
+            self.events.append({"utc": utc_now(), "role": role, "kind": kind, "decision": "DENY"})
+            raise ScientificAbort(f"FINAL_TEST_ACCESS_VIOLATION: denied {kind} read for {role}")
+
+    def assert_clean(self) -> None:
+        if any((self.strict_test_signal_reads, self.strict_test_label_reads, self.strict_test_feature_reads)):
+            raise ScientificAbort("MANYTX_STAGE2M_NOT_READY\nFINAL_TEST_ACCESS_VIOLATION")
+
+    def manifest(self) -> dict[str, Any]:
+        return {
+            "policy": "strict zero-day signals, labels, indices, and features are forbidden",
+            "strict_test_signal_reads": self.strict_test_signal_reads,
+            "strict_test_label_reads": self.strict_test_label_reads,
+            "strict_test_feature_reads": self.strict_test_feature_reads,
+            "strict_index_arrays_loaded": False,
+            "events": self.events,
+            "status": "PASS" if not self.events else "FAIL",
+        }
+
+
+class ReadOnlyBenchmark:
+    def __init__(self, path: Path, schema: H5Schema, guard: StrictTestGuard, chunk_size: int) -> None:
+        self.path, self.schema, self.guard, self.chunk_size = path, schema, guard, chunk_size
+
+    @staticmethod
+    def _read_sorted(ds: h5py.Dataset, indices: np.ndarray, chunk_size: int) -> np.ndarray:
+        ix = np.asarray(indices, dtype=np.int64)
+        if ix.ndim != 1 or len(np.unique(ix)) != len(ix):
+            raise ScientificAbort("Split indices must be a one-dimensional unique array")
+        order = np.argsort(ix)
+        sorted_ix = ix[order]
+        blocks = [np.asarray(ds[sorted_ix[a : a + chunk_size]]) for a in range(0, len(ix), chunk_size)]
+        sorted_values = np.concatenate(blocks, axis=0) if blocks else np.empty((0,) + ds.shape[1:], dtype=ds.dtype)
+        inverse = np.empty_like(order)
+        inverse[order] = np.arange(len(order))
+        return sorted_values[inverse]
+
+    def read_signals(self, split: SplitRef, indices: np.ndarray) -> np.ndarray:
+        self.guard.authorize(split, "signal")
+        with h5py.File(self.path, "r", rdcc_nbytes=128 * 1024 * 1024) as h5:
+            raw = self._read_sorted(h5[self.schema.signal_key], indices, self.chunk_size)
+        if self.schema.orientation == "N_L_IQ":
+            raw = np.transpose(raw, (0, 2, 1))
+        return np.asarray(raw, dtype=np.float32)
+
+    def read_metadata(self, split: SplitRef, indices: np.ndarray, fields: Sequence[str] = ("tx", "rx", "day", "eq")) -> dict[str, np.ndarray]:
+        self.guard.authorize(split, "label")
+        key_map = {"sample_id": self.schema.sample_id_key, "tx": self.schema.tx_key, "rx": self.schema.rx_key, "day": self.schema.day_key, "eq": self.schema.equalization_key}
+        result: dict[str, np.ndarray] = {}
+        with h5py.File(self.path, "r") as h5:
+            for field in fields:
+                key = key_map[field]
+                if key is None:
+                    continue
+                data = self._read_sorted(h5[key], indices, self.chunk_size)
+                result[field] = decode_values(data)
+        return result
+
+
+def h5_datasets(handle: h5py.File) -> dict[str, h5py.Dataset]:
+    result: dict[str, h5py.Dataset] = {}
+    handle.visititems(lambda name, obj: result.__setitem__(name, obj) if isinstance(obj, h5py.Dataset) else None)
+    return result
+
+
+def choose_dataset(datasets: Mapping[str, h5py.Dataset], candidates: Sequence[str], n: int, semantic: str, *, optional: bool = False) -> str | None:
+    candidate_l = [x.lower() for x in candidates]
+    ranked: list[tuple[int, str]] = []
+    for name, ds in datasets.items():
+        if not ds.shape or ds.shape[0] != n:
+            continue
+        leaf = name.rsplit("/", 1)[-1].lower()
+        if leaf in candidate_l:
+            ranked.append((candidate_l.index(leaf), name))
+    if ranked:
+        return min(ranked)[1]
+    if optional:
+        return None
+    raise ScientificAbort(f"Could not resolve {semantic} dataset. HDF5 datasets: {sorted(datasets)}")
+
+
+def inspect_h5(path: Path) -> H5Schema:
+    with h5py.File(path, "r") as h5:
+        datasets = h5_datasets(h5)
+        signals: list[tuple[int, str, tuple[int, ...], str]] = []
+        preferred = ["x", "signals", "iq_samples", "iq", "samples", "waveforms", "data"]
+        for name, ds in datasets.items():
+            shape = tuple(int(x) for x in ds.shape)
+            if len(shape) == 3 and ((shape[1], shape[2]) == (2, EXPECTED_SIGNAL_LENGTH) or (shape[1], shape[2]) == (EXPECTED_SIGNAL_LENGTH, 2)):
+                leaf = name.rsplit("/", 1)[-1].lower()
+                rank = preferred.index(leaf) if leaf in preferred else len(preferred)
+                signals.append((rank, name, shape, str(ds.dtype)))
+        if not signals:
+            raise ScientificAbort("No canonical I/Q dataset with shape (N,2,256) or (N,256,2) found")
+        _, signal_key, shape, dtype = min(signals)
+        n = shape[0]
+        if n != EXPECTED_TOTAL:
+            raise ScientificAbort(f"Expected {EXPECTED_TOTAL} samples; found {n}")
+        if np.dtype(dtype) != np.dtype("float32"):
+            raise ScientificAbort(f"Expected canonical signal dtype float32; found {dtype}")
+        schema = H5Schema(
+            signal_key=signal_key,
+            sample_id_key=str(choose_dataset(datasets, ["sample_id", "sample_identifier", "id"], n, "sample identifier")),
+            tx_key=str(choose_dataset(datasets, ["physical_transmitter_id", "physical_tx_id", "transmitter_id", "tx_id", "tx", "transmitter", "y", "labels", "label"], n, "transmitter identity")),
+            rx_key=str(choose_dataset(datasets, ["physical_receiver_id", "physical_rx_id", "receiver_id", "rx_id", "rx", "receiver"], n, "receiver identity")),
+            day_key=str(choose_dataset(datasets, ["capture_date", "capture_date_id", "capture_day", "day_id", "date", "day"], n, "capture date")),
+            equalization_key=str(choose_dataset(datasets, ["equalization_state", "equalized_state", "equalized", "equalization", "eq"], n, "equalization state")),
+            signal_shape=shape,
+            signal_dtype=dtype,
+            orientation="N_IQ_L" if shape[1] == 2 else "N_L_IQ",
+        )
+        for key in [schema.sample_id_key, schema.tx_key, schema.rx_key, schema.day_key, schema.equalization_key]:
+            if key is not None and datasets[key].shape[0] != n:
+                raise ScientificAbort(f"Metadata length mismatch for {key}")
+        return schema
+
+
+def find_exact(root: Path, name: str) -> Path:
+    matches = sorted(root.rglob(name))
+    if len(matches) != 1:
+        raise ScientificAbort(f"Expected exactly one {name} under {root}; found {len(matches)}")
+    return matches[0]
+
+
+def load_allowed_splits(root: Path) -> dict[str, SplitRef]:
+    result: dict[str, SplitRef] = {}
+    for role, (name, expected, display) in ALLOWED_SPLITS.items():
+        path = find_exact(root, name)
+        values = np.load(path, mmap_mode="r", allow_pickle=False)
+        if values.ndim != 1 or len(values) != expected:
+            raise ScientificAbort(f"{name}: expected one-dimensional count {expected}, found shape {values.shape}")
+        if not np.issubdtype(values.dtype, np.integer):
+            raise ScientificAbort(f"{name}: index dtype must be integer, found {values.dtype}")
+        if int(values.min()) < 0 or int(values.max()) >= EXPECTED_TOTAL or len(np.unique(values)) != len(values):
+            raise ScientificAbort(f"{name}: invalid, duplicate, or out-of-range indices")
+        result[role] = SplitRef(role, display, path, expected)
+    return result
+
+
+def load_json_candidates(root: Path) -> list[tuple[Path, Any]]:
+    result = []
+    for path in root.rglob("*.json"):
+        try:
+            result.append((path, json.loads(path.read_text(encoding="utf-8"))))
+        except Exception:
+            continue
+    return result
+
+
+def recursive_find_key(value: Any, targets: set[str]) -> list[Any]:
+    found: list[Any] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized = str(key).lower().replace("-", "_").replace(" ", "_")
+            if normalized in targets:
+                found.append(child)
+            found.extend(recursive_find_key(child, targets))
+    elif isinstance(value, list):
+        for child in value:
+            found.extend(recursive_find_key(child, targets))
+    return found
+
+
+def evidence_texts(root: Path) -> list[tuple[Path, str]]:
+    result: list[tuple[Path, str]] = []
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in {".json", ".csv", ".md", ".txt", ".yaml", ".yml"} and path.stat().st_size <= 32 * 1024 * 1024:
+            try: result.append((path, path.read_text(encoding="utf-8", errors="replace")))
+            except OSError: pass
+    return result
+
+
+def verify_strict_without_loading(root: Path, json_docs: list[tuple[Path, Any]], texts: list[tuple[Path, str]]) -> dict[str, Any]:
+    records = {}
+    for role, (name, expected, display) in STRICT_SPLITS.items():
+        path = find_exact(root, name)
+        # Intentionally no np.load/open_memmap: only existence, byte hash, and manifest count are legal.
+        targets = {role, Path(name).stem.lower(), role + "_count", Path(name).stem.lower() + "_count"}
+        candidates: list[int] = []
+        for _, doc in json_docs:
+            for value in recursive_find_key(doc, targets):
+                if isinstance(value, (int, float)) and int(value) == value:
+                    candidates.append(int(value))
+                elif isinstance(value, dict):
+                    for k in ("count", "n", "samples", "sample_count"):
+                        if k in value and isinstance(value[k], (int, float)):
+                            candidates.append(int(value[k]))
+        normalized_name = Path(name).stem.lower()
+        for _, text in texts:
+            lowered = text.lower().replace(",", "")
+            if normalized_name in lowered or role in lowered or display.lower() in lowered:
+                if str(expected) in lowered: candidates.append(expected)
+        if expected not in candidates:
+            raise ScientificAbort(f"Strict split count {expected} for {name} was not verifiable from a frozen JSON manifest")
+        records[role] = {"display": display, "path": str(path), "exists": True, "manifest_count": expected, "sha256": sha256_file(path), "index_array_loaded": False}
+    return records
+
+
+def validate_frozen_mapping(path: Path, expected_size: int) -> dict[str, Any]:
+    if not path.is_file():
+        raise ScientificAbort(f"Required frozen Stage 1B mapping is missing: {path}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ScientificAbort(f"Could not parse frozen mapping {path}: {exc}") from exc
+    if not isinstance(value, dict) or len(value) != expected_size:
+        raise ScientificAbort(f"{path.name}: expected a {expected_size}-entry object, found {type(value).__name__} with length {len(value) if isinstance(value, dict) else 'N/A'}")
+    try:
+        indices = [int(index) for index in value.values()]
+    except (TypeError, ValueError) as exc:
+        raise ScientificAbort(f"{path.name}: mapping values must be integer indices") from exc
+    if sorted(indices) != list(range(expected_size)):

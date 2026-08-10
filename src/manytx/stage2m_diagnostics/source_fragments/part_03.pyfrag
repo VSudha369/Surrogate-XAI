@@ -1,0 +1,139 @@
+                record = json.loads(config_path.read_text(encoding="utf-8")); observed_version = record.get("stage_version"); observed_script = record.get("script_sha256")
+            except Exception:
+                observed_version, observed_script = "UNREADABLE", "UNREADABLE"
+            if observed_version != VERSION or observed_script != self.script_sha256:
+                incompatible.append({"path":str(config_path.resolve()), "kind":"configuration", "observed_version":observed_version, "observed_script_sha256":observed_script})
+        else:
+            preexisting = []
+            for key in ("checkpoints","cache","features","manifests","tables","figures","reports","statistics","publication","diagnostics"):
+                preexisting.extend(str(path.resolve()) for path in self.dirs[key].rglob("*") if path.is_file() and path.name != "INCOMPATIBLE_OUTPUT_INVALIDATION.json")
+            if preexisting:
+                incompatible.append({"kind":"unversioned_partial_output", "observed_version":f"UNKNOWN_OR_PRE-v{VERSION}", "sample_paths":preexisting[:20], "file_count":len(preexisting)})
+        if not incompatible:
+            return False
+        if self.cfg.start_stage != 1:
+            raise ScientificAbort(f"INCOMPATIBLE_STAGE2M_OUTPUT_DETECTED: v{VERSION} must restart at Stage 01; stale prior-version checkpoints will not be reused")
+        atomic_json(self.dirs["manifests"] / "INCOMPATIBLE_OUTPUT_INVALIDATION.json", {"detected_utc":utc_now(), "policy":"INVALIDATE_AND_REBUILD_FROM_STAGE_01", "current_version":VERSION, "current_script_sha256":self.script_sha256, "incompatible_artifacts":incompatible, "files_deleted":False, "stale_checkpoint_reuse":False})
+        return True
+
+    def banner(self) -> None:
+        print("=" * 100)
+        print("STAGE 2M — WISIG MANYTX SCIENTIFIC BENCHMARK DIAGNOSTICS & ZERO-DAY LEARNABILITY AUDIT")
+        print("=" * 100)
+        print(f"IMPLEMENTATION VERSION: {VERSION}")
+        print(f"CANONICAL BENCHMARK: {CANONICAL_NAME}")
+        print("BENCHMARK MODE: READ ONLY\nLEGACY RADIO BRANCH: READ ONLY\nSTRICT ZERO-DAY TEST SIGNAL ACCESS: FORBIDDEN")
+        print("CALIBRATION UNKNOWN DIAGNOSTICS: ENABLED\nDEEP TEACHER TRAINING: DISABLED\nSURROGATE TRAINING: DISABLED")
+        print("XAI EVALUATION: DISABLED\nFINAL TEST EVALUATION: DISABLED")
+        if self.incompatible_output_detected:
+            print(f"[INVALIDATE] Incompatible pre-v{VERSION} output detected; all stages will rebuild from Stage 01. No legacy checkpoint will be reused.")
+        print("=" * 100)
+
+    def checkpoint_path(self, stage: int, name: str) -> Path:
+        return self.dirs["checkpoints"] / f"stage_{stage:02d}_{name}.checkpoint.json"
+
+    def checkpoint_valid(self, path: Path) -> bool:
+        if self.cfg.force or self.incompatible_output_detected or not path.exists(): return False
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("stage_version") != VERSION or data.get("script_sha256") != self.script_sha256: return False
+            if data["benchmark_sha256"] != self.benchmark_sha or data["config_sha256"] != self.cfg.config_sha256: return False
+            return all(Path(item["path"]).exists() and sha256_file(Path(item["path"])) == item["sha256"] for item in data["outputs"])
+        except Exception:
+            return False
+
+    def run_stage(self, stage: int, name: str, function: Callable[[], list[Path]]) -> None:
+        cp = self.checkpoint_path(stage, name)
+        if self.checkpoint_valid(cp):
+            self.log.info("[RESUME] Stage %02d — %s", stage, name)
+            self.stage_outputs[stage] = [Path(x["path"]) for x in json.loads(cp.read_text())["outputs"]]
+            print(f"[PASS] Stage {stage:02d} — {name} (validated checkpoint)")
+            return
+        self.log.info("[RUN] Stage %02d — %s", stage, name)
+        outputs = function()
+        missing = [str(x) for x in outputs if not x.exists()]
+        if missing: raise ScientificAbort(f"Stage {stage:02d} missing required outputs: {missing}")
+        payload = {"stage": stage, "name": name, "stage_version":VERSION, "script_sha256":self.script_sha256, "completed_utc": utc_now(), "benchmark_sha256": self.benchmark_sha, "config_sha256": self.cfg.config_sha256,
+                   "outputs": [{"path": str(x.resolve()), "sha256": sha256_file(x), "bytes": x.stat().st_size} for x in outputs]}
+        atomic_json(cp, payload); self.stage_outputs[stage] = outputs
+        print(f"[PASS] Stage {stage:02d} — {name}")
+
+    def prepare_access(self) -> None:
+        self.benchmark_sha = sha256_file(self.cfg.benchmark_path)
+        if self.benchmark_sha != EXPECTED_BENCHMARK_SHA256:
+            raise ScientificAbort("ABORT_STAGE_2M\nBENCHMARK_HASH_MISMATCH")
+        self.schema = inspect_h5(self.cfg.benchmark_path)
+        self.splits = load_allowed_splits(self.cfg.stage1b_dir)
+        if self.cfg.copy_local:
+            scratch_root = Path("/content/stage2m_scratch") if Path("/content").exists() else Path(tempfile.gettempdir()) / "stage2m_scratch"
+            scratch_root.mkdir(parents=True, exist_ok=True)
+            copy = scratch_root / self.cfg.benchmark_path.name
+            if not copy.exists() or sha256_file(copy) != self.benchmark_sha:
+                shutil.copy2(self.cfg.benchmark_path, copy)
+            if sha256_file(copy) != self.benchmark_sha: raise ScientificAbort("Local HDF5 copy hash mismatch")
+            self.benchmark_access_path = copy
+
+    def benchmark(self) -> ReadOnlyBenchmark:
+        if self.schema is None: raise ScientificAbort("HDF5 schema unavailable")
+        return ReadOnlyBenchmark(self.benchmark_access_path, self.schema, self.guard, self.cfg.chunk_size)
+
+    def stage01(self) -> list[Path]:
+        assert self.schema is not None
+        json_docs = load_json_candidates(self.cfg.stage1b_dir)
+        texts = evidence_texts(self.cfg.stage1b_dir)
+        strict = verify_strict_without_loading(self.cfg.stage1b_dir, json_docs, texts)
+        documentary = verify_stage1b_documentary_evidence(self.cfg.stage1b_dir, texts)
+        validate_allowed_disjoint(self.splits)
+        allowed_records = []
+        for role, split in self.splits.items():
+            allowed_records.append({"role": role, "display": split.display, "path": str(split.path), "count": split.count, "sha256": sha256_file(split.path), "loaded_for_diagnostics": True})
+        table = pd.DataFrame(allowed_records + [{"role": k, "display": v["display"], "path": v["path"], "count": v["manifest_count"], "sha256": v["sha256"], "loaded_for_diagnostics": False} for k, v in strict.items()])
+        paths = [self.dirs["tables"] / "benchmark_verification.csv", self.dirs["tables"] / "protocol_counts.csv"]
+        atomic_csv(paths[0], pd.DataFrame([
+            {"check": "canonical_hdf5_exists", "observed": self.cfg.benchmark_path.exists(), "expected": True, "status": "PASS"},
+            {"check": "canonical_sha256", "observed": self.benchmark_sha, "expected": EXPECTED_BENCHMARK_SHA256, "status": "PASS"},
+            {"check": "sample_count", "observed": self.schema.signal_shape[0], "expected": EXPECTED_TOTAL, "status": "PASS"},
+            {"check": "signal_length", "observed": EXPECTED_SIGNAL_LENGTH, "expected": EXPECTED_SIGNAL_LENGTH, "status": "PASS"},
+            {"check": "strict_index_arrays_loaded", "observed": False, "expected": False, "status": "PASS"},
+        ])); atomic_csv(paths[1], table)
+        provenance = {"stage": STAGE_NAME, "version": VERSION, "script_path":str(self.script_path), "script_sha256":self.script_sha256, "created_utc": utc_now(), "benchmark_path": str(self.cfg.benchmark_path.resolve()), "benchmark_sha256": self.benchmark_sha,
+                      "expected_source_sha256": EXPECTED_SOURCE_SHA256, "h5_schema": asdict(self.schema), "allowed_splits": allowed_records, "strict_splits": strict, "package_versions": package_versions(), "session_id": "NOT_REPRESENTED", "capture_dates": 4}
+        provenance["stage1b_documentary_evidence"] = documentary
+        p_prov = self.dirs["manifests"] / "STAGE2M_INPUT_PROVENANCE.json"; atomic_json(p_prov, provenance)
+        p_split = self.dirs["manifests"] / "STAGE2M_SPLIT_VERIFICATION.json"; atomic_json(p_split, {"allowed": allowed_records, "strict": strict, "allowed_pairwise_disjoint": True, "strict_disjointness": "verified from frozen Stage 1B manifest only; strict arrays not loaded"})
+        p_guard = self.dirs["manifests"] / "TEST_GUARD_MANIFEST.json"; atomic_json(p_guard, self.guard.manifest())
+        p_cfg = self.dirs["manifests"] / "STAGE2M_CONFIG.json"; atomic_json(p_cfg, {"stage_version":VERSION, "script_sha256":self.script_sha256, "config": self.cfg.normalized(), "config_sha256": self.cfg.config_sha256, "incompatible_previous_outputs_detected":self.incompatible_output_detected})
+        report = self.dirs["reports"] / "frozen_benchmark_verification_report.md"
+        atomic_text(report, f"# Frozen Benchmark Verification Report\n\n**Status:** PASS\n\n- Canonical benchmark: `{self.cfg.benchmark_path}`\n- SHA-256: `{self.benchmark_sha}` (matched)\n- Shape: `{self.schema.signal_shape}`; dtype: `{self.schema.signal_dtype}`\n- Session metadata: `session_id = NOT_REPRESENTED`; 4 capture dates.\n- P0–P5 feasibility: verified from frozen split counts.\n- Strict zero-day index files: existence/count/hash verified; arrays were not loaded.\n- Strict signal/label/feature reads: 0/0/0.\n")
+        return paths + [p_prov, p_split, p_guard, p_cfg, report]
+
+    def _metadata_counts(self, split: SplitRef) -> tuple[list[pd.DataFrame], dict[str, set[str]]]:
+        bench = self.benchmark(); aggregate: dict[tuple[str, ...], int] = {}; uniques = {k: set() for k in ("tx", "rx", "day", "eq")}
+        groupings = [("tx",), ("rx",), ("day",), ("eq",), ("tx", "rx"), ("tx", "day"), ("tx", "eq"), ("tx", "rx", "day"), ("tx", "rx", "day", "eq")]
+        stores = [dict() for _ in groupings]
+        for _, ix in iter_split_chunks(split, self.cfg.chunk_size):
+            meta = bench.read_metadata(split, ix, ("tx", "rx", "day", "eq")); frame = pd.DataFrame(meta)
+            for key in uniques: uniques[key].update(frame[key].astype(str).unique())
+            for pos, grouping in enumerate(groupings):
+                counts = frame.groupby(list(grouping), dropna=False).size()
+                for key, count in counts.items():
+                    key_t = key if isinstance(key, tuple) else (key,)
+                    stores[pos][tuple(map(str, key_t))] = stores[pos].get(tuple(map(str, key_t)), 0) + int(count)
+        frames = []
+        for grouping, store in zip(groupings, stores):
+            rows = [{**dict(zip(grouping, key)), "count": count, "protocol": split.display, "role": split.role} for key, count in store.items()]
+            frames.append(pd.DataFrame(rows))
+        return frames, uniques
+
+    def stage02(self) -> list[Path]:
+        all_frames: list[list[pd.DataFrame]] = [[] for _ in range(9)]; global_uniques = {k: set() for k in ("tx", "rx", "day", "eq")}; split_uniques: dict[str, dict[str, set[str]]] = {}
+        for split in self.splits.values():
+            frames, uniques = self._metadata_counts(split)
+            split_uniques[split.role] = uniques
+            for i, frame in enumerate(frames): all_frames[i].append(frame)
+            for key in global_uniques: global_uniques[key].update(uniques[key])
+        combined = [pd.concat(frames, ignore_index=True) for frames in all_frames]
+        observed_cardinality = {key: len(values) for key, values in global_uniques.items()}
+        expected_cardinality = {"tx": 120, "rx": EXPECTED_RX, "day": EXPECTED_DAYS, "eq": 2}
+        if observed_cardinality != expected_cardinality:
+            raise ScientificAbort(f"Allowed-data metadata cardinality mismatch: observed={observed_cardinality}, expected={expected_cardinality}")

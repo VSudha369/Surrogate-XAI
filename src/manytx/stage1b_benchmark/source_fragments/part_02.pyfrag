@@ -1,0 +1,261 @@
+        rows: List[Dict[str, Any]] = []
+        leaf_count = 0
+
+        def walk(value: Any, path_values: List[str], path_names: List[str]) -> None:
+            nonlocal leaf_count
+            if isinstance(value, np.ndarray) and self._is_signal_array(value):
+                n = len(value)
+                meta_rows = []
+                inferred = self._infer_path_metadata(path_values, path_names)
+                if not inferred.get("transmitter_id"):
+                    return
+                for i in range(n):
+                    meta_rows.append(
+                        {
+                            "transmitter_id": inferred["transmitter_id"],
+                            "receiver_id": inferred.get("receiver_id", "NOT_REPRESENTED"),
+                            "day_id": inferred.get("day_id", "NOT_REPRESENTED"),
+                            "session_id": inferred.get("session_id", "NOT_REPRESENTED"),
+                            "equalization_state": inferred.get("equalization_state", "NOT_REPRESENTED"),
+                            "source_index": i,
+                            "source_member": "/".join(path_values),
+                        }
+                    )
+                accessor.add_group(value, meta_rows)
+                rows.extend(meta_rows)
+                leaf_count += 1
+                return
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    walk(child, path_values + [str(key)], path_names + [normalize_key(key)])
+
+        walk(obj, [], [])
+        if leaf_count == 0:
+            return None
+        self.notes.append(
+            "Detected nested dictionary signal leaves. Metadata was inferred from explicit path tokens where possible."
+        )
+        meta = pd.DataFrame(rows)
+        return accessor, meta, self.notes
+
+    def _infer_path_metadata(self, values: List[str], names: List[str]) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for value, name in zip(values, names):
+            clean_value = str(value)
+            if any(k in name for k in self.TX_NAMES):
+                out["transmitter_id"] = clean_value
+            elif any(k in name for k in self.RX_NAMES):
+                out["receiver_id"] = clean_value
+            elif any(k in name for k in self.DAY_NAMES):
+                out["day_id"] = clean_value
+            elif any(k in name for k in self.SESSION_NAMES):
+                out["session_id"] = clean_value
+            elif any(k in name for k in self.EQ_NAMES):
+                out["equalization_state"] = clean_value
+        return out
+
+    def _from_generic(self, obj: Any) -> Optional[Tuple[SignalAccessor, pd.DataFrame, List[Dict[str, Any]]]]:
+        if isinstance(obj, (list, tuple)):
+            for value in obj:
+                if isinstance(value, pd.DataFrame):
+                    found = self._from_dataframe(value)
+                    if found is not None:
+                        return found
+                if isinstance(value, dict):
+                    found = self._from_dict(value, "root")
+                    if found is not None:
+                        return found
+        return None
+
+
+def canonicalize_iq(sample: Any) -> np.ndarray:
+    arr = np.asarray(sample)
+    arr = np.squeeze(arr)
+    if arr.size == 0:
+        raise ValueError("empty signal")
+    if np.iscomplexobj(arr):
+        if arr.ndim == 1:
+            return np.stack([arr.real, arr.imag], axis=0).astype(np.float32, copy=False)
+        if arr.ndim == 2 and 1 in arr.shape:
+            flat = arr.reshape(-1)
+            return np.stack([flat.real, flat.imag], axis=0).astype(np.float32, copy=False)
+        if arr.ndim == 2 and arr.shape[0] != arr.shape[1]:
+            if arr.shape[0] < arr.shape[1]:
+                flat = arr.reshape(-1)
+            else:
+                flat = arr.T.reshape(-1)
+            return np.stack([flat.real, flat.imag], axis=0).astype(np.float32, copy=False)
+        raise ValueError(f"unsupported complex signal shape {arr.shape}")
+    if not np.issubdtype(arr.dtype, np.number):
+        raise ValueError(f"non-numeric signal dtype {arr.dtype}")
+    arr = arr.astype(np.float32, copy=False)
+    if arr.ndim == 1 and arr.shape[0] % 2 == 0 and arr.shape[0] >= 16:
+        paired = arr.reshape(-1, 2).T
+        return paired.astype(np.float32, copy=False)
+    if arr.ndim == 2:
+        if arr.shape[0] == 2 and arr.shape[1] >= 8:
+            return arr.astype(np.float32, copy=False)
+        if arr.shape[1] == 2 and arr.shape[0] >= 8:
+            return arr.T.astype(np.float32, copy=False)
+    if arr.ndim == 3:
+        squeezed = np.squeeze(arr)
+        return canonicalize_iq(squeezed)
+    raise ValueError(f"unsupported real signal shape {arr.shape}")
+
+
+def per_sample_normalize(x: np.ndarray, eps: float = 1.0e-12) -> np.ndarray:
+    centered = x - x.mean(axis=1, keepdims=True)
+    rms = np.sqrt(np.mean(centered * centered))
+    if not np.isfinite(rms) or rms < eps:
+        return centered.astype(np.float32, copy=False)
+    return (centered / rms).astype(np.float32, copy=False)
+
+
+class Stage1BRunner:
+    def __init__(self, cfg: StageConfig) -> None:
+        self.cfg = cfg
+        self.stage_root = cfg.stage_root
+        self.dirs = {
+            "configs": self.stage_root / "configs",
+            "checkpoints": self.stage_root / "checkpoints",
+            "logs": self.stage_root / "logs",
+            "manifests": self.stage_root / "manifests",
+            "source_audit": self.stage_root / "source_audit",
+            "tables": self.stage_root / "tables",
+            "figures": self.stage_root / "figures",
+            "reports": self.stage_root / "reports",
+            "mappings": self.stage_root / "mappings",
+            "splits": self.stage_root / "splits",
+            "benchmark": self.stage_root / "benchmark",
+            "publication": self.stage_root / "publication",
+        }
+        self.logger = logging.getLogger("Stage1B")
+        self.status: Dict[str, Dict[str, Any]] = {}
+        self.failures: List[str] = []
+        self.warnings: List[str] = []
+        self.source_path: Optional[Path] = None
+        self.source_hash: str = ""
+        self.source_member: str = ""
+        self.source_object: Any = None
+        self.accessor: Optional[SignalAccessor] = None
+        self.meta: pd.DataFrame = pd.DataFrame()
+        self.schema_summary: List[Dict[str, Any]] = []
+        self.integrity: Dict[str, Any] = {}
+        self.duplicate_audit: Dict[str, Any] = {}
+        self.tx_partition: Dict[str, str] = {}
+        self.partition_reasons: Dict[str, str] = {}
+        self.protocol_indices: Dict[str, np.ndarray] = {}
+        self.mappings: Dict[str, Dict[str, int]] = {}
+        self.h5_path = self.dirs["benchmark"] / f"{BENCHMARK_VERSION}.h5"
+        self.config_hash = sha256_bytes(stable_json(self.cfg.as_dict()).encode("utf-8"))
+
+    def run(self) -> None:
+        self._print_banner()
+        random.seed(self.cfg.python_seed)
+        np.random.seed(self.cfg.numpy_seed)
+        self._prepare_dirs()
+        self._configure_logging()
+        atomic_write_json(self.dirs["configs"] / "stage1b_config.json", self.cfg.as_dict())
+        atomic_write_json(self.dirs["configs"] / "stage1b_config.sha256.json", {"sha256": self.config_hash})
+        try:
+            self.stage01_source_discovery()
+            self.stage02_schema_discovery()
+            self.stage03_inventory()
+            self.stage04_signal_integrity()
+            self.stage05_duplicate_audit()
+            self.stage06_zero_day_partition()
+            self.stage07_domain_protocols()
+            self.stage08_tensorization()
+            self.stage09_verification()
+            self.stage10_freeze_reports()
+        except ScientificAbort as exc:
+            self.failures.append(str(exc))
+            self.logger.exception("Scientific abort")
+            self._write_not_ready(str(exc))
+            raise SystemExit(2) from exc
+        except Exception as exc:
+            self.failures.append(f"Unexpected failure: {exc}")
+            self.logger.exception("Unexpected failure")
+            self._write_not_ready(f"Unexpected failure: {exc}")
+            raise
+
+    def _print_banner(self) -> None:
+        print("LEGACY RADIO BRANCH: READ ONLY")
+        print("NEW MANYTX BRANCH: WRITE ENABLED")
+        print("TEST MODEL EVALUATION: DISABLED")
+        print("DATASET REGENERATION FROM SYNTHETIC SIGNALS: DISABLED")
+        print("=" * 100)
+        print("STAGE 1B - WISIG MANYTX ZERO-DAY BENCHMARK ENGINEERING")
+        print(f"Benchmark version: {BENCHMARK_VERSION}")
+        print("Legacy branch: READ ONLY")
+        print("Test model evaluation: DISABLED")
+        print("=" * 100)
+
+    def _prepare_dirs(self) -> None:
+        self._assert_safe_output_path()
+        for path in [self.cfg.snapshot_root, *self.dirs.values()]:
+            path.mkdir(parents=True, exist_ok=True)
+
+    def _assert_safe_output_path(self) -> None:
+        branch = self.cfg.branch_root
+        parts = {normalize_key(part) for part in branch.parts}
+        forbidden = sorted(parts.intersection(LEGACY_FORBIDDEN_NAMES))
+        if forbidden:
+            raise ScientificAbort(f"Output branch resolves inside forbidden legacy path component(s): {forbidden}")
+        if branch.name != BRANCH_NAME:
+            raise ScientificAbort(f"Output branch must be named {BRANCH_NAME}; got {branch.name}")
+
+    def _configure_logging(self) -> None:
+        self.logger.setLevel(logging.INFO)
+        self.logger.handlers.clear()
+        formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        stream = logging.StreamHandler(sys.stdout)
+        stream.setFormatter(formatter)
+        file_handler = logging.FileHandler(self.dirs["logs"] / "stage1b.log", encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        self.logger.addHandler(stream)
+        self.logger.addHandler(file_handler)
+
+    def _checkpoint(self, stage: str, decision: str, details: Dict[str, Any]) -> None:
+        payload = {
+            "stage": stage,
+            "decision": decision,
+            "timestamp_utc": utc_stamp(),
+            "config_sha256": self.config_hash,
+            "source_sha256": self.source_hash,
+            "details": details,
+        }
+        self.status[stage] = payload
+        atomic_write_json(self.dirs["checkpoints"] / f"{stage}.checkpoint.json", payload)
+        print(f"{stage.replace('_', ' ').title()} {decision} - {details.get('summary', '')}")
+
+    def stage01_source_discovery(self) -> None:
+        stage = "stage_01_source_discovery"
+        source = self._find_source()
+        self.source_path = source
+        self.source_hash = sha256_file(source)
+        archive_info: Dict[str, Any] = {
+            "source_path": str(source),
+            "source_sha256": self.source_hash,
+            "size_bytes": source.stat().st_size,
+            "is_zip": zipfile.is_zipfile(source),
+        }
+        if zipfile.is_zipfile(source):
+            with zipfile.ZipFile(source, "r") as zf:
+                bad = zf.testzip()
+                if bad is not None:
+                    raise ScientificAbort(f"Archive corruption detected at member {bad}")
+                members = zf.infolist()
+                archive_info["members"] = [
+                    {"filename": m.filename, "file_size": m.file_size, "compress_size": m.compress_size}
+                    for m in members
+                ]
+                pickle_members = [m.filename for m in members if m.filename.lower().endswith((".pkl", ".pickle"))]
+                if not pickle_members:
+                    pickle_members = [m.filename for m in members if not m.is_dir()]
+                if not pickle_members:
+                    raise ScientificAbort("Source zip archive contains no readable data members.")
+                self.source_member = pickle_members[0]
+        else:
+            self.source_member = source.name
+        atomic_write_json(self.dirs["source_audit"] / "source_archive_audit.json", archive_info)

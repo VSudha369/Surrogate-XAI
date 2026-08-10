@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+Stage 1B v1.0.3: WiSig ManyTx zero-day benchmark engineering.
+
+This module performs benchmark construction only. It does not train, tune,
+evaluate, or inspect model performance. It creates an immutable, leakage-safe
+ManyTx branch that is separate from the frozen RadioML branch.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import dataclasses
+import hashlib
+import importlib.metadata
+import io
+import json
+import logging
+import math
+import os
+import pickle
+import platform
+import random
+import shutil
+import sys
+import tempfile
+import time
+import zipfile
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+import h5py
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+BENCHMARK_VERSION = "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3"
+STAGE_VERSION = "Stage 1B v1.0.3"
+BRANCH_NAME = "MANYTX_ZERO_DAY_BRANCH_v1.0.3"
+READY = "MANYTX_BENCHMARK_READY"
+NOT_READY = "MANYTX_BENCHMARK_NOT_READY"
+LEGACY_FORBIDDEN_NAMES = {
+    "benchmark_v4.1.0",
+    "block2_v4.5.1",
+    "stage2_5_benchmark_diagnostics_v1.0.0",
+    "stage2_6",
+    "stage2.6",
+    "stage3",
+    "stage4",
+    "radioml",
+    "block2_output",
+}
+
+
+def utc_stamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def stable_json(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, indent=2, default=str)
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@contextlib.contextmanager
+def atomic_output(final_path: Path) -> Iterator[Path]:
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=final_path.name + ".",
+        suffix=".tmp",
+        dir=str(final_path.parent),
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        yield tmp_path
+        os.replace(tmp_path, final_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    with atomic_output(path) as tmp:
+        tmp.write_text(text, encoding="utf-8")
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    atomic_write_text(path, stable_json(payload) + "\n")
+
+
+def atomic_save_npy(path: Path, array: np.ndarray) -> None:
+    with atomic_output(path) as tmp:
+        with tmp.open("wb") as f:
+            np.save(f, array)
+
+
+def normalize_key(value: Any) -> str:
+    text = str(value).strip().lower()
+    for token in ["-", ".", "/", "\\", " "]:
+        text = text.replace(token, "_")
+    while "__" in text:
+        text = text.replace("__", "_")
+    return text
+
+
+def package_versions(names: Sequence[str]) -> Dict[str, str]:
+    versions: Dict[str, str] = {}
+    for name in names:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = "not_installed"
+    return versions
+
+
+@dataclasses.dataclass(frozen=True)
+class StageConfig:
+    project_root: Path
+    source: Optional[Path]
+    output_branch: str = BRANCH_NAME
+    partition_seed: int = 20260808
+    python_seed: int = 42
+    numpy_seed: int = 123
+    strict_fraction: float = 0.20
+    calibration_fraction: float = 0.15
+    validation_fraction: float = 0.15
+    min_samples_per_tx: int = 2
+    near_zero_energy: float = 1.0e-12
+    amplitude_outlier_z: float = 8.0
+    compression: str = "gzip"
+    compression_level: int = 4
+    chunk_rows: int = 1024
+    transmitter_field: Optional[str] = None
+    receiver_field: Optional[str] = None
+    day_field: Optional[str] = None
+    session_field: Optional[str] = None
+    signal_field: Optional[str] = None
+
+    @property
+    def branch_root(self) -> Path:
+        return (self.project_root / self.output_branch).resolve()
+
+    @property
+    def stage_root(self) -> Path:
+        return self.branch_root / "01_benchmark_engineering"
+
+    @property
+    def snapshot_root(self) -> Path:
+        return self.branch_root / "00_project_snapshot"
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "project_root": str(self.project_root),
+            "source": None if self.source is None else str(self.source),
+            "output_branch": self.output_branch,
+            "partition_seed": self.partition_seed,
+            "python_seed": self.python_seed,
+            "numpy_seed": self.numpy_seed,
+            "strict_fraction": self.strict_fraction,
+            "calibration_fraction": self.calibration_fraction,
+            "validation_fraction": self.validation_fraction,
+            "min_samples_per_tx": self.min_samples_per_tx,
+            "near_zero_energy": self.near_zero_energy,
+            "amplitude_outlier_z": self.amplitude_outlier_z,
+            "compression": self.compression,
+            "compression_level": self.compression_level,
+            "chunk_rows": self.chunk_rows,
+            "transmitter_field": self.transmitter_field,
+            "receiver_field": self.receiver_field,
+            "day_field": self.day_field,
+            "session_field": self.session_field,
+            "signal_field": self.signal_field,
+        }
+
+
+class ScientificAbort(RuntimeError):
+    pass
+
+
+class SignalAccessor:
+    def __init__(self) -> None:
+        self.groups: List[Any] = []
+        self.records: List[Dict[str, Any]] = []
+
+    def add_group(self, data: Any, metadata_rows: List[Dict[str, Any]]) -> None:
+        group_id = len(self.groups)
+        self.groups.append(data)
+        for local_index, row in enumerate(metadata_rows):
+            row = dict(row)
+            row["_group_id"] = group_id
+            row["_local_index"] = local_index
+            self.records.append(row)
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def raw_sample(self, index: int) -> Any:
+        row = self.records[index]
+        group = self.groups[int(row["_group_id"])]
+        local = int(row["_local_index"])
+        if isinstance(group, pd.Series):
+            return group.iloc[local]
+        return group[local]
+
+
+class SchemaDetector:
+    TX_NAMES = ("tx", "transmitter", "transmitter_id", "device", "radio_id", "radio")
+    RX_NAMES = ("rx", "receiver", "receiver_id", "capture_receiver")
+    DAY_NAMES = ("day", "date", "capture_day", "session_day")
+    SESSION_NAMES = ("session", "capture", "run", "recording", "experiment")
+    EQ_NAMES = ("equal", "equalized", "eq", "equalization")
+    SIGNAL_NAMES = ("signal", "signals", "iq", "x", "data", "samples", "packet", "packets")
+
+    def __init__(self, cfg: StageConfig, logger: logging.Logger) -> None:
+        self.cfg = cfg
+        self.logger = logger
+        self.notes: List[str] = []
+
+    def summarize(self, obj: Any, max_depth: int = 4) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+
+        def walk(value: Any, path: str, depth: int) -> None:
+            summary: Dict[str, Any] = {"path": path, "type": type(value).__name__}
+            if isinstance(value, np.ndarray):
+                summary.update({"shape": list(value.shape), "dtype": str(value.dtype)})
+            elif isinstance(value, pd.DataFrame):
+                summary.update({"shape": list(value.shape), "columns": [str(c) for c in value.columns[:50]]})
+            elif isinstance(value, dict):
+                summary.update({"keys": [str(k) for k in list(value.keys())[:50]], "len": len(value)})
+            elif isinstance(value, (list, tuple)):
+                summary.update({"len": len(value)})
+            rows.append(summary)
+            if depth >= max_depth:
+                return
+            if isinstance(value, dict):
+                for key, child in list(value.items())[:40]:
+                    walk(child, f"{path}.{key}", depth + 1)
+            elif isinstance(value, (list, tuple)):
+                for idx, child in enumerate(list(value)[:40]):
+                    walk(child, f"{path}[{idx}]", depth + 1)
+
+        walk(obj, "root", 0)
+        return rows
+
+    def discover(self, obj: Any) -> Tuple[SignalAccessor, pd.DataFrame, List[Dict[str, Any]]]:
+        if isinstance(obj, pd.DataFrame):
+            found = self._from_dataframe(obj)
+            if found is not None:
+                return found
+        if isinstance(obj, dict):
+            found = self._from_dict(obj, "root")
+            if found is not None:
+                return found
+        found = self._from_generic(obj)
+        if found is not None:
+            return found
+        raise ScientificAbort(
+            "Unable to infer WiSig ManyTx schema from the actual archive. "
+            "Provide --signal-field and metadata field overrides, or inspect source_schema_report.md."
+        )
+
+    def _is_signal_array(self, arr: np.ndarray) -> bool:
+        if arr.dtype == object:
+            return arr.ndim == 1 and len(arr) > 0
+        if not np.issubdtype(arr.dtype, np.number):
+            return False
+        if arr.ndim < 2:
+            return False
+        if np.iscomplexobj(arr):
+            return arr.shape[0] > 1 and arr.shape[-1] >= 8
+        if arr.ndim >= 3 and (arr.shape[-1] == 2 or arr.shape[1] == 2):
+            return arr.shape[0] > 1
+        return False
+
+    def _name_matches(self, name: Any, needles: Sequence[str]) -> bool:
+        key = normalize_key(name)
+        return any(needle in key for needle in needles)
+
+    def _field_for(self, columns: Iterable[Any], override: Optional[str], needles: Sequence[str]) -> Optional[Any]:
+        cols = list(columns)
+        if override is not None:
+            for col in cols:
+                if str(col) == override:
+                    return col
+            raise ScientificAbort(f"Requested field '{override}' was not found in source metadata.")
+        for col in cols:
+            if self._name_matches(col, needles):
+                return col
+        return None
+
+    def _canonical_series_candidate(self, series: pd.Series) -> bool:
+        if len(series) == 0:
+            return False
+        probe_count = min(20, len(series))
+        valid = 0
+        for value in series.iloc[:probe_count]:
+            try:
+                canonicalize_iq(value)
+                valid += 1
+            except Exception:
+                pass
+        return valid >= max(1, probe_count // 2)
+
+    def _from_dataframe(self, df: pd.DataFrame) -> Optional[Tuple[SignalAccessor, pd.DataFrame, List[Dict[str, Any]]]]:
+        signal_col = self._field_for(df.columns, self.cfg.signal_field, self.SIGNAL_NAMES)
+        if signal_col is None:
+            for col in df.columns:
+                if self._canonical_series_candidate(df[col]):
+                    signal_col = col
+                    self.notes.append(f"Detected signal column from sample canonicalization: {col}")
+                    break
+        if signal_col is None:
+            return None
+        tx_col = self._field_for(df.columns, self.cfg.transmitter_field, self.TX_NAMES)
+        if tx_col is None:
+            raise ScientificAbort("DataFrame schema contains signals but no transmitter identifier field was found.")
+        rx_col = self._field_for(df.columns, self.cfg.receiver_field, self.RX_NAMES)
+        day_col = self._field_for(df.columns, self.cfg.day_field, self.DAY_NAMES)
+        session_col = self._field_for(df.columns, self.cfg.session_field, self.SESSION_NAMES)
+        eq_col = self._field_for(df.columns, None, self.EQ_NAMES)
+        meta = pd.DataFrame(
+            {
+                "transmitter_id": df[tx_col].astype(str),
+                "receiver_id": df[rx_col].astype(str) if rx_col is not None else "NOT_REPRESENTED",
