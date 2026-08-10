@@ -65,6 +65,19 @@ def find_one_directory(root: Path, name: str) -> Path:
     return matches[0]
 
 
+def resolve_pipeline_script(search_root: Path) -> Path:
+    override = os.environ.get("WISIG_STAGE2_6M_SCRIPT", "")
+    if override:
+        script = Path(override).expanduser().resolve()
+        if not script.is_file():
+            raise RuntimeError(f"WISIG_STAGE2_6M_SCRIPT does not identify a file: {script}")
+        return script
+    colocated = Path(__file__).resolve().with_name(SCRIPT_NAME)
+    if colocated.is_file():
+        return colocated
+    return find_one(search_root, SCRIPT_NAME)
+
+
 def install_missing() -> None:
     missing = [requirement for module, requirement in REQUIRED.items() if importlib.util.find_spec(module) is None]
     if missing:
@@ -127,6 +140,10 @@ def verify_stage2m(stage2m: Path) -> None:
 
 
 def main() -> None:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
     print("=" * 100)
     print("STAGE 2.6M — COLAB LAUNCHER v1.0.1")
     print("=" * 100)
@@ -136,8 +153,9 @@ def main() -> None:
     branch_root = Path(branch_override).expanduser().resolve() if branch_override else find_one_directory(search_root, BRANCH_NAME)
     if not branch_root.is_dir():
         raise RuntimeError(f"Canonical branch root missing: {branch_root}")
-    script_override = os.environ.get("WISIG_STAGE2_6M_SCRIPT", "")
-    script = Path(script_override).expanduser().resolve() if script_override else find_one(search_root, SCRIPT_NAME)
+    script = resolve_pipeline_script(search_root)
+    print("Branch root:", branch_root)
+    print("Pipeline script:", script)
     benchmark = branch_root / "01_benchmark_engineering" / "benchmark" / "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3.h5"
     if not benchmark.is_file():
         raise RuntimeError(f"Canonical benchmark missing: {benchmark}")
@@ -158,13 +176,16 @@ def main() -> None:
     profile = os.environ.get("WISIG_STAGE2_6M_PROFILE", "full")
     command = [
         sys.executable,
+        "-u",
         str(script),
         "--branch-root",
         str(branch_root),
         "--profile",
         profile,
     ]
-    subprocess.check_call(command)
+    child_environment = dict(os.environ)
+    child_environment["PYTHONUNBUFFERED"] = "1"
+    subprocess.check_call(command, env=child_environment)
     output = branch_root / "03_representation_ablation"
     ready = output / "MANYTX_STAGE2_6M_READY.txt"
     not_ready = output / "MANYTX_STAGE2_6M_NOT_READY.txt"
