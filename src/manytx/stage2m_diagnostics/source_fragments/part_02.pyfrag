@@ -1,0 +1,179 @@
+        raise ScientificAbort(f"{path.name}: indices must be a bijection onto [0, {expected_size - 1}]")
+    return {"path": str(path.resolve()), "entries": expected_size, "sha256": sha256_file(path), "contiguous_bijection": True}
+
+
+def verify_stage1b_documentary_evidence(root: Path, texts: list[tuple[Path, str]]) -> dict[str, Any]:
+    source_hits = [str(path) for path, text in texts if EXPECTED_SOURCE_SHA256 in text]
+    outlier_hits = [str(path) for path, text in texts if ("outlier" in text.lower() or "extreme amplitude" in text.lower()) and ("5307" in text.replace(",", ""))]
+    if not source_hits:
+        raise ScientificAbort("Expected Stage 1B source SHA-256 was not found in frozen provenance documents")
+    if not outlier_hits:
+        raise ScientificAbort("Stage 1B documentary evidence for 5,307 extreme-amplitude outliers was not found")
+    mappings_root = root / "mappings"
+    mapping_records = {
+        "known_transmitter": validate_frozen_mapping(mappings_root / "transmitter_id_to_index.json", 98),
+        "receiver": validate_frozen_mapping(mappings_root / "receiver_id_to_index.json", 18),
+        "capture_day": validate_frozen_mapping(mappings_root / "day_id_to_index.json", 4),
+    }
+    hash_manifest_files = [str(path) for path, _ in texts if "hash" in path.name.lower() and "manifest" in path.name.lower()]
+    if not hash_manifest_files: raise ScientificAbort("Stage 1B hash manifest was not found")
+    # Free-text wording is not a frozen schema and must never be a scientific
+    # abort gate.  The exact canonical benchmark SHA is checked before Stage 01;
+    # exact mappings are validated above; allowed label cardinalities are checked
+    # from legally accessible rows in Stage 02.  Strict labels remain unread.
+    characteristic_contract = {
+        "physical_transmitters": {"expected": 150, "basis": "canonical Stage 1B v1.0.3 benchmark contract; strict labels deliberately unread"},
+        "known_transmitters": {"expected": 98, "basis": "exact frozen transmitter mapping; allowed-row cardinality checked in Stage 02"},
+        "calibration_unknown_transmitters": {"expected": 22, "basis": "allowed calibration-unknown cardinality checked in Stage 02"},
+        "strict_zero_day_transmitters": {"expected": 30, "basis": "frozen Stage 1B protocol contract; strict labels deliberately unread"},
+        "receivers": {"expected": 18, "basis": "exact frozen receiver mapping; allowed-row cardinality checked in Stage 02"},
+        "capture_dates": {"expected": 4, "basis": "exact frozen day mapping; allowed-row cardinality checked in Stage 02"},
+    }
+    return {
+        "expected_source_sha256": EXPECTED_SOURCE_SHA256,
+        "source_sha_provenance_files": source_hits,
+        "stage1b_extreme_amplitude_outliers": EXPECTED_OUTLIERS,
+        "outlier_evidence_files": outlier_hits,
+        "characteristic_contract": characteristic_contract,
+        "characteristic_free_text_gate_used": False,
+        "mappings": mapping_records,
+        "hash_manifest_files": hash_manifest_files,
+    }
+
+
+def split_indices(split: SplitRef) -> np.ndarray:
+    return np.asarray(np.load(split.path, mmap_mode="r", allow_pickle=False), dtype=np.int64)
+
+
+def validate_allowed_disjoint(splits: Mapping[str, SplitRef]) -> None:
+    arrays = {name: np.sort(split_indices(ref)) for name, ref in splits.items()}
+    names = list(arrays)
+    for i, left in enumerate(names):
+        for right in names[i + 1 :]:
+            if np.intersect1d(arrays[left], arrays[right], assume_unique=True).size:
+                raise ScientificAbort(f"Prohibited overlap between {left} and {right}")
+
+
+def iter_split_chunks(split: SplitRef, size: int) -> Iterator[tuple[int, np.ndarray]]:
+    values = np.load(split.path, mmap_mode="r", allow_pickle=False)
+    for start in range(0, len(values), size):
+        yield start, np.asarray(values[start : start + size], dtype=np.int64)
+
+
+def package_versions() -> dict[str, str]:
+    versions = {
+        "python": platform.python_version(), "numpy": np.__version__, "pandas": pd.__version__, "scipy": scipy.__version__,
+        "scikit_learn": sklearn_version, "h5py": h5py.__version__, "matplotlib": matplotlib.__version__, "platform": platform.platform(),
+        "processor": platform.processor(),
+    }
+    try:
+        import psutil
+        versions["cpu_logical"] = str(psutil.cpu_count(logical=True))
+        versions["available_ram_bytes"] = str(psutil.virtual_memory().available)
+    except Exception:
+        versions["available_ram_bytes"] = "unavailable"
+    return versions
+
+
+def rf_features(signals: np.ndarray) -> tuple[np.ndarray, list[str]]:
+    """Extract a compact, physically interpretable deterministic RF feature bank."""
+    x = np.asarray(signals, dtype=np.float64)
+    i, q = x[:, 0, :], x[:, 1, :]
+    z = i + 1j * q
+    amp, power = np.abs(z), np.abs(z) ** 2
+    phase_inc = np.angle(z[:, 1:] * np.conj(z[:, :-1]))
+    names: list[str] = []
+    cols: list[np.ndarray] = []
+
+    def add(name: str, value: np.ndarray) -> None:
+        names.append(name)
+        cols.append(np.nan_to_num(np.asarray(value, dtype=np.float64), nan=0.0, posinf=1e12, neginf=-1e12))
+
+    add("mean_i", i.mean(1)); add("mean_q", q.mean(1)); add("std_i", i.std(1)); add("std_q", q.std(1))
+    add("skew_i", stats.skew(i, axis=1, bias=False)); add("skew_q", stats.skew(q, axis=1, bias=False))
+    add("kurtosis_i", stats.kurtosis(i, axis=1, fisher=True, bias=False)); add("kurtosis_q", stats.kurtosis(q, axis=1, fisher=True, bias=False))
+    add("rms_amplitude", np.sqrt(power.mean(1))); add("amplitude_mean", amp.mean(1)); add("amplitude_std", amp.std(1))
+    for quantile in (0.01, 0.05, 0.25, 0.5, 0.75, 0.95, 0.99):
+        add(f"amplitude_q{int(100*quantile):02d}", np.quantile(amp, quantile, axis=1))
+    peak = amp.max(1); rms = np.sqrt(power.mean(1))
+    add("peak_amplitude", peak); add("crest_factor", peak / (rms + EPS)); add("papr_db", 10 * np.log10((power.max(1) + EPS) / (power.mean(1) + EPS)))
+    add("amplitude_skew", stats.skew(amp, axis=1, bias=False)); add("amplitude_kurtosis", stats.kurtosis(amp, axis=1, fisher=True, bias=False))
+    thirds = np.array_split(power, 3, axis=1); total_energy = power.sum(1) + EPS
+    for n, block in zip(("early", "middle", "late"), thirds): add(f"energy_fraction_{n}", block.sum(1) / total_energy)
+    ic, qc = i - i.mean(1, keepdims=True), q - q.mean(1, keepdims=True)
+    cov = (ic * qc).mean(1); vi, vq = (ic ** 2).mean(1), (qc ** 2).mean(1)
+    add("iq_covariance", cov); add("iq_correlation", cov / np.sqrt(vi * vq + EPS)); add("iq_variance_ratio", vi / (vq + EPS))
+    pseudo = np.mean(z ** 2, axis=1); complex_power = np.mean(np.abs(z) ** 2, axis=1)
+    add("circularity_coefficient", np.abs(pseudo) / (complex_power + EPS)); add("pseudo_covariance_magnitude", np.abs(pseudo))
+    add("radial_coefficient_variation", amp.std(1) / (amp.mean(1) + EPS)); add("phase_increment_mean", phase_inc.mean(1))
+    add("phase_increment_std", phase_inc.std(1)); add("phase_increment_median", np.median(phase_inc, axis=1))
+    add("phase_increment_iqr", np.quantile(phase_inc, .75, axis=1) - np.quantile(phase_inc, .25, axis=1))
+    hist = np.empty(len(x))
+    for row, values in enumerate(phase_inc):
+        counts = np.histogram(values, bins=24, range=(-np.pi, np.pi))[0].astype(float); p = counts / max(counts.sum(), 1)
+        hist[row] = -np.sum(p[p > 0] * np.log2(p[p > 0]))
+    add("phase_increment_entropy", hist); add("instantaneous_frequency_mean", phase_inc.mean(1) / (2 * np.pi))
+    add("instantaneous_frequency_std", phase_inc.std(1) / (2 * np.pi))
+    for lag in (1, 2, 4, 8, 16):
+        ac = np.mean(z[:, lag:] * np.conj(z[:, :-lag]), axis=1) / (complex_power + EPS)
+        add(f"complex_autocorr_mag_lag{lag}", np.abs(ac)); add(f"complex_autocorr_real_lag{lag}", ac.real)
+    for lag in (1, 4, 16):
+        a0, a1 = amp[:, :-lag], amp[:, lag:]
+        num = np.mean((a0 - a0.mean(1, keepdims=True)) * (a1 - a1.mean(1, keepdims=True)), axis=1)
+        add(f"envelope_autocorr_lag{lag}", num / (a0.std(1) * a1.std(1) + EPS))
+    for lag in (1, 2, 4):
+        p0, p1 = phase_inc[:, :-lag], phase_inc[:, lag:]
+        add(f"phase_increment_autocorr_lag{lag}", np.mean(np.cos(p1 - p0), axis=1))
+    spectrum = np.fft.fftshift(np.fft.fft(z, axis=1), axes=1); psd = np.abs(spectrum) ** 2 + EPS
+    psd_p = psd / psd.sum(1, keepdims=True); freq = np.linspace(-0.5, 0.5, psd.shape[1], endpoint=False)
+    centroid = np.sum(psd_p * freq, axis=1); spread = np.sqrt(np.sum(psd_p * (freq[None, :] - centroid[:, None]) ** 2, axis=1))
+    add("spectral_centroid", centroid); add("spectral_spread", spread)
+    add("spectral_entropy", -np.sum(psd_p * np.log2(psd_p), axis=1) / np.log2(psd.shape[1]))
+    add("spectral_flatness", np.exp(np.mean(np.log(psd), axis=1)) / (np.mean(psd, axis=1) + EPS))
+    add("spectral_peak_to_average", psd.max(1) / (psd.mean(1) + EPS)); add("dominant_bin_concentration", psd.max(1) / psd.sum(1))
+    add("dominant_bin_frequency", freq[np.argmax(psd, axis=1)])
+    sorted_psd = np.sort(psd_p, axis=1)[:, ::-1]; cumulative = np.cumsum(sorted_psd, axis=1)
+    add("occupied_bins_99_fraction", (np.argmax(cumulative >= .99, axis=1) + 1) / psd.shape[1])
+    add("spectral_skew", stats.skew(psd_p, axis=1, bias=False)); add("spectral_kurtosis", stats.kurtosis(psd_p, axis=1, fisher=True, bias=False))
+    edge = psd.shape[1] // 8
+    add("spectral_left_edge_fraction", psd_p[:, :edge].sum(1)); add("spectral_right_edge_fraction", psd_p[:, -edge:].sum(1))
+    matrix = np.column_stack(cols).astype(np.float32)
+    return matrix, names
+
+
+def core_feature_names(all_names: Sequence[str]) -> list[str]:
+    wanted = {"mean_i", "mean_q", "std_i", "std_q", "rms_amplitude", "amplitude_mean", "amplitude_std", "amplitude_q50", "amplitude_q95", "amplitude_q99", "peak_amplitude", "crest_factor", "papr_db", "amplitude_skew", "amplitude_kurtosis", "iq_covariance", "iq_correlation", "iq_variance_ratio", "circularity_coefficient", "pseudo_covariance_magnitude", "phase_increment_mean", "phase_increment_std", "phase_increment_entropy", "instantaneous_frequency_mean", "instantaneous_frequency_std", "spectral_centroid", "spectral_spread", "spectral_entropy", "spectral_flatness"}
+    return [x for x in all_names if x in wanted]
+
+
+class Pipeline:
+    def __init__(self, cfg: Stage2MConfig) -> None:
+        self.cfg = cfg
+        self.cfg.validate()
+        np.random.seed(cfg.seeds["numpy_seed"])
+        self.guard = StrictTestGuard()
+        self.log = logging.getLogger("stage2m")
+        self.output = cfg.output_root
+        self.script_path = Path(__file__).resolve()
+        self.script_sha256 = sha256_file(self.script_path)
+        self.dirs = {name: self.output / name for name in ("configs", "checkpoints", "cache", "features", "logs", "manifests", "tables", "figures", "reports", "statistics", "publication", "diagnostics")}
+        for path in self.dirs.values(): path.mkdir(parents=True, exist_ok=True)
+        self.incompatible_output_detected = self.audit_existing_output_compatibility()
+        self.benchmark_sha = ""
+        self.schema: H5Schema | None = None
+        self.splits: dict[str, SplitRef] = {}
+        self.benchmark_access_path = cfg.benchmark_path
+        self.stage_outputs: dict[int, list[Path]] = {}
+
+    def audit_existing_output_compatibility(self) -> bool:
+        incompatible: list[dict[str, Any]] = []
+        for path in sorted(self.dirs["checkpoints"].glob("stage_*.checkpoint.json")):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8")); observed = record.get("script_sha256")
+            except Exception:
+                observed = "UNREADABLE"
+            if observed != self.script_sha256:
+                incompatible.append({"path":str(path.resolve()), "kind":"checkpoint", "observed_script_sha256":observed})
+        config_path = self.dirs["manifests"] / "STAGE2M_CONFIG.json"
+        if config_path.exists():
+            try:
