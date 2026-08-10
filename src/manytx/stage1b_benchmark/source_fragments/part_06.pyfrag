@@ -1,0 +1,191 @@
+        test_count = int(len(self.protocol_indices["strict_zero_day_test_indices"]))
+        known_tx = int(counts.loc["KNOWN_TRAIN_TX", "tx"]) if "KNOWN_TRAIN_TX" in counts.index else 0
+        cal_tx = int(counts.loc["CALIBRATION_UNKNOWN_TX", "tx"]) if "CALIBRATION_UNKNOWN_TX" in counts.index else 0
+        strict_tx = int(counts.loc["STRICT_ZERO_DAY_TX", "tx"]) if "STRICT_ZERO_DAY_TX" in counts.index else 0
+        base = [
+            f"# {BENCHMARK_VERSION}",
+            "",
+            f"- Source dataset: WiSig ManyTx",
+            f"- Source SHA-256: `{self.source_hash}`",
+            f"- Total samples: {len(self.meta)}",
+            f"- Transmitters: {self.meta['transmitter_id'].nunique()}",
+            f"- Receivers: {self.meta['receiver_id'].nunique()}",
+            f"- Days/sessions: {self.meta['day_id'].nunique()} days, {self.meta['session_id'].nunique()} sessions",
+            f"- Actual I/Q length: {sorted(self.meta['signal_length'].unique().tolist())}",
+            f"- Known transmitter count: {known_tx}",
+            f"- Calibration-unknown transmitter count: {cal_tx}",
+            f"- Strict zero-day transmitter count: {strict_tx}",
+            f"- Train/Validation/Test sample counts: {train_count}/{val_count}/{test_count}",
+            f"- Duplicate audit: {self.duplicate_audit}",
+            f"- Leakage audit: strict zero-day and calibration identities are disjoint from Train",
+            f"- Partitioning algorithm: deterministic coverage score over samples, receiver coverage, day coverage, and Tx/Rx/day combinations",
+            f"- Random seed: {self.cfg.partition_seed}",
+            f"- Normalization strategy: per-sample centered RMS normalization; no validation/test statistics are used",
+            f"- Test-access policy: final evaluation only; model selection and threshold selection disabled",
+            f"- Benchmark SHA-256: `{benchmark_sha}`",
+            "",
+            "Known-device classification uses only known transmitter classes with contiguous class indices.",
+            "Zero-day/unseen-device detection uses transmitter identities that never receive known-class training targets.",
+            "",
+            "## Limitations",
+            "Domain-shift protocols marked infeasible reflect missing source coverage and are not synthetically repaired.",
+        ]
+        report = "\n".join(base) + "\n"
+        atomic_write_text(self.dirs["reports"] / "benchmark_freeze_report.md", report)
+        atomic_write_text(self.dirs["reports"] / "reviewer_ready_benchmark_report.md", report)
+
+    def _write_figures(self) -> None:
+        self._bar_figure("samples_per_transmitter.csv", "transmitter_id", "sample_count", "samples_per_transmitter.png", "Samples per transmitter")
+        self._bar_figure("samples_per_receiver.csv", "receiver_id", "sample_count", "samples_per_receiver.png", "Samples per receiver")
+        self._bar_figure("samples_per_day.csv", "day_id", "sample_count", "samples_per_day.png", "Samples per day/session")
+        self._heatmap("transmitter_id", "receiver_id", "tx_receiver_heatmap.png", "Tx x receiver coverage")
+        self._heatmap("transmitter_id", "day_id", "tx_day_heatmap.png", "Tx x day coverage")
+        summary = self.meta.groupby("tx_partition").size().reset_index(name="sample_count")
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(summary["tx_partition"].astype(str), summary["sample_count"].astype(int), color=["#2b6cb0", "#718096", "#c53030", "#805ad5"][: len(summary)])
+        ax.set_title("Split composition")
+        ax.set_ylabel("Samples")
+        ax.tick_params(axis="x", rotation=20)
+        fig.tight_layout()
+        fig.savefig(self.dirs["figures"] / "split_composition.png", dpi=200)
+        plt.close(fig)
+
+    def _bar_figure(self, table_name: str, x_col: str, y_col: str, out_name: str, title: str) -> None:
+        table = pd.read_csv(self.dirs["tables"] / table_name).head(80)
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.bar(np.arange(len(table)), table[y_col].astype(int), color="#2b6cb0")
+        ax.set_title(title)
+        ax.set_ylabel("Samples")
+        ax.set_xticks(np.arange(len(table)))
+        ax.set_xticklabels(table[x_col].astype(str), rotation=90, fontsize=6)
+        fig.tight_layout()
+        fig.savefig(self.dirs["figures"] / out_name, dpi=200)
+        plt.close(fig)
+
+    def _heatmap(self, row_col: str, col_col: str, out_name: str, title: str) -> None:
+        pivot = self.meta.pivot_table(index=row_col, columns=col_col, values="sample_id", aggfunc="count", fill_value=0)
+        pivot = pivot.iloc[:120, :80]
+        fig, ax = plt.subplots(figsize=(12, 7))
+        image = ax.imshow(pivot.to_numpy(), aspect="auto", interpolation="nearest", cmap="viridis")
+        ax.set_title(title)
+        ax.set_xlabel(col_col)
+        ax.set_ylabel(row_col)
+        fig.colorbar(image, ax=ax, label="Samples")
+        fig.tight_layout()
+        fig.savefig(self.dirs["figures"] / out_name, dpi=200)
+        plt.close(fig)
+
+    def _write_publication_artifacts(self, benchmark_sha: str) -> None:
+        xlsx_path = self.dirs["publication"] / "benchmark_summary.xlsx"
+        with pd.ExcelWriter(xlsx_path) as writer:
+            self.meta.groupby("tx_partition").size().reset_index(name="sample_count").to_excel(writer, "partition_summary", index=False)
+            pd.read_csv(self.dirs["tables"] / "samples_per_transmitter.csv").to_excel(writer, "samples_per_tx", index=False)
+            pd.read_csv(self.dirs["tables"] / "tx_receiver_day_coverage.csv").head(50000).to_excel(writer, "tx_rx_day_coverage", index=False)
+        tex = self.meta.groupby("tx_partition").size().reset_index(name="sample_count").to_latex(index=False)
+        atomic_write_text(self.dirs["publication"] / "benchmark_tables.tex", tex)
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        pdf_path = self.dirs["publication"] / "benchmark_report.pdf"
+        with PdfPages(pdf_path) as pdf:
+            fig = plt.figure(figsize=(8.5, 11))
+            text = (
+                f"{BENCHMARK_VERSION}\n\n"
+                f"Source SHA-256: {self.source_hash}\n"
+                f"Benchmark SHA-256: {benchmark_sha}\n"
+                f"Samples: {len(self.meta)}\n"
+                f"Transmitters: {self.meta['transmitter_id'].nunique()}\n"
+                f"Receivers: {self.meta['receiver_id'].nunique()}\n"
+                f"Days: {self.meta['day_id'].nunique()}\n\n"
+                "Model performance evaluation performed: NO\n"
+                f"Status: {READY}\n"
+            )
+            fig.text(0.08, 0.92, text, va="top", ha="left", family="monospace", fontsize=11)
+            pdf.savefig(fig)
+            plt.close(fig)
+            for fig_name in ["split_composition.png", "tx_receiver_heatmap.png", "tx_day_heatmap.png"]:
+                path = self.dirs["figures"] / fig_name
+                if path.exists():
+                    img = plt.imread(path)
+                    fig, ax = plt.subplots(figsize=(11, 8.5))
+                    ax.imshow(img)
+                    ax.axis("off")
+                    pdf.savefig(fig)
+                    plt.close(fig)
+
+    def _write_not_ready(self, reason: str) -> None:
+        self.stage_root.mkdir(parents=True, exist_ok=True)
+        for path in self.dirs.values():
+            path.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "final_status": NOT_READY,
+            "reason": reason,
+            "failures": self.failures,
+            "warnings": self.warnings,
+            "timestamp_utc": utc_stamp(),
+        }
+        atomic_write_json(self.dirs["manifests"] / "BENCHMARK_PROVENANCE.json", payload)
+        atomic_write_text(self.stage_root / "MANYTX_BENCHMARK_NOT_READY.txt", NOT_READY + "\n" + reason + "\n")
+        print(NOT_READY)
+        print(f"Reason: {reason}")
+
+    def _print_success(self, benchmark_sha: str) -> None:
+        strict_tx = self.meta.loc[self.meta["tx_partition"].eq("STRICT_ZERO_DAY_TX"), "transmitter_id"].nunique()
+        known_tx = self.meta.loc[self.meta["tx_partition"].eq("KNOWN_TRAIN_TX"), "transmitter_id"].nunique()
+        cal_tx = self.meta.loc[self.meta["tx_partition"].eq("CALIBRATION_UNKNOWN_TX"), "transmitter_id"].nunique()
+        print("")
+        print(READY)
+        print(f"Frozen benchmark: {self.h5_path}")
+        print(f"Benchmark SHA-256: {benchmark_sha}")
+        print(f"Strict zero-day transmitters: {strict_tx}")
+        print(f"Known training transmitters: {known_tx}")
+        print(f"Calibration-unknown transmitters: {cal_tx}")
+        print("Test model evaluation performed:")
+        print("NO")
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> StageConfig:
+    default_project = Path(os.environ.get("MANYTX_PROJECT_ROOT", "/content/drive/MyDrive/colab files /Surrogate-XAI/project_root"))
+    if not default_project.exists() and not str(default_project).startswith("/content"):
+        default_project = Path.cwd() / "project_root"
+    parser = argparse.ArgumentParser(description="WiSig ManyTx Stage 1B zero-day benchmark engineering")
+    parser.add_argument("--project-root", type=Path, default=default_project, help="Surrogate-XAI project_root directory.")
+    parser.add_argument("--source", type=Path, default=None, help="Path to ManyTx.pkl.zip. If omitted, the runner searches safe project locations.")
+    parser.add_argument("--partition-seed", type=int, default=20260808)
+    parser.add_argument("--python-seed", type=int, default=42)
+    parser.add_argument("--numpy-seed", type=int, default=123)
+    parser.add_argument("--strict-fraction", type=float, default=0.20)
+    parser.add_argument("--calibration-fraction", type=float, default=0.15)
+    parser.add_argument("--validation-fraction", type=float, default=0.15)
+    parser.add_argument("--min-samples-per-tx", type=int, default=2)
+    parser.add_argument("--signal-field", default=None)
+    parser.add_argument("--transmitter-field", default=None)
+    parser.add_argument("--receiver-field", default=None)
+    parser.add_argument("--day-field", default=None)
+    parser.add_argument("--session-field", default=None)
+    args = parser.parse_args(argv)
+    return StageConfig(
+        project_root=args.project_root.resolve(),
+        source=args.source.resolve() if args.source is not None else None,
+        partition_seed=args.partition_seed,
+        python_seed=args.python_seed,
+        numpy_seed=args.numpy_seed,
+        strict_fraction=args.strict_fraction,
+        calibration_fraction=args.calibration_fraction,
+        validation_fraction=args.validation_fraction,
+        min_samples_per_tx=args.min_samples_per_tx,
+        signal_field=args.signal_field,
+        transmitter_field=args.transmitter_field,
+        receiver_field=args.receiver_field,
+        day_field=args.day_field,
+        session_field=args.session_field,
+    )
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    cfg = parse_args(argv)
+    runner = Stage1BRunner(cfg)
+    runner.run()
+
+
+if __name__ == "__main__":
+    main()
