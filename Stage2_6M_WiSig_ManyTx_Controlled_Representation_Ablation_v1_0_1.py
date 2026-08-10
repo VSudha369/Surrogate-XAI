@@ -67,6 +67,14 @@ EXPECTED_BENCHMARK_SHA256 = "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe0308
 EXPECTED_STAGE2M_VERSION = "1.0.5"
 EXPECTED_STAGE2M_SCRIPT_SHA256 = "46c95bbf9fb6806a5f463b4e173434a5f03f013367b1bcd38ebb73c07d0f67ba"
 EXPECTED_STAGE2M_HASH_MANIFEST_SHA256 = "0a8853d782006ce8af2d7b798a61c1e141afbeb55066cb70115ae41c8d24f16a"
+
+# This predecessor produced scientifically valid synchronized checkpoints before
+# failing only when AMP encountered a non-finite gradient. Accepting it preserves
+# completed epochs while all other frozen provenance and architecture gates remain
+# mandatory. New checkpoints always record the current script SHA-256.
+CHECKPOINT_COMPATIBLE_SCRIPT_SHA256 = frozenset({
+    "421e3c64ce33b3b7929e10d5af84debe9e735c9b2a8709475080cfa0346fd6ac",
+})
 EXPECTED_SIGNAL_SHAPE = (2, 256)
 EXPECTED_TOTAL_SAMPLES = 1_020_643
 EXPECTED_KNOWN_CLASSES = 98
@@ -1504,10 +1512,11 @@ def validate_checkpoint(
     benchmark_sha: str,
     script_sha: str,
 ) -> None:
+    recorded_script_sha = payload.get("script_sha")
     checks = {
         "benchmark SHA": payload.get("benchmark_sha") == benchmark_sha,
         "Stage 2M SHA": payload.get("stage2m_sha") == EXPECTED_STAGE2M_SCRIPT_SHA256,
-        "script SHA": payload.get("script_sha") == script_sha,
+        "script SHA": recorded_script_sha == script_sha or recorded_script_sha in CHECKPOINT_COMPATIBLE_SCRIPT_SHA256,
         "configuration SHA": payload.get("configuration_sha") == config.configuration_sha256(),
         "arm": payload.get("arm") == run.arm,
         "seed": int(payload.get("seed", -1)) == run.seed,
@@ -1596,6 +1605,12 @@ def train_one_epoch(
         if not torch.isfinite(gradient_norm):
             nonfinite_events += 1
             run.optimizer.zero_grad(set_to_none=True)
+            # unscale_() records the non-finite gradients in GradScaler. Calling
+            # step() lets GradScaler skip optimizer.step() canonically, and the
+            # paired update() lowers the scale and resets per-optimizer state
+            # before the next batch.
+            run.scaler.step(run.optimizer)
+            run.scaler.update()
             if nonfinite_events >= 2:
                 raise ScientificAbort(f"Persistent non-finite gradients for {run.arm}, seed {run.seed}")
             continue

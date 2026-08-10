@@ -34,6 +34,8 @@ Stage 1B and Stage 2M are opened read-only. `manifests/STAGE2M_FINAL_STATUS.json
 
 The easiest route is to mount Google Drive once in the parent Colab notebook and execute `Stage2_6M_Colab_Launcher_v1_0_1.py` as a subprocess. The launcher detects an accessible existing mount, installs only missing dependencies, verifies upstream inputs, reports the GPU, and invokes the standalone program with `subprocess.check_call`. When run from a cloned repository it prefers the standalone script beside the launcher; `WISIG_STAGE2_6M_SCRIPT` remains the explicit override, and Drive-wide discovery is used only as a fallback. If Drive is not already accessible, the launcher emits a clear instruction instead of attempting an unsupported mount from a non-IPython child process.
 
+Full-profile training resumes only from a complete synchronized four-arm epoch checkpoint. The v1.0.1 AMP recovery correction explicitly accepts checkpoints written by predecessor script SHA-256 `421e3c64ce33b3b7929e10d5af84debe9e735c9b2a8709475080cfa0346fd6ac`; every other benchmark, Stage 2M, configuration, architecture, arm, and seed provenance gate remains mandatory, and all newly written checkpoints record the corrected script SHA-256.
+
 Environment overrides are explicit:
 
 ```python
