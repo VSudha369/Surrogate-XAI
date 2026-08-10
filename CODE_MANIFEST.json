@@ -24,8 +24,8 @@
     },
     {
       "path": "README.md",
-      "bytes": 6306,
-      "sha256": "c294fddf3a23e38dbc15d859b4758e86966e46bf582a8acb1dcf557b9bfb4208"
+      "bytes": 6738,
+      "sha256": "3cd62da17241e1971bf8f0d0b670d1de4efe3c0c771e47c1602837bc51760084"
     },
     {
       "path": "SCIENTIFIC_PROTOCOL.md",
@@ -59,8 +59,8 @@
     },
     {
       "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_1.py",
-      "bytes": 185062,
-      "sha256": "7493e709bf0cd4a41b990b950f8603900ce4904299497c400ab5df7de346a141"
+      "bytes": 186579,
+      "sha256": "1b66b23ff0b0810a0f7070c450dff038fb38d962bd65bbe6fc3f56f551b850f3"
     },
     {
       "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_1.ipynb",

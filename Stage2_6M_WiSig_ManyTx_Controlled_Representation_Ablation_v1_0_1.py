@@ -74,7 +74,9 @@ EXPECTED_STAGE2M_HASH_MANIFEST_SHA256 = "0a8853d782006ce8af2d7b798a61c1e141afbeb
 # mandatory. New checkpoints always record the current script SHA-256.
 CHECKPOINT_COMPATIBLE_SCRIPT_SHA256 = frozenset({
     "421e3c64ce33b3b7929e10d5af84debe9e735c9b2a8709475080cfa0346fd6ac",
+    "7493e709bf0cd4a41b990b950f8603900ce4904299497c400ab5df7de346a141",
 })
+MAX_CONSECUTIVE_AMP_OVERFLOWS = 32
 EXPECTED_SIGNAL_SHAPE = (2, 256)
 EXPECTED_TOTAL_SAMPLES = 1_020_643
 EXPECTED_KNOWN_CLASSES = 98
@@ -1538,17 +1540,41 @@ def resume_training_runs(
 ) -> Tuple[int, Dict[str, Any]]:
     if not config.resume:
         return 0, {"stale_epochs": 0, "epochs_without_any_improvement": 0}
-    paths = {arm: checkpoint_dir(config, arm, run.seed) / "last.pt" for arm, run in runs.items()}
-    existing = {arm: path.is_file() for arm, path in paths.items()}
-    if not any(existing.values()):
-        return 0, {"stale_epochs": 0, "epochs_without_any_improvement": 0}
-    if not all(existing.values()):
-        raise ScientificAbort(f"INVALIDATE_AND_RESTART_ARM: incomplete synchronized seed checkpoint set {existing}")
-    epochs = set()
-    group_states = []
+    candidates: Dict[str, Dict[int, Mapping[str, Any]]] = {}
+    any_checkpoint = False
     for arm, run in runs.items():
-        payload = safe_torch_load(paths[arm], map_location=device)
-        validate_checkpoint(payload, run, config, benchmark_sha, script_sha)
+        base = checkpoint_dir(config, arm, run.seed)
+        paths = (base / "last.pt", base / "resume_slot_0.pt", base / "resume_slot_1.pt")
+        candidates[arm] = {}
+        for path in paths:
+            if not path.is_file():
+                continue
+            any_checkpoint = True
+            payload = safe_torch_load(path, map_location=device)
+            validate_checkpoint(payload, run, config, benchmark_sha, script_sha)
+            candidates[arm].setdefault(int(payload["epoch"]), payload)
+    if not any_checkpoint:
+        return 0, {"stale_epochs": 0, "epochs_without_any_improvement": 0}
+    missing = [arm for arm, payloads in candidates.items() if not payloads]
+    if missing:
+        raise ScientificAbort(f"INVALIDATE_AND_RESTART_ARM: incomplete synchronized seed checkpoint set; missing={missing}")
+    common_epochs = set.intersection(*(set(payloads) for payloads in candidates.values()))
+    selected_epoch: Optional[int] = None
+    selected_payloads: Dict[str, Mapping[str, Any]] = {}
+    for epoch in sorted(common_epochs, reverse=True):
+        payloads = {arm: candidates[arm][epoch] for arm in runs}
+        group_state_hashes = {sha256_object(dict(payload.get("group_state", {}))) for payload in payloads.values()}
+        if len(group_state_hashes) == 1:
+            selected_epoch = epoch
+            selected_payloads = payloads
+            break
+    if selected_epoch is None:
+        available = {arm: sorted(payloads) for arm, payloads in candidates.items()}
+        raise ScientificAbort(
+            f"INVALIDATE_AND_RESTART_ARM: no synchronized common epoch checkpoint; available={available}"
+        )
+    for arm, run in runs.items():
+        payload = selected_payloads[arm]
         run.model.load_state_dict(payload["model_state"], strict=True)
         run.optimizer.load_state_dict(payload["optimizer_state"])
         run.scheduler.load_state_dict(payload["scheduler_state"])
@@ -1557,13 +1583,9 @@ def resume_training_runs(
         run.best_metrics = dict(payload.get("best_metrics", {}))
         run.best_known = float(payload.get("best_known", -math.inf))
         run.best_selection = tuple(payload.get("best_selection", (-math.inf, -math.inf, -math.inf)))  # type: ignore[assignment]
-        epochs.add(int(payload["epoch"]))
-        group_states.append(dict(payload.get("group_state", {})))
-    if len(epochs) != 1 or len({sha256_object(x) for x in group_states}) != 1:
-        raise ScientificAbort("INVALIDATE_AND_RESTART_ARM: synchronized arm checkpoints disagree")
-    completed_epoch = epochs.pop()
-    logger.info("Resuming synchronized seed %s after epoch %d", next(iter(runs.values())).seed, completed_epoch)
-    return completed_epoch, group_states[0]
+    group_state = dict(next(iter(selected_payloads.values())).get("group_state", {}))
+    logger.info("Resuming synchronized seed %s after epoch %d", next(iter(runs.values())).seed, selected_epoch)
+    return selected_epoch, group_state
 
 
 def train_one_epoch(
@@ -1581,6 +1603,8 @@ def train_one_epoch(
     samples = 0
     successful_steps = 0
     nonfinite_events = 0
+    nonfinite_loss_events = 0
+    consecutive_amp_overflows = 0
     equalized_counts = np.zeros(2, dtype=np.int64)
     use_amp = config.amp_enabled and device.type == "cuda"
     for batch in loader:
@@ -1595,7 +1619,8 @@ def train_one_epoch(
         loss, components = objective_loss(run.arm, outputs, y, run.prototypes, config)
         if not torch.isfinite(loss):
             nonfinite_events += 1
-            if nonfinite_events >= 2:
+            nonfinite_loss_events += 1
+            if nonfinite_loss_events >= 2:
                 raise ScientificAbort(f"Persistent non-finite loss for {run.arm}, seed {run.seed}")
             continue
         previous_scale = float(run.scaler.get_scale())
@@ -1604,6 +1629,7 @@ def train_one_epoch(
         gradient_norm = torch.nn.utils.clip_grad_norm_(run.model.parameters(), max_norm=5.0)
         if not torch.isfinite(gradient_norm):
             nonfinite_events += 1
+            consecutive_amp_overflows += 1
             run.optimizer.zero_grad(set_to_none=True)
             # unscale_() records the non-finite gradients in GradScaler. Calling
             # step() lets GradScaler skip optimizer.step() canonically, and the
@@ -1611,7 +1637,7 @@ def train_one_epoch(
             # before the next batch.
             run.scaler.step(run.optimizer)
             run.scaler.update()
-            if nonfinite_events >= 2:
+            if consecutive_amp_overflows >= MAX_CONSECUTIVE_AMP_OVERFLOWS:
                 raise ScientificAbort(f"Persistent non-finite gradients for {run.arm}, seed {run.seed}")
             continue
         run.scaler.step(run.optimizer)
@@ -1620,6 +1646,7 @@ def train_one_epoch(
         step_succeeded = not use_amp or current_scale >= previous_scale
         if step_succeeded:
             successful_steps += 1
+            consecutive_amp_overflows = 0
             if ARM_DEFINITIONS[run.arm]["prototype_weight"] > 0:
                 run.prototypes.update(outputs["embedding_normalized"].detach(), y)
         batch_n = len(y)
@@ -1731,7 +1758,7 @@ def train_seed_group(
             provisional_group_state = {"epochs_without_any_improvement": 0 if any_improvement else stale_epochs + 1}
             payload = checkpoint_payload(run, config, epoch, benchmark_sha, script_sha, exposure_sha, provisional_group_state)
             base = checkpoint_dir(config, arm, seed)
-            atomic_torch_save(base / "last.pt", payload, config.output_root)
+            atomic_torch_save(base / f"resume_slot_{epoch % 2}.pt", payload, config.output_root)
             if is_known_best:
                 atomic_torch_save(base / "best_known_macro_f1.pt", payload, config.output_root)
             if is_selection_best:
@@ -1748,6 +1775,8 @@ def train_seed_group(
         if len({row["exposure_sha256"] for row in epoch_rows}) != 1:
             raise ScientificAbort("Same-epoch sampler exposure differs between arms")
         common_group_state = {"epochs_without_any_improvement": 0 if any_improvement else stale_epochs + 1}
+        history_rows.extend(epoch_rows)
+        atomic_write_csv(history_path, pd.DataFrame(history_rows), config.output_root)
         for arm, run in runs.items():
             synchronized_payload = checkpoint_payload(
                 run,
@@ -1759,8 +1788,11 @@ def train_seed_group(
                 common_group_state,
             )
             atomic_torch_save(checkpoint_dir(config, arm, seed) / "last.pt", synchronized_payload, config.output_root)
-        history_rows.extend(epoch_rows)
-        atomic_write_csv(history_path, pd.DataFrame(history_rows), config.output_root)
+            atomic_torch_save(
+                checkpoint_dir(config, arm, seed) / f"resume_slot_{epoch % 2}.pt",
+                synchronized_payload,
+                config.output_root,
+            )
         stale_epochs = 0 if any_improvement else stale_epochs + 1
         if epoch >= config.minimum_epochs and stale_epochs >= config.early_stopping_patience:
             logger.info("Synchronized group early stop for seed %d at epoch %d", seed, epoch)
