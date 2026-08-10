@@ -1,0 +1,78 @@
+{
+  "artifact": "Stage 2.6M — WiSig ManyTx Controlled Representation Learning & Domain-Robust Embedding Ablation",
+  "version": "1.0.0",
+  "generated_date": "2026-08-10",
+  "canonical_benchmark": "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3",
+  "canonical_benchmark_sha256": "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9",
+  "source_provenance": [
+    {
+      "name": "Surrogate_XAI (2).ipynb",
+      "sha256": "f6c291149cb4f058fc9199dacb31a8cfd43d502dbbd996ec786db97f6b30252f",
+      "role": "Prior-work review only; its RadioML-oriented diagnostic bundle is not the active Stage 2.6M pipeline"
+    },
+    {
+      "name": "Stage 2.6M master generation prompt",
+      "sha256": "c225368963152c882b1637ab0055547406efdd9329d1430226087e2e807fd631",
+      "role": "Authoritative scientific and engineering specification"
+    }
+  ],
+  "files": [
+    {
+      "path": ".gitignore",
+      "bytes": 144,
+      "sha256": "1b0c67532e073ad3cd1be5eb47fe61d453be4390580775907fad5f4e2a63c958"
+    },
+    {
+      "path": "README.md",
+      "bytes": 4848,
+      "sha256": "657212fec561978f54c64bd3e96c670dc09f8bccf5a3a8ec3152242626318037"
+    },
+    {
+      "path": "SCIENTIFIC_PROTOCOL.md",
+      "bytes": 7321,
+      "sha256": "c607beef5d193ee65bb08fa3cbfb522b62080daf7cfe70661f5917445e68b80a"
+    },
+    {
+      "path": "OUTPUT_SCHEMA.md",
+      "bytes": 4465,
+      "sha256": "fe4144cf882c83a1fc94f22b965b7443ad1aec5d32ab19a2b73e4834638fa5cd"
+    },
+    {
+      "path": "VALIDATION_CHECKLIST.md",
+      "bytes": 3394,
+      "sha256": "2cc7487b97690024d6528ce1b878d5f094dfa6140446bd16bafda3f64bf42b18"
+    },
+    {
+      "path": "requirements.txt",
+      "bytes": 144,
+      "sha256": "b88d3e652ed928637f886b2541a5d4314885c5df8a64a502ddc56cbc0b84fb00"
+    },
+    {
+      "path": "stage2_6m_config.example.json",
+      "bytes": 343,
+      "sha256": "d92b2f7f01e70fabe79bbd10d44184090f15afaf2b8050527bf251f89a6cc588"
+    },
+    {
+      "path": "Stage2_6M_Colab_Launcher_v1_0_0.py",
+      "bytes": 5452,
+      "sha256": "899408a8134b546b19ab7a4696e00b1fe6bfe8e8e8102127cc39923ce9b1ba8e"
+    },
+    {
+      "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_0.py",
+      "bytes": 179993,
+      "sha256": "7052305bd362ad9e942b2d3a04f0cfb6bcd9b3b188e34ea9062a70ad20f92ee1"
+    },
+    {
+      "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_0.ipynb",
+      "bytes": 2378,
+      "sha256": "42eff00362ea847dab98f88a9225557b2e5795b32d1a3c181bf256429fa55bb5"
+    }
+  ],
+  "validation": {
+    "python_ast_parse": "PASS",
+    "notebook_json_parse": "PASS",
+    "undefined_global_symbol_audit": "PASS (__file__ is the only runtime-provided symbol)",
+    "scientific_execution": "NOT_RUN_LOCALLY — frozen benchmark and ML runtime are not present in this workspace",
+    "synthetic_execution": "NOT_RUN_LOCALLY — torch/scipy/scikit-learn/h5py/matplotlib are not installed in the bundled document runtime"
+  }
+}
