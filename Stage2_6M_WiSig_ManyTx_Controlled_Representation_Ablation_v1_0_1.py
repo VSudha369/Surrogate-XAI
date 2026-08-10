@@ -397,15 +397,64 @@ def flatten_json_records(value: Any, trail: Tuple[str, ...] = ()) -> Iterator[Tu
         yield trail, value
 
 
-def iter_json_containers(value: Any) -> Iterator[Any]:
+def manifest_name_matches(value: Any, filename: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    basename = value.replace("\\", "/").rstrip("/").split("/")[-1]
+    candidate = normalize_token(basename)
+    stem = normalize_token(Path(filename).stem)
+    targets = {normalize_token(filename), stem, re.sub(r"_indices$", "", stem)}
+    return candidate in targets
+
+
+def iter_bound_manifest_records(
+    value: Any,
+    filename: str,
+    trail: Tuple[str, ...] = (),
+) -> Iterator[Tuple[Tuple[str, ...], Mapping[str, Any]]]:
+    """Yield only manifest records directly bound to ``filename``."""
     if isinstance(value, Mapping):
-        yield value
-        for child in value.values():
-            yield from iter_json_containers(child)
+        bound_by_trail = any(manifest_name_matches(part, filename) for part in trail)
+        bound_by_value = any(manifest_name_matches(child, filename) for child in value.values())
+        if bound_by_trail or bound_by_value:
+            yield trail, value
+        for key, child in value.items():
+            child_trail = trail + (str(key),)
+            if manifest_name_matches(str(key), filename) and isinstance(child, str) and re.fullmatch(r"[0-9a-fA-F]{64}", child.strip()):
+                yield child_trail, {"sha256": child}
+            yield from iter_bound_manifest_records(child, filename, child_trail)
     elif isinstance(value, list):
-        yield value
-        for child in value:
-            yield from iter_json_containers(child)
+        for index, child in enumerate(value):
+            yield from iter_bound_manifest_records(child, filename, trail + (str(index),))
+
+
+def extract_bound_manifest_declarations(
+    payload: Any,
+    filename: str,
+) -> Tuple[set[str], set[int], List[str]]:
+    hashes: set[str] = set()
+    counts: set[int] = set()
+    record_locations: List[str] = []
+    for trail, record in iter_bound_manifest_records(payload, filename):
+        record_hashes: set[str] = set()
+        record_counts: set[int] = set()
+        for leaf_trail, value in flatten_json_records(record):
+            key = normalize_token("_".join(leaf_trail))
+            if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value.strip()) and any(
+                token in key for token in ("sha256", "sha_256", "hash", "digest")
+            ):
+                record_hashes.add(value.strip().lower())
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and any(
+                token in key for token in ("count", "samples", "num_indices", "n_indices", "length", "size")
+            ):
+                numeric = int(value)
+                if float(value) == numeric:
+                    record_counts.add(numeric)
+        if record_hashes or record_counts:
+            hashes.update(record_hashes)
+            counts.update(record_counts)
+            record_locations.append("/".join(trail) or "<root>")
+    return hashes, counts, sorted(set(record_locations))
 
 
 class StrictZeroDayGuard:
@@ -462,36 +511,37 @@ class StrictZeroDayGuard:
                 raise ScientificAbort(f"Expected exactly one frozen {filename}; found {len(matches)}")
             path = matches[0]
             actual_sha = sha256_file(path)
-            declared_count: Optional[int] = None
-            declared_sha: Optional[str] = None
-            evidence_files: set[str] = set()
-            name_token = normalize_token(filename)
-            stem_token = normalize_token(Path(filename).stem)
+            declared_counts: set[int] = set()
+            declared_hashes: set[str] = set()
+            count_evidence: set[str] = set()
+            hash_evidence: set[str] = set()
             for manifest_path, payload in manifests:
-                for container in iter_json_containers(payload):
-                    serialized = normalize_token(json.dumps(json_ready(container), sort_keys=True))
-                    if stem_token not in serialized and name_token not in serialized:
-                        continue
-                    evidence_files.add(str(manifest_path))
-                    for trail, value in flatten_json_records(container):
-                        joined = normalize_token("_".join(trail))
-                        if isinstance(value, (int, float)) and any(t in joined for t in ("count", "samples", "size", "length")):
-                            if int(value) == expected_count:
-                                declared_count = int(value)
-                        if isinstance(value, str) and re.fullmatch(r"[0-9a-fA-F]{64}", value.strip()) and any(t in joined for t in ("sha", "hash", "digest")):
-                            declared_sha = value.lower()
-            if declared_count != expected_count:
+                hashes, counts, locations = extract_bound_manifest_declarations(payload, filename)
+                if expected_count in counts:
+                    declared_counts.add(expected_count)
+                    count_evidence.add(str(manifest_path))
+                if actual_sha in hashes:
+                    declared_hashes.add(actual_sha)
+                    hash_evidence.add(str(manifest_path))
+                if locations and hashes:
+                    declared_hashes.update(hashes)
+            if expected_count not in declared_counts:
                 raise ScientificAbort(f"Frozen manifest count missing or wrong for {filename}")
-            if declared_sha is not None and declared_sha != actual_sha:
-                raise ScientificAbort(f"Frozen manifest SHA mismatch for {filename}")
+            if actual_sha not in declared_hashes:
+                raise ScientificAbort(
+                    f"Frozen manifest SHA mismatch for {filename}: actual {actual_sha}; "
+                    f"path-bound declarations {sorted(declared_hashes)}"
+                )
             self.strict_file_audit.append({
                 "path": str(path),
                 "exists": True,
-                "count_from_manifest": declared_count,
+                "count_from_manifest": expected_count,
                 "expected_count": expected_count,
                 "sha256": actual_sha,
-                "declared_sha256": declared_sha,
-                "manifest_evidence": sorted(evidence_files),
+                "declared_sha256": actual_sha,
+                "count_manifest_evidence": sorted(count_evidence),
+                "hash_manifest_evidence": sorted(hash_evidence),
+                "path_bound_hash_candidates": sorted(declared_hashes),
                 "loaded_into_memory": False,
             })
         return self.strict_file_audit
