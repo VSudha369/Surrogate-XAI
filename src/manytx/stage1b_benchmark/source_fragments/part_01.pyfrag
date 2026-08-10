@@ -1,0 +1,226 @@
+                "day_id": df[day_col].astype(str) if day_col is not None else "NOT_REPRESENTED",
+                "session_id": df[session_col].astype(str) if session_col is not None else "NOT_REPRESENTED",
+                "equalization_state": df[eq_col].astype(str) if eq_col is not None else "NOT_REPRESENTED",
+                "source_index": np.arange(len(df), dtype=np.int64),
+                "source_member": "pickle:dataframe",
+            }
+        )
+        accessor = SignalAccessor()
+        accessor.add_group(df[signal_col], meta.to_dict("records"))
+        return accessor, meta, self.notes
+
+    def _from_dict(self, obj: Dict[Any, Any], path: str) -> Optional[Tuple[SignalAccessor, pd.DataFrame, List[Dict[str, Any]]]]:
+        native_manytx = self._from_wisig_manytx_dict(obj)
+        if native_manytx is not None:
+            return native_manytx
+        if self.cfg.signal_field:
+            if self.cfg.signal_field in obj:
+                return self._from_keyed_dict(obj, self.cfg.signal_field)
+            raise ScientificAbort(f"Requested signal field '{self.cfg.signal_field}' was not found.")
+        signal_key = None
+        for key, value in obj.items():
+            if isinstance(value, np.ndarray) and self._is_signal_array(value) and self._name_matches(key, self.SIGNAL_NAMES):
+                signal_key = key
+                break
+        if signal_key is None:
+            for key, value in obj.items():
+                if isinstance(value, np.ndarray) and self._is_signal_array(value):
+                    signal_key = key
+                    self.notes.append(f"Detected signal array by shape and dtype at {path}.{key}")
+                    break
+        if signal_key is not None:
+            return self._from_keyed_dict(obj, signal_key)
+        nested = self._from_nested_dict(obj)
+        return nested
+
+    def _from_wisig_manytx_dict(
+        self, obj: Dict[Any, Any]
+    ) -> Optional[Tuple[SignalAccessor, pd.DataFrame, List[Dict[str, Any]]]]:
+        required = {
+            "tx_list",
+            "rx_list",
+            "capture_date_list",
+            "equalized_list",
+            "max_sig",
+            "data",
+        }
+        if not required.issubset(set(obj.keys())):
+            return None
+
+        tx_list = list(obj["tx_list"])
+        rx_list = list(obj["rx_list"])
+        day_list = list(obj["capture_date_list"])
+        eq_list = list(obj["equalized_list"])
+        data = obj["data"]
+
+        try:
+            max_sig = int(obj["max_sig"])
+        except Exception as exc:
+            raise ScientificAbort(f"WiSig ManyTx max_sig is not an integer: {obj['max_sig']!r}") from exc
+        if max_sig < 1:
+            raise ScientificAbort(f"WiSig ManyTx max_sig must be positive; got {max_sig}.")
+
+        if not isinstance(data, (list, tuple)):
+            raise ScientificAbort(f"WiSig ManyTx 'data' must be a list/tuple; got {type(data).__name__}.")
+        if len(data) != len(tx_list):
+            raise ScientificAbort(
+                f"WiSig ManyTx axis-0 mismatch: len(data)={len(data)} but len(tx_list)={len(tx_list)}."
+            )
+
+        accessor = SignalAccessor()
+        rows: List[Dict[str, Any]] = []
+        empty_cells = 0
+        nonempty_cells = 0
+        total_samples = 0
+        signal_lengths: set[int] = set()
+        source_orientations: set[str] = set()
+
+        for tx_idx, tx_id in enumerate(tx_list):
+            tx_block = data[tx_idx]
+            if not isinstance(tx_block, (list, tuple)) or len(tx_block) != len(rx_list):
+                got = len(tx_block) if isinstance(tx_block, (list, tuple)) else type(tx_block).__name__
+                raise ScientificAbort(
+                    f"WiSig ManyTx axis-1 mismatch at tx index {tx_idx} ({tx_id!r}): "
+                    f"expected {len(rx_list)} receivers, got {got}."
+                )
+
+            for rx_idx, rx_id in enumerate(rx_list):
+                rx_block = tx_block[rx_idx]
+                if not isinstance(rx_block, (list, tuple)) or len(rx_block) != len(day_list):
+                    got = len(rx_block) if isinstance(rx_block, (list, tuple)) else type(rx_block).__name__
+                    raise ScientificAbort(
+                        f"WiSig ManyTx axis-2 mismatch at tx={tx_id!r}, rx={rx_id!r}: "
+                        f"expected {len(day_list)} capture dates, got {got}."
+                    )
+
+                for day_idx, day_id in enumerate(day_list):
+                    day_block = rx_block[day_idx]
+                    if not isinstance(day_block, (list, tuple)) or len(day_block) != len(eq_list):
+                        got = len(day_block) if isinstance(day_block, (list, tuple)) else type(day_block).__name__
+                        raise ScientificAbort(
+                            f"WiSig ManyTx axis-3 mismatch at tx={tx_id!r}, rx={rx_id!r}, "
+                            f"date={day_id!r}: expected {len(eq_list)} equalization states, got {got}."
+                        )
+
+                    for eq_idx, eq_state in enumerate(eq_list):
+                        cell = day_block[eq_idx]
+                        if not isinstance(cell, np.ndarray):
+                            raise ScientificAbort(
+                                f"WiSig ManyTx terminal cell must be ndarray at indices "
+                                f"({tx_idx},{rx_idx},{day_idx},{eq_idx}); got {type(cell).__name__}."
+                            )
+                        if cell.ndim != 3:
+                            raise ScientificAbort(
+                                f"WiSig ManyTx terminal cell must be rank-3 at indices "
+                                f"({tx_idx},{rx_idx},{day_idx},{eq_idx}); got shape {cell.shape}."
+                            )
+                        if not np.issubdtype(cell.dtype, np.number):
+                            raise ScientificAbort(
+                                f"WiSig ManyTx terminal cell must be numeric at indices "
+                                f"({tx_idx},{rx_idx},{day_idx},{eq_idx}); got dtype {cell.dtype}."
+                            )
+                        if cell.shape[0] > max_sig:
+                            raise ScientificAbort(
+                                f"WiSig ManyTx terminal cell contains {cell.shape[0]} signals, exceeding "
+                                f"declared max_sig={max_sig}, at indices ({tx_idx},{rx_idx},{day_idx},{eq_idx})."
+                            )
+
+                        if cell.shape[2] == 2 and cell.shape[1] >= 8:
+                            signal_length = int(cell.shape[1])
+                            orientation = "N,L,IQ"
+                        elif cell.shape[1] == 2 and cell.shape[2] >= 8:
+                            signal_length = int(cell.shape[2])
+                            orientation = "N,IQ,L"
+                        else:
+                            raise ScientificAbort(
+                                f"WiSig ManyTx terminal cell does not expose an unambiguous I/Q axis of size 2 "
+                                f"at indices ({tx_idx},{rx_idx},{day_idx},{eq_idx}); got shape {cell.shape}."
+                            )
+
+                        signal_lengths.add(signal_length)
+                        source_orientations.add(orientation)
+                        n = int(cell.shape[0])
+                        if n == 0:
+                            empty_cells += 1
+                            continue
+
+                        nonempty_cells += 1
+                        meta_rows: List[Dict[str, Any]] = []
+                        source_cell = (
+                            f"pickle:data/tx[{tx_idx}]={tx_id}/rx[{rx_idx}]={rx_id}/"
+                            f"capture_date[{day_idx}]={day_id}/equalized[{eq_idx}]={eq_state}"
+                        )
+                        for sample_idx in range(n):
+                            meta_rows.append(
+                                {
+                                    "transmitter_id": str(tx_id),
+                                    "receiver_id": str(rx_id),
+                                    "day_id": str(day_id),
+                                    # ManyTx exposes capture_date_list but no independent session identifier.
+                                    "session_id": "NOT_REPRESENTED",
+                                    "equalization_state": str(eq_state),
+                                    "source_index": int(sample_idx),
+                                    "source_member": source_cell,
+                                    "source_tx_index": int(tx_idx),
+                                    "source_rx_index": int(rx_idx),
+                                    "source_day_index": int(day_idx),
+                                    "source_equalization_index": int(eq_idx),
+                                }
+                            )
+                        accessor.add_group(cell, meta_rows)
+                        rows.extend(meta_rows)
+                        total_samples += n
+
+        if total_samples == 0:
+            raise ScientificAbort("WiSig ManyTx native schema was recognized, but it contains zero signals.")
+
+        self.notes.append(
+            "Detected native WiSig ManyTx schema WISIG_MANYTX_NATIVE_NESTED_V1 using explicit "
+            "tx_list, rx_list, capture_date_list, equalized_list, max_sig, and data fields. "
+            "Axis mapping is source-authentic: axis0=tx_list, axis1=rx_list, "
+            "axis2=capture_date_list, axis3=equalized_list. No session field exists in the source, "
+            "so session_id is recorded as NOT_REPRESENTED rather than inferred from capture date. "
+            f"Transmitters={len(tx_list)}, receivers={len(rx_list)}, capture_dates={len(day_list)}, "
+            f"equalization_states={len(eq_list)}, nonempty_cells={nonempty_cells}, "
+            f"empty_cells={empty_cells}, samples={total_samples}, "
+            f"source_orientations={sorted(source_orientations)}, signal_lengths={sorted(signal_lengths)}."
+        )
+        meta = pd.DataFrame(rows)
+        return accessor, meta, self.notes
+
+    def _from_keyed_dict(self, obj: Dict[Any, Any], signal_key: Any) -> Tuple[SignalAccessor, pd.DataFrame, List[Dict[str, Any]]]:
+        signals = obj[signal_key]
+        n = len(signals)
+        keys = list(obj.keys())
+
+        def aligned_array(field: Optional[str], needles: Sequence[str], default: str) -> List[str]:
+            selected = self._field_for(keys, field, needles)
+            if selected is None:
+                return [default] * n
+            values = obj[selected]
+            if np.isscalar(values) or isinstance(values, str):
+                return [str(values)] * n
+            if len(values) != n:
+                raise ScientificAbort(f"Metadata field '{selected}' length {len(values)} does not match signal count {n}.")
+            return [str(v) for v in list(values)]
+
+        tx = aligned_array(self.cfg.transmitter_field, self.TX_NAMES, "")
+        if any(v == "" for v in tx):
+            raise ScientificAbort("Signal array was found, but transmitter identifiers were not found.")
+        meta = pd.DataFrame(
+            {
+                "transmitter_id": tx,
+                "receiver_id": aligned_array(self.cfg.receiver_field, self.RX_NAMES, "NOT_REPRESENTED"),
+                "day_id": aligned_array(self.cfg.day_field, self.DAY_NAMES, "NOT_REPRESENTED"),
+                "session_id": aligned_array(self.cfg.session_field, self.SESSION_NAMES, "NOT_REPRESENTED"),
+                "equalization_state": aligned_array(None, self.EQ_NAMES, "NOT_REPRESENTED"),
+                "source_index": np.arange(n, dtype=np.int64),
+                "source_member": f"pickle:{signal_key}",
+            }
+        )
+        accessor = SignalAccessor()
+        accessor.add_group(signals, meta.to_dict("records"))
+        return accessor, meta, self.notes
+
+    def _from_nested_dict(self, obj: Dict[Any, Any]) -> Optional[Tuple[SignalAccessor, pd.DataFrame, List[Dict[str, Any]]]]:
+        accessor = SignalAccessor()
