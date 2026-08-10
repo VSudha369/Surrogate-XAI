@@ -1,0 +1,134 @@
+{
+  "artifact": "Stage2M_WiSig_ManyTx_Scientific_Diagnostics_v1_0_5",
+  "version": "1.0.5",
+  "generated_utc": "2026-08-09T19:10:12.5582180Z",
+  "purpose": "Corrected implementation bundle; no benchmark results are fabricated or included.",
+  "canonical_benchmark": {
+    "name": "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3",
+    "required_sha256": "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9",
+    "expected_source_sha256": "a8fc3e35134a240bfb4dab8862a6e482cef44de000b813d42417b853c47ccc7e",
+    "stage1b_mutation_required": false
+  },
+  "v1_0_5_corrections": {
+    "stage09_confidence_interval_schema_explicit": true,
+    "confidence_interval_columns_unique_before_concat": true,
+    "domain_matched_identifier": "matching :: novelty score",
+    "duplicate_score_column_regression_fixed": true,
+    "protocol_balanced_accuracy_definition": "mean recall over identities observed in protocol",
+    "fixed_train_class_frame_balanced_accuracy_also_reported": true,
+    "matplotlib_deprecated_boxplot_labels_argument_used": false,
+    "no_outcome_variation_status": "NOT_ESTIMABLE_NO_OUTCOME_VARIATION",
+    "unavailable_association_statistics_fabricated_as_zero": false,
+    "train_known_identity_requirement": 98,
+    "calibration_unknown_identity_requirement": 22,
+    "known_validation_identity_rule": "nonempty subset of Train Known",
+    "observed_frozen_p2_identity_coverage_from_colab": "97/98",
+    "absent_domain_centroid_value": "unavailable/NaN",
+    "stage01_characteristic_free_text_abort_gate_removed": true,
+    "strict_transmitter_labels_read_for_cardinality": false,
+    "hdf5_outlier_flag_dependency_removed": true,
+    "stage1b_global_extreme_amplitude_count_acknowledged": 5307,
+    "stage1b_per_sample_outlier_membership_claimed": false,
+    "allowed_raw_rms_rule_fit": "Train Known only",
+    "strict_row_audit_fields_parsed": 0,
+    "mahalanobis_definition": "minimum shared-shrinkage-covariance quadratic distance across all known prototypes",
+    "statistical_and_practical_evidence_separated": true,
+    "checkpoint_compatibility_keys": [
+      "stage_version",
+      "script_sha256",
+      "benchmark_sha256",
+      "config_sha256",
+      "output_sha256"
+    ],
+    "prior_version_checkpoint_reuse": false
+  },
+  "static_validation": {
+    "python_ast_parse": "PASS",
+    "python_bytecode_compile": "PASS",
+    "notebook_json_and_code_parse": "PASS",
+    "ten_internal_stage_methods_present": "PASS",
+    "strict_test_guard_class_present": "PASS",
+    "hdf5_write_mode_audit": "PASS — all benchmark opens use mode r",
+    "strict_index_numpy_load_audit": "PASS",
+    "stage01_structured_evidence_fixture_without_characteristic_prose": "PASS",
+    "known_validation_subset_coverage_contract": "PASS — accepts the evidenced 97/98 P2 condition",
+    "absent_identity_metric_and_centroid_handling": "PASS",
+    "degenerate_and_regular_contingency_dispatch": "PASS",
+    "stage09_duplicate_column_regression_fixture": "PASS",
+    "empty_matched_ci_frame_schema": "PASS",
+    "hdf5_outlier_key_dependency_audit": "PASS — absent",
+    "raw_rms_strict_row_control_flow_audit": "PASS — forbidden rows continue before byte decoding/CSV parsing",
+    "minimum_prototype_mahalanobis_numerical_equivalence_test": "PASS",
+    "script_sha_checkpoint_binding_audit": "PASS",
+    "runtime_benchmark_execution": "NOT PERFORMED for v1.0.5 — canonical benchmark is not part of this implementation workspace"
+  },
+  "observed_runtime_evidence_from_v1_0_4": {
+    "canonical_benchmark_sha256": "PASS",
+    "stage01": "PASS",
+    "stage02": "PASS",
+    "stage03": "PASS",
+    "stage04": "PASS",
+    "stage05": "PASS",
+    "stage06": "PASS",
+    "stage07": "PASS",
+    "stage08": "PASS",
+    "strict_test_signal_reads": 0,
+    "strict_test_label_reads": 0,
+    "strict_test_feature_reads": 0
+  },
+  "source_references": [
+    {
+      "role": "user-supplied pipeline reference notebook",
+      "path_at_generation": "C:/Users/DELL/Desktop/Surrogate_XA..I.ipynb",
+      "sha256": "6ceb0eab73d9dcb3b83e7ca38ac8448e779327b8575147e7ead4d668a66e06dd"
+    },
+    {
+      "role": "user-supplied Stage 2M master generation prompt",
+      "path_at_generation": "pasted-text.txt",
+      "sha256": "00931bfbb15c33933ead13765b821d2c09840cd64d50a8ca27090fe5d42845af"
+    }
+  ],
+  "files": [
+    {
+      "name": "OUTPUT_SCHEMA.md",
+      "bytes": 4583,
+      "sha256": "d988bdd1cb81371a754fb4278f4782a14fc42a1df413db777b0047589a8a3461"
+    },
+    {
+      "name": "README.md",
+      "bytes": 8870,
+      "sha256": "e8965a8671cf1af1a9fb4f9c516e2d0cd6432a305305e3fedbabb8c543ba801d"
+    },
+    {
+      "name": "requirements.txt",
+      "bytes": 163,
+      "sha256": "f0c10c7960aaf4b2651f022e5515e20110e051ddb4a2289783850a0cb16a8787"
+    },
+    {
+      "name": "SCIENTIFIC_PROTOCOL.md",
+      "bytes": 7634,
+      "sha256": "7ec6d32e3e3eb57b897795ad0390be2d330d86fdfb2e78b2c27a9778aac165f4"
+    },
+    {
+      "name": "Stage2M_Colab_Launcher_v1_0_5.py",
+      "bytes": 4666,
+      "sha256": "395a865ef63057bb49c586a8933768f22176ebaeec22c67892c1859958b6a4d3"
+    },
+    {
+      "name": "Stage2M_WiSig_ManyTx_Scientific_Diagnostics_v1_0_5.ipynb",
+      "bytes": 4889,
+      "sha256": "f57ac37419a27d644e5518566ebb468d8935cf7439f503eb0ed3f494c8178a44"
+    },
+    {
+      "name": "Stage2M_WiSig_ManyTx_Scientific_Diagnostics_v1_0_5.py",
+      "bytes": 161339,
+      "sha256": "46c95bbf9fb6806a5f463b4e173434a5f03f013367b1bcd38ebb73c07d0f67ba"
+    },
+    {
+      "name": "VALIDATION_CHECKLIST.md",
+      "bytes": 4327,
+      "sha256": "d4a0e32882dbf600e244dfe27e82d13d0b9bd209ccd0b71cb0b6fcecd95ac21b"
+    }
+  ],
+  "manifest_self_hash_policy": "CODE_MANIFEST.json and the ZIP are excluded from the internal file list to avoid self-reference; their hashes are reported after packaging."
+}
