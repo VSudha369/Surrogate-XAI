@@ -1,0 +1,14 @@
+{
+  "source_name": "Stage1B_WiSig_ManyTx_ZeroDay_Benchmark_v1_0_3.py",
+  "source_bytes": 82850,
+  "source_sha256": "2bb03d9fe8f5663f7baeddd334968bf2135e1472827e13b843fcce710ff77581",
+  "parts": [
+    {"name": "part_00.pyfrag", "bytes": 11933, "sha256": "a2856fd86c85add1522c98ab30b79b79899d19250522a584477e7e664f77f803"},
+    {"name": "part_01.pyfrag", "bytes": 11997, "sha256": "5fe62fda4be9c0dcb69a5f48927bdb10c123764679acd0320b54b5a1532d5171"},
+    {"name": "part_02.pyfrag", "bytes": 11989, "sha256": "06846d199a7ee35f0cd3bf140416779cb7bad6bb5e7c2ef489b6b3c944fd10b7"},
+    {"name": "part_03.pyfrag", "bytes": 11989, "sha256": "16e19337ee5570544d0b468958ffebad7251aa9da35b822f30c28f98188d4caf"},
+    {"name": "part_04.pyfrag", "bytes": 11990, "sha256": "80c5dc1d01013d03672aa238ef3fd8d858c01c7a034fb7787b9a898f8c9efcd9"},
+    {"name": "part_05.pyfrag", "bytes": 11938, "sha256": "fa126138bc7073d40e2233e3607386a5d37723f5c3c5de3a71966c7749a609fb"},
+    {"name": "part_06.pyfrag", "bytes": 11014, "sha256": "14204c1298b5cae1cdef18c537dcf1123013601ec7c3adf654ef586785c2430a"}
+  ]
+}
