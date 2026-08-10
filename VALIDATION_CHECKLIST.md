@@ -12,16 +12,17 @@
 
 - [ ] Branch root resolves to `MANYTX_ZERO_DAY_BRANCH_v1.0.3`.
 - [ ] Benchmark SHA-256 equals the canonical hash.
-- [ ] Stage 2M version, canonical script SHA, artifact hash-manifest SHA, READY marker, and proceed decision pass.
+- [ ] `STAGE2M_FINAL_STATUS.json` exactly verifies READY status, version, declared script/benchmark hashes, proceed decision, empty failed gates, final-test prohibitions, and nested strict guard zeros.
+- [ ] Stage 2M `HASH_MANIFEST.json` independently matches the frozen SHA-256; no Stage 2M source script is required in the output tree.
 - [ ] Stage 1B and Stage 2M are treated read-only.
-- [ ] All six authorized partition counts match the frozen protocol.
+- [ ] All six authorized frozen `.npy` partition arrays exist and their counts match the protocol; no full-HDF5 split reconstruction path exists.
 - [ ] Train Known contains exactly 98 identities; Calibration Unknown contains 22 disjoint identities.
 
 ## Strict zero-day
 
 - [ ] Strict index arrays are never passed to `numpy.load` or HDF5 row readers.
 - [ ] Frozen manifests provide strict file counts; byte-stream hashes are recorded.
-- [ ] Signal, label, embedding, metric, and threshold strict counters are all zero.
+- [ ] Signal, label, embedding, metric, and threshold strict violation counters are all zero and are not represented as complete HDF5 read instrumentation.
 - [ ] No strict prediction, embedding, score, AUROC, or threshold artifact exists.
 
 ## Controlled experiment
@@ -61,4 +62,5 @@
 - [ ] Three checkpoint types exist for all 12 arm/seed runs.
 - [ ] File and SHA-256 manifests exist.
 - [ ] `CANONICAL_STAGE3M_OBJECTIVE.json` contains the frozen policy and rationale.
+- [ ] `STAGE2_6M_FINAL_STATUS.json` contains pipeline/script/configuration hashes, Stage 2M hashes, architecture signature, seed panel, and profile.
 - [ ] READY is written only after all gates pass under the full profile.

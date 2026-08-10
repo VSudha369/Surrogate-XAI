@@ -68,7 +68,9 @@ PCA is visualization only. It is not used in quantitative selection.
 
 ## Manifests
 
-The manifest set includes input provenance, frozen config, strict guard, architecture, losses, sampler, seeds, checkpoints, statistics, per-stage manifests, final status, Stage 3M objective, file inventory, and SHA-256 inventory.
+The manifest set includes input provenance, frozen config, strict guard, architecture, losses, sampler, seeds, checkpoints, statistics, per-stage manifests, final status, Stage 3M objective, file inventory, and SHA-256 inventory. `STRICT_TEST_GUARD.json` labels its numeric fields as violation counters and records the structural enforcement mechanisms.
+
+`STAGE2_6M_FINAL_STATUS.json` includes pipeline/script/configuration provenance, both frozen Stage 2M hashes, architecture signature, seed panel, profile, benchmark hash, decision, violation counters, and success gates. The artifact-manifest hash remains in the separate READY marker to avoid self-reference.
 
 `CANONICAL_STAGE3M_OBJECTIVE.json` freezes the decision, selected objective/coefficients when resolved, architecture signature, embedding dimension, sampler, augmentation, optimizer, budget, seed evidence, and rationale.
 
@@ -81,4 +83,4 @@ The manifest set includes input provenance, frozen config, strict guard, archite
 - `MANYTX_STAGE2_6M_READY.txt` exists only for a full successful run.
 - `MANYTX_STAGE2_6M_NOT_READY.txt` records a hard gate or execution failure.
 
-READY includes the benchmark hash, strict counters, selected decision, and artifact-manifest hash.
+READY includes the benchmark hash, strict-test violation counters, selected decision, and artifact-manifest hash.

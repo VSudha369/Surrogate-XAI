@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-strip Google Colab launcher for Stage 2.6M v1.0.0.
+"""Single-strip Google Colab launcher for Stage 2.6M v1.0.1.
 
 Copy this entire file into one Colab cell.  It never uses ``%run`` and passes
 only explicit arguments to the standalone pipeline process.
@@ -15,7 +15,10 @@ import sys
 from pathlib import Path
 
 EXPECTED_BENCHMARK_SHA256 = "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9"
-SCRIPT_NAME = "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_0.py"
+EXPECTED_STAGE2M_VERSION = "1.0.5"
+EXPECTED_STAGE2M_SCRIPT_SHA256 = "46c95bbf9fb6806a5f463b4e173434a5f03f013367b1bcd38ebb73c07d0f67ba"
+EXPECTED_STAGE2M_HASH_MANIFEST_SHA256 = "0a8853d782006ce8af2d7b798a61c1e141afbeb55066cb70115ae41c8d24f16a"
+SCRIPT_NAME = "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_1.py"
 BRANCH_NAME = "MANYTX_ZERO_DAY_BRANCH_v1.0.3"
 REQUIRED = {
     "h5py": "h5py>=3.10",
@@ -71,25 +74,61 @@ def install_missing() -> None:
 def verify_stage2m(stage2m: Path) -> None:
     if not stage2m.is_dir():
         raise RuntimeError(f"Frozen Stage 2M directory missing: {stage2m}")
-    ready = False
-    proceed = False
-    for path in stage2m.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in {".txt", ".json", ".md"}:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        upper = text.upper()
-        ready = ready or "MANYTX_STAGE2M_READY" in upper
-        proceed = proceed or "PROCEED_STAGE_2_6M_WITH_CAUTION" in upper
-    if not ready or not proceed:
-        raise RuntimeError("Stage 2M READY and PROCEED_STAGE_2_6M_WITH_CAUTION evidence are required")
+    status_path = stage2m / "manifests" / "STAGE2M_FINAL_STATUS.json"
+    hash_manifest_path = stage2m / "manifests" / "HASH_MANIFEST.json"
+    if not status_path.is_file():
+        raise RuntimeError(f"Stage 2M structured final status missing: {status_path}")
+    if not hash_manifest_path.is_file():
+        raise RuntimeError(f"Stage 2M artifact hash manifest missing: {hash_manifest_path}")
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Stage 2M structured final status is invalid JSON: {status_path}") from exc
+    if not isinstance(status, dict):
+        raise RuntimeError("Stage 2M structured final status must be a JSON object")
+    required_status = {
+        "status": "MANYTX_STAGE2M_READY",
+        "stage_version": EXPECTED_STAGE2M_VERSION,
+        "script_sha256": EXPECTED_STAGE2M_SCRIPT_SHA256,
+        "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+        "recommendation": "PROCEED_STAGE_2_6M_WITH_CAUTION",
+        "failed_gates": [],
+        "final_test_model_evaluation_performed": False,
+        "final_test_threshold_selection_performed": False,
+    }
+    mismatches = {
+        key: {"expected": expected, "actual": status.get(key, "<missing>")}
+        for key, expected in required_status.items()
+        if status.get(key, "<missing>") != expected or type(status.get(key, "<missing>")) is not type(expected)
+    }
+    strict_guard = status.get("strict_test_guard")
+    if not isinstance(strict_guard, dict):
+        mismatches["strict_test_guard"] = {"expected": "JSON object", "actual": type(strict_guard).__name__}
+    else:
+        required_guard = {
+            "strict_index_arrays_loaded": False,
+            "strict_test_signal_reads": 0,
+            "strict_test_label_reads": 0,
+            "strict_test_feature_reads": 0,
+        }
+        for key, expected in required_guard.items():
+            actual = strict_guard.get(key, "<missing>")
+            if actual != expected or type(actual) is not type(expected):
+                mismatches[f"strict_test_guard.{key}"] = {"expected": expected, "actual": actual}
+    if mismatches:
+        raise RuntimeError(f"Stage 2M structured final status contract failed: {json.dumps(mismatches, sort_keys=True)}")
+    actual_manifest_sha = sha256_file(hash_manifest_path)
+    if actual_manifest_sha != EXPECTED_STAGE2M_HASH_MANIFEST_SHA256:
+        raise RuntimeError(
+            "Stage 2M HASH_MANIFEST.json SHA-256 mismatch: "
+            f"expected {EXPECTED_STAGE2M_HASH_MANIFEST_SHA256}, actual {actual_manifest_sha}"
+        )
+    print("[PASS] Stage 2M structured final status and HASH_MANIFEST SHA-256 verified")
 
 
 def main() -> None:
     print("=" * 100)
-    print("STAGE 2.6M — COLAB LAUNCHER v1.0.0")
+    print("STAGE 2.6M — COLAB LAUNCHER v1.0.1")
     print("=" * 100)
     mount_drive()
     search_root = Path(os.environ.get("WISIG_SEARCH_ROOT", "/content/drive/MyDrive"))

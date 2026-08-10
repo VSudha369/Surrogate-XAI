@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stage 2.6M — WiSig ManyTx controlled representation-learning ablation.
 
-Version 1.0.0.  This executable implements the ten-stage, four-arm, three-seed
+Version 1.0.1.  This executable implements the ten-stage, four-arm, three-seed
 experiment defined by the Stage 2.6M scientific protocol.  It is intentionally
 restricted to Train Known fitting, P0–P3 known validation, and frozen-model
 Calibration Unknown diagnostics.  Strict zero-day signal, label, embedding,
@@ -60,7 +60,7 @@ from sklearn.linear_model import SGDClassifier
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 
-PIPELINE_VERSION = "1.0.0"
+PIPELINE_VERSION = "1.0.1"
 CANONICAL_BENCHMARK = "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3"
 CANONICAL_BRANCH = "MANYTX_ZERO_DAY_BRANCH_v1.0.3"
 EXPECTED_BENCHMARK_SHA256 = "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9"
@@ -409,7 +409,7 @@ def iter_json_containers(value: Any) -> Iterator[Any]:
 
 
 class StrictZeroDayGuard:
-    """Authorizes only named non-final partitions and audits strict artifacts."""
+    """Authorizes only named non-final partitions and records policy violations."""
 
     def __init__(self, branch_root: Path, output_root: Path):
         self.branch_root = branch_root.resolve()
@@ -525,10 +525,18 @@ class StrictZeroDayGuard:
     def manifest(self) -> Dict[str, Any]:
         return {
             "policy": "STRICT ZERO-DAY SIGNAL/LABEL/EMBEDDING/METRIC/THRESHOLD ACCESS FORBIDDEN",
+            "enforcement": [
+                "authorized partition allowlist",
+                "strict-path prohibition",
+                "frozen authorized index arrays only",
+                "output artifact scan",
+                "static strict-artifact guard",
+            ],
             "allowed_partitions": sorted(self._allowed_indices),
             "strict_files": self.strict_file_audit,
-            "counters": self.counters(),
-            "all_counters_zero": all(v == 0 for v in self.counters().values()),
+            "counter_semantics": "Violation counters raised by the structural guard; not independent instrumentation of every HDF5 operation.",
+            "violation_counters": self.counters(),
+            "all_violation_counters_zero": all(v == 0 for v in self.counters().values()),
             "generated_at": utc_now(),
         }
 
@@ -676,22 +684,12 @@ def choose_metadata_field(
 
 PARTITION_ALIASES: Dict[str, Tuple[str, ...]] = {
     "train_known": ("train_known", "known_train", "train_known_indices"),
-    "p0": ("p0", "p0_known_validation", "known_validation_p0", "p0_indices"),
+    "p0": ("p0", "validation_known", "p0_known_validation", "known_validation_p0", "p0_indices"),
     "p1": ("p1", "p1_cross_day_validation", "cross_day_validation", "p1_indices"),
     "p2": ("p2", "p2_cross_receiver_validation", "cross_receiver_validation", "p2_indices"),
     "p3": ("p3", "p3_cross_day_receiver_validation", "cross_day_receiver_validation", "p3_indices"),
     "calibration_unknown": ("calibration_unknown", "cal_unknown", "calibration_unknown_indices"),
 }
-
-
-def match_partition_token(value: Any) -> Optional[str]:
-    token = normalize_token(value)
-    for partition, aliases in PARTITION_ALIASES.items():
-        for alias in aliases:
-            alias_token = normalize_token(alias).replace("_indices", "")
-            if token == alias_token or token == normalize_token(alias):
-                return partition
-    return None
 
 
 def discover_partition_index_files(branch_root: Path) -> Dict[str, Path]:
@@ -713,8 +711,6 @@ def discover_partition_index_files(branch_root: Path) -> Dict[str, Path]:
 
 
 def resolve_partition_indices(
-    h5: h5py.File,
-    rows: Sequence[Mapping[str, Any]],
     branch_root: Path,
     total: int,
     guard: StrictZeroDayGuard,
@@ -727,13 +723,12 @@ def resolve_partition_indices(
         partitions[partition] = np.asarray(values, dtype=np.int64).reshape(-1)
     missing = set(EXPECTED_PARTITION_COUNTS) - set(partitions)
     if missing:
-        split_field = choose_metadata_field(h5, rows, total, ("partition", "split", "protocol", "subset", "split_name"))
-        split_dataset = h5[split_field.dataset_path]
-        raw = split_dataset[:] if split_field.compound_field is None else split_dataset.fields(split_field.compound_field)[:]
-        split_values = decode_string_array(np.asarray(raw))
-        for partition in sorted(missing):
-            mask = np.array([match_partition_token(v) == partition for v in split_values], dtype=bool)
-            partitions[partition] = np.flatnonzero(mask).astype(np.int64)
+        searched_root = branch_root / "01_benchmark_engineering"
+        raise ScientificAbort(
+            "Missing required frozen authorized partition index arrays: "
+            f"{sorted(missing)}. Searched beneath {searched_root}. "
+            "Stage 2.6M consumes the six frozen Stage 1B split arrays and never reconstructs splits from HDF5 metadata."
+        )
     for partition, expected_count in EXPECTED_PARTITION_COUNTS.items():
         values = np.asarray(partitions[partition], dtype=np.int64)
         if len(values) != expected_count:
@@ -767,7 +762,7 @@ def resolve_benchmark(config: Stage26Config, guard: StrictZeroDayGuard) -> Resol
             "day": choose_metadata_field(handle, rows, total, ("day_id", "capture_date", "capture_day", "date", "day")),
             "equalized": choose_metadata_field(handle, rows, total, ("equalization_state", "equalized", "equalization", "eq_state")),
         }
-        raw_indices = resolve_partition_indices(handle, rows, config.branch_root_path, total, guard)
+        raw_indices = resolve_partition_indices(config.branch_root_path, total, guard)
         raw_meta: Dict[str, Dict[str, np.ndarray]] = {}
         for partition, indices in raw_indices.items():
             guard.authorize_rows(partition, indices, "metadata read")
@@ -1707,49 +1702,66 @@ def verify_stage2m(config: Stage26Config) -> Dict[str, Any]:
     root = config.stage2m_path
     if not root.is_dir():
         raise ScientificAbort(f"Stage 2M diagnostics directory missing: {root}")
-    ready_candidates = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in {".txt", ".json", ".md"}]
-    ready_evidence: List[str] = []
-    proceed_evidence: List[str] = []
-    version_evidence: List[str] = []
-    for path in ready_candidates:
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        if "MANYTX_STAGE2M_READY" in text:
-            ready_evidence.append(str(path))
-        upper = text.upper()
-        if "PROCEED_STAGE_2_6M_WITH_CAUTION" in upper or (
-            "PROCEED_STAGE_2_6M" in upper and not any(x in upper for x in ("DO_NOT_PROCEED", "STOP_STAGE_2_6M", "ABORT_STAGE_2_6M"))
-        ):
-            proceed_evidence.append(str(path))
-        if EXPECTED_STAGE2M_VERSION in text and any(t in upper for t in ("VERSION", "EXECUTED")):
-            version_evidence.append(str(path))
-    if not ready_evidence:
-        raise ScientificAbort("Stage 2M READY marker MANYTX_STAGE2M_READY was not verified")
-    if not proceed_evidence:
-        raise ScientificAbort("Stage 2M final recommendation is not a compatible proceed decision")
-    if not version_evidence:
-        raise ScientificAbort(f"Stage 2M executed version {EXPECTED_STAGE2M_VERSION} was not verified")
-    script_matches = [p for p in root.rglob("*.py") if sha256_file(p) == EXPECTED_STAGE2M_SCRIPT_SHA256]
-    if len(script_matches) != 1:
-        raise ScientificAbort(f"Expected one Stage 2M canonical script SHA match; found {len(script_matches)}")
-    manifest_matches = [
-        p for p in root.rglob("*")
-        if p.is_file() and "manifest" in p.name.lower() and sha256_file(p) == EXPECTED_STAGE2M_HASH_MANIFEST_SHA256
-    ]
-    if len(manifest_matches) != 1:
-        raise ScientificAbort(f"Expected one Stage 2M artifact hash-manifest SHA match; found {len(manifest_matches)}")
+    status_path = root / "manifests" / "STAGE2M_FINAL_STATUS.json"
+    hash_manifest_path = root / "manifests" / "HASH_MANIFEST.json"
+    if not status_path.is_file():
+        raise ScientificAbort(f"Stage 2M structured final status missing: {status_path}")
+    if not hash_manifest_path.is_file():
+        raise ScientificAbort(f"Stage 2M artifact hash manifest missing: {hash_manifest_path}")
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ScientificAbort(f"Stage 2M structured final status is invalid JSON: {status_path}") from exc
+    if not isinstance(status, Mapping):
+        raise ScientificAbort("Stage 2M structured final status must be a JSON object")
+    required_status = {
+        "status": "MANYTX_STAGE2M_READY",
+        "stage_version": EXPECTED_STAGE2M_VERSION,
+        "script_sha256": EXPECTED_STAGE2M_SCRIPT_SHA256,
+        "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+        "recommendation": "PROCEED_STAGE_2_6M_WITH_CAUTION",
+        "failed_gates": [],
+        "final_test_model_evaluation_performed": False,
+        "final_test_threshold_selection_performed": False,
+    }
+    mismatches = {
+        key: {"expected": expected, "actual": status.get(key, "<missing>")}
+        for key, expected in required_status.items()
+        if status.get(key, "<missing>") != expected or type(status.get(key, "<missing>")) is not type(expected)
+    }
+    strict_guard = status.get("strict_test_guard")
+    if not isinstance(strict_guard, Mapping):
+        mismatches["strict_test_guard"] = {"expected": "JSON object", "actual": type(strict_guard).__name__}
+    else:
+        required_guard = {
+            "strict_index_arrays_loaded": False,
+            "strict_test_signal_reads": 0,
+            "strict_test_label_reads": 0,
+            "strict_test_feature_reads": 0,
+        }
+        for key, expected in required_guard.items():
+            actual = strict_guard.get(key, "<missing>")
+            if actual != expected or type(actual) is not type(expected):
+                mismatches[f"strict_test_guard.{key}"] = {"expected": expected, "actual": actual}
+    if mismatches:
+        raise ScientificAbort(f"Stage 2M structured final status contract failed: {json.dumps(mismatches, sort_keys=True)}")
+    actual_manifest_sha = sha256_file(hash_manifest_path)
+    if actual_manifest_sha != EXPECTED_STAGE2M_HASH_MANIFEST_SHA256:
+        raise ScientificAbort(
+            "Stage 2M HASH_MANIFEST.json SHA-256 mismatch: "
+            f"expected {EXPECTED_STAGE2M_HASH_MANIFEST_SHA256}, actual {actual_manifest_sha}"
+        )
     return {
         "directory": str(root),
         "executed_version": EXPECTED_STAGE2M_VERSION,
-        "ready_evidence": sorted(ready_evidence),
-        "proceed_evidence": sorted(proceed_evidence),
-        "version_evidence": sorted(version_evidence),
-        "canonical_script": str(script_matches[0]),
+        "structured_final_status": str(status_path),
+        "structured_final_status_sha256": sha256_file(status_path),
+        "status": status["status"],
+        "recommendation": status["recommendation"],
         "canonical_script_sha256": EXPECTED_STAGE2M_SCRIPT_SHA256,
-        "hash_manifest": str(manifest_matches[0]),
+        "hash_manifest": str(hash_manifest_path),
         "hash_manifest_sha256": EXPECTED_STAGE2M_HASH_MANIFEST_SHA256,
+        "strict_test_guard": dict(strict_guard),
         "read_only": True,
     }
 
@@ -2450,7 +2462,7 @@ class Stage26Pipeline:
             "stage2m": self.stage2m_provenance,
             "partition_counts": {name: len(part.indices) for name, part in benchmark.partitions.items()},
             "known_transmitter_mapping": benchmark.transmitter_mapping,
-            "strict_zero_day_policy": "manifest-only existence/hash/count verification; arrays never loaded",
+            "strict_zero_day_policy": "authorized split-array allowlist plus strict-path/output guards; strict arrays never loaded",
             "generated_at": utc_now(),
         }
         provenance_path = self.config.output_root / "manifests" / "STAGE2_6M_INPUT_PROVENANCE.json"
@@ -2466,11 +2478,11 @@ class Stage26Pipeline:
 
 Measured fact: the canonical benchmark exists at `{benchmark.h5_path}` and its SHA-256 equals `{self.benchmark_sha}`.
 
-Measured fact: Stage 2M executed version {EXPECTED_STAGE2M_VERSION}, canonical script SHA, artifact hash-manifest SHA, READY marker, and compatible proceed recommendation were verified read-only.
+Measured fact: Stage 2M executed version {EXPECTED_STAGE2M_VERSION}, declared canonical script SHA, benchmark SHA, READY status, compatible proceed recommendation, final-test prohibitions, and zero strict-access fields were verified from its structured final status. The artifact HASH_MANIFEST SHA was verified independently.
 
 Measured fact: the benchmark resolver found `{benchmark.signal_key}` with orientation `{benchmark.signal_orientation}` and {benchmark.total_samples:,} rows. All six authorized partition counts match the frozen protocol.
 
-Measured fact: strict zero-day index files were checked only as opaque frozen files. Their arrays were not loaded; all strict-test counters are zero.
+Measured fact: strict zero-day index files were checked only as opaque frozen files. Their arrays were not loaded; all strict-test violation counters are zero. Structural enforcement is provided by the authorized partition allowlist, strict-path prohibition, frozen-index-only resolver, and output scan.
 
 Scientific interpretation: Stage 2.6M may proceed without altering Stage 1B or Stage 2M and without exposing final zero-day information.
 """
@@ -3298,10 +3310,19 @@ Domain AUROC is interpreted jointly with Tx performance; a value nearer 0.5 is n
         final_status_path = self.config.output_root / "manifests" / "STAGE2_6M_FINAL_STATUS.json"
         final_status = {
             "status": "MANYTX_STAGE2_6M_READY",
+            "pipeline_version": PIPELINE_VERSION,
+            "script_sha256": self.script_sha,
+            "configuration_sha256": self.config.configuration_sha256(),
+            "stage2m_script_sha256": EXPECTED_STAGE2M_SCRIPT_SHA256,
+            "stage2m_artifact_manifest_sha256": EXPECTED_STAGE2M_HASH_MANIFEST_SHA256,
+            "architecture_signature": architecture["architecture_signature"],
+            "seed_panel": list(self.config.seeds),
+            "profile": self.config.profile,
             "decision": decision["decision"],
             "selected_arm": selected_arm,
             "benchmark_sha256": self.benchmark_sha,
-            "strict_zero_day_counters": self.guard.counters(),
+            "strict_zero_day_counter_semantics": "violation counters; structural prevention is the primary access-control evidence",
+            "strict_zero_day_violation_counters": self.guard.counters(),
             "success_gates": {
                 "benchmark_sha_correct": True,
                 "stage2m_ready_verified": True,
@@ -3353,17 +3374,18 @@ Domain AUROC is interpreted jointly with Tx performance; a value nearer 0.5 is n
             f"decision={decision['decision']}\n"
             f"benchmark_sha256={self.benchmark_sha}\n"
             f"artifact_sha256={artifact_sha}\n"
-            "strict_zero_day_signal_reads=0\nstrict_zero_day_label_reads=0\n"
-            "strict_zero_day_embedding_reads=0\nstrict_zero_day_metric_reads=0\nstrict_zero_day_threshold_reads=0\n"
+            "strict_zero_day_signal_read_violations=0\nstrict_zero_day_label_read_violations=0\n"
+            "strict_zero_day_embedding_read_violations=0\nstrict_zero_day_metric_read_violations=0\n"
+            "strict_zero_day_threshold_read_violations=0\n"
         )
         atomic_write_text(ready_path, ready_text, self.config.output_root)
         print("[PASS] Stage 10 — Freeze Recommendation for Stage 3M")
         print("\nMANYTX_STAGE2_6M_READY")
         print(f"\nBenchmark SHA-256:\n{self.benchmark_sha}")
-        print("\nStrict zero-day signals accessed: 0")
-        print("Strict zero-day labels accessed: 0")
-        print("Strict zero-day embeddings generated: 0")
-        print("Strict zero-day metrics computed: 0")
+        print("\nStrict zero-day signal access violations: 0")
+        print("Strict zero-day label access violations: 0")
+        print("Strict zero-day embedding access violations: 0")
+        print("Strict zero-day metric access violations: 0")
         print(f"\nSelected Stage 3M objective:\n{decision['decision']}")
         print(f"\nStage 2.6M output:\n{self.config.output_root}")
         print(f"\nArtifact SHA-256:\n{artifact_sha}")

@@ -1,6 +1,6 @@
 # Stage 2.6M — WiSig ManyTx controlled representation ablation
 
-This repository contains the executable Stage 2.6M v1.0.0 experiment for the frozen `WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3` benchmark. It compares exactly four representation objectives under one common RF temporal network:
+This repository contains the executable Stage 2.6M v1.0.1 experiment for the frozen `WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3` benchmark. It compares exactly four representation objectives under one common RF temporal network:
 
 | Arm | Objective |
 |---|---|
@@ -15,7 +15,7 @@ The supplied prior notebook was reviewed for project history and engineering con
 
 Training reads only `Train Known`. P0–P3 are frozen validation protocols. Calibration Unknown is embedded only after training and never contributes gradients, prototypes, covariance fitting, thresholds, or primary model selection.
 
-`strict_zero_day_test_indices.npy` and `strict_zero_day_shift_test_indices.npy` are never loaded. The guard verifies only their existence, byte-stream hash, and count declared in frozen Stage 1B manifests. All strict signal/label/embedding/metric/threshold counters must remain zero before READY can be written.
+`strict_zero_day_test_indices.npy` and `strict_zero_day_shift_test_indices.npy` are never loaded. The guard verifies only their existence, byte-stream hash, and count declared in frozen Stage 1B manifests. Its strict signal/label/embedding/metric/threshold fields are violation counters, while the primary evidence is structural: an authorized partition allowlist, strict-path prohibition, frozen-index-only resolution, output scanning, and a static forbidden-artifact guard.
 
 ## Canonical layout
 
@@ -28,18 +28,18 @@ MANYTX_ZERO_DAY_BRANCH_v1.0.3/
 └── 03_representation_ablation/          # created by this pipeline only
 ```
 
-Stage 1B and Stage 2M are opened read-only. The benchmark SHA-256, Stage 2M executed version, canonical script SHA, artifact hash-manifest SHA, READY marker, and proceed recommendation are hard gates.
+Stage 1B and Stage 2M are opened read-only. `manifests/STAGE2M_FINAL_STATUS.json` must satisfy the exact structured readiness, version, script/benchmark hash, proceed recommendation, failed-gate, final-test prohibition, and strict-guard contract. `manifests/HASH_MANIFEST.json` is hashed independently and must match the frozen Stage 2M artifact-manifest SHA-256.
 
 ## Colab execution
 
-The easiest route is to copy the complete contents of `Stage2_6M_Colab_Launcher_v1_0_0.py` into one Colab cell. The launcher mounts Drive, installs only missing dependencies, verifies upstream inputs, reports the GPU, and invokes the standalone program with `subprocess.check_call`.
+The easiest route is to copy the complete contents of `Stage2_6M_Colab_Launcher_v1_0_1.py` into one Colab cell. The launcher mounts Drive, installs only missing dependencies, verifies upstream inputs, reports the GPU, and invokes the standalone program with `subprocess.check_call`.
 
 Environment overrides are explicit:
 
 ```python
 import os
 os.environ["WISIG_BRANCH_ROOT"] = "/content/drive/MyDrive/.../MANYTX_ZERO_DAY_BRANCH_v1.0.3"
-os.environ["WISIG_STAGE2_6M_SCRIPT"] = "/content/drive/MyDrive/.../Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_0.py"
+os.environ["WISIG_STAGE2_6M_SCRIPT"] = "/content/drive/MyDrive/.../Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_1.py"
 os.environ["WISIG_STAGE2_6M_PROFILE"] = "full"
 ```
 
@@ -48,7 +48,7 @@ Never invoke the standalone pipeline with `%run`; that can leak Jupyter's `-f ke
 ## Direct execution
 
 ```bash
-python Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_0.py \
+python Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_1.py \
   --branch-root "/path/to/MANYTX_ZERO_DAY_BRANCH_v1.0.3" \
   --profile full
 ```
@@ -58,7 +58,7 @@ Resume is enabled by default. A checkpoint is rejected unless benchmark, Stage 2
 For dependency and finite-gradient validation without benchmark access:
 
 ```bash
-python Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_0.py \
+python Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_1.py \
   --synthetic-validation --device cpu
 ```
 

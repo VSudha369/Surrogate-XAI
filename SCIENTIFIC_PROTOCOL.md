@@ -10,10 +10,12 @@ Stage 2.6M is a controlled objective ablation, not architecture search or final 
 - Stage 2M executed version: `1.0.5`.
 - Stage 2M canonical script SHA-256: `46c95bbf9fb6806a5f463b4e173434a5f03f013367b1bcd38ebb73c07d0f67ba`.
 - Stage 2M artifact hash-manifest SHA-256: `0a8853d782006ce8af2d7b798a61c1e141afbeb55066cb70115ae41c8d24f16a`.
+- Stage 2M provenance is accepted only from the structured `manifests/STAGE2M_FINAL_STATUS.json` contract; the artifact `HASH_MANIFEST.json` is hashed independently. A Stage 2M source `.py` file is not expected inside the frozen output tree.
 - Train Known is the sole gradient-bearing partition.
 - P0–P3 are known-transmitter evaluation protocols.
 - Calibration Unknown is a frozen-model, threshold-free secondary diagnostic.
 - Strict zero-day signals, labels, embeddings, metrics, and thresholds are unavailable.
+- All six authorized partitions must be loaded from frozen Stage 1B `.npy` index arrays. Missing arrays abort the run; splits are never reconstructed by scanning the full HDF5 metadata.
 
 ## Hypotheses
 
@@ -94,3 +96,5 @@ AMP applies only on CUDA. CE, pairwise similarity, and prototype distances are c
 ## Claims boundary
 
 The final report distinguishes measured fact, statistical inference, scientific interpretation, and Stage 3M recommendation. It does not claim final zero-day performance, threshold quality, XAI quality, surrogate fidelity, or deployment latency.
+
+Strict-test counters are explicitly interpreted as violation counters produced by the structural guard. The access-control evidence is the authorized partition allowlist, strict-path prohibition, frozen-index-only resolver, strict-array non-loading rule, and output/artifact scan.
