@@ -1,0 +1,73 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Datasets and benchmark binaries
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.pkl.zip
+*.npy
+*.npz
+*.parquet
+*.mat
+*.bin
+
+# Model/checkpoint artifacts
+*.pt
+*.pth
+*.ckpt
+*.onnx
+checkpoints/
+
+# Generated experiment outputs
+outputs/
+results/
+logs/
+cache/
+figures/
+tables/
+publication/
+embeddings/
+metrics/
+statistics/
+project_root/
+
+# Archives / large bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+
+# Secrets / local configuration
+.env
+.env.*
+*.pem
+*.key
+credentials*.json
+service_account*.json
+
+# Final-test and derived prediction artifacts
+*strict_zero_day*predictions*
+*strict_zero_day*embeddings*
+*strict_zero_day*scores*
+*final_test*predictions*
+*final_test*embeddings*
