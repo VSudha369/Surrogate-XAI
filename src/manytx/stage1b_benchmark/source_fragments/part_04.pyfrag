@@ -1,0 +1,204 @@
+            raise ScientificAbort("Conflicting-label exact duplicate samples were found; benchmark cannot be frozen.")
+        self._checkpoint(stage, "PASS", {"summary": "Duplicate/leakage audit complete", **self.duplicate_audit})
+
+    def stage06_zero_day_partition(self) -> None:
+        stage = "stage_06_zero_day_partition_engineering"
+        tx_stats = (
+            self.meta.groupby("transmitter_id")
+            .agg(
+                sample_count=("sample_id", "size"),
+                receiver_count=("receiver_id", "nunique"),
+                day_count=("day_id", "nunique"),
+                session_count=("session_id", "nunique"),
+            )
+            .reset_index()
+        )
+        combos = (
+            self.meta.groupby("transmitter_id")
+            .apply(lambda g: g[["receiver_id", "day_id"]].drop_duplicates().shape[0])
+            .reset_index(name="rx_day_combo_count")
+        )
+        tx_stats = tx_stats.merge(combos, on="transmitter_id", how="left")
+        max_samples = max(1, int(tx_stats["sample_count"].max()))
+        max_rx = max(1, int(tx_stats["receiver_count"].max()))
+        max_day = max(1, int(tx_stats["day_count"].max()))
+        max_combo = max(1, int(tx_stats["rx_day_combo_count"].max()))
+        tx_stats["coverage_score"] = (
+            np.log1p(tx_stats["sample_count"]) / math.log1p(max_samples)
+            + tx_stats["receiver_count"] / max_rx
+            + tx_stats["day_count"] / max_day
+            + tx_stats["rx_day_combo_count"] / max_combo
+        )
+        eligible = tx_stats[tx_stats["sample_count"] >= self.cfg.min_samples_per_tx].copy()
+        if len(eligible) < 3:
+            raise ScientificAbort("Coverage audit found fewer than three eligible transmitter identities.")
+        eligible["deterministic_rank"] = eligible["transmitter_id"].map(
+            lambda tx: int(sha256_bytes(f"{self.cfg.partition_seed}:{tx}".encode("utf-8"))[:12], 16)
+        )
+        eligible = eligible.sort_values(["coverage_score", "deterministic_rank", "transmitter_id"], ascending=[False, True, True])
+        n = len(eligible)
+        strict_n = max(1, int(round(n * self.cfg.strict_fraction)))
+        cal_n = max(1 if n >= 5 else 0, int(round(n * self.cfg.calibration_fraction)))
+        if n - strict_n - cal_n < 1:
+            cal_n = max(0, cal_n - 1)
+        strict_tx = set(eligible.head(strict_n)["transmitter_id"].astype(str))
+        remaining = eligible[~eligible["transmitter_id"].isin(strict_tx)].copy()
+        calibration_tx = set(remaining.head(cal_n)["transmitter_id"].astype(str))
+        known_tx = set(eligible["transmitter_id"].astype(str)) - strict_tx - calibration_tx
+        if not known_tx or not strict_tx:
+            raise ScientificAbort("Unable to create disjoint known and strict zero-day transmitter groups.")
+        for tx in known_tx:
+            self.tx_partition[tx] = "KNOWN_TRAIN_TX"
+            self.partition_reasons[tx] = "Eligible transmitter retained for supervised known-device training."
+        for tx in calibration_tx:
+            self.tx_partition[tx] = "CALIBRATION_UNKNOWN_TX"
+            self.partition_reasons[tx] = "Coverage-qualified transmitter reserved for validation-time open-set calibration only."
+        for tx in strict_tx:
+            self.tx_partition[tx] = "STRICT_ZERO_DAY_TX"
+            self.partition_reasons[tx] = "Highest coverage-qualified transmitter reserved as final unseen identity."
+        self.meta["tx_partition"] = self.meta["transmitter_id"].map(self.tx_partition).fillna("EXCLUDED_LOW_COVERAGE_TX")
+        self.meta["known_or_unknown"] = np.where(self.meta["tx_partition"].eq("KNOWN_TRAIN_TX"), "known", "unknown")
+        tx_stats["partition"] = tx_stats["transmitter_id"].map(self.tx_partition).fillna("EXCLUDED_LOW_COVERAGE_TX")
+        tx_stats["assignment_reason"] = tx_stats["transmitter_id"].map(self.partition_reasons).fillna(
+            "Insufficient observations under configured coverage threshold."
+        )
+        tx_stats.to_csv(self.dirs["tables"] / "zero_day_partition_summary.csv", index=False)
+        summary = self.meta.groupby("tx_partition").size().reset_index(name="sample_count")
+        summary.to_csv(self.dirs["tables"] / "partition_summary.csv", index=False)
+        lines = [
+            "# Zero-Day Partition Report",
+            "",
+            f"- Known transmitters: {len(known_tx)}",
+            f"- Calibration-unknown transmitters: {len(calibration_tx)}",
+            f"- Strict zero-day transmitters: {len(strict_tx)}",
+            f"- Partition seed: {self.cfg.partition_seed}",
+            "",
+            "The split is transmitter-identity based and coverage-aware. Strict zero-day identities are disjoint from training and calibration identities.",
+        ]
+        atomic_write_text(self.dirs["reports"] / "zero_day_partition_report.md", "\n".join(lines) + "\n")
+        self._checkpoint(
+            stage,
+            "PASS",
+            {
+                "summary": "Zero-day transmitter partitions frozen",
+                "known_tx_count": len(known_tx),
+                "calibration_unknown_tx_count": len(calibration_tx),
+                "strict_zero_day_tx_count": len(strict_tx),
+            },
+        )
+
+    def stage07_domain_protocols(self) -> None:
+        stage = "stage_07_day_receiver_protocol_engineering"
+        known_mask = self.meta["tx_partition"].eq("KNOWN_TRAIN_TX")
+        cal_mask = self.meta["tx_partition"].eq("CALIBRATION_UNKNOWN_TX")
+        strict_mask = self.meta["tx_partition"].eq("STRICT_ZERO_DAY_TX")
+        heldout_day = self._choose_holdout_value("day_id", known_mask)
+        heldout_rx = self._choose_holdout_value("receiver_id", known_mask)
+        in_domain_mask = known_mask.copy()
+        if heldout_day is not None:
+            in_domain_mask &= ~self.meta["day_id"].eq(heldout_day)
+        if heldout_rx is not None:
+            in_domain_mask &= ~self.meta["receiver_id"].eq(heldout_rx)
+        in_domain_idx = np.flatnonzero(in_domain_mask.to_numpy())
+        if len(in_domain_idx) < 2:
+            raise ScientificAbort("Known in-domain samples are insufficient after receiver/day holdout selection.")
+        val_count = max(1, int(round(len(in_domain_idx) * self.cfg.validation_fraction)))
+        ordered = sorted(
+            in_domain_idx,
+            key=lambda i: sha256_bytes(f"{self.cfg.partition_seed}:p0:{self.meta.loc[i, 'sample_id']}".encode("utf-8")),
+        )
+        val_known = np.array(sorted(ordered[:val_count]), dtype=np.int64)
+        train_known = np.array(sorted(ordered[val_count:]), dtype=np.int64)
+        if len(train_known) == 0:
+            raise ScientificAbort("Known training split is empty.")
+        # Pure domain-shift protocols: P1 changes day only, P2 changes receiver only, P3 changes both.
+        if heldout_day is not None:
+            p1_mask = known_mask & self.meta["day_id"].eq(heldout_day)
+            if heldout_rx is not None:
+                p1_mask &= ~self.meta["receiver_id"].eq(heldout_rx)
+            cross_day = self._indices(p1_mask)
+        else:
+            cross_day = np.array([], dtype=np.int64)
+
+        if heldout_rx is not None:
+            p2_mask = known_mask & self.meta["receiver_id"].eq(heldout_rx)
+            if heldout_day is not None:
+                p2_mask &= ~self.meta["day_id"].eq(heldout_day)
+            cross_rx = self._indices(p2_mask)
+        else:
+            cross_rx = np.array([], dtype=np.int64)
+
+        if heldout_day is not None and heldout_rx is not None:
+            cross_day_rx = self._indices(
+                known_mask
+                & self.meta["day_id"].eq(heldout_day)
+                & self.meta["receiver_id"].eq(heldout_rx)
+            )
+        else:
+            cross_day_rx = np.array([], dtype=np.int64)
+        strict_idx = self._indices(strict_mask)
+        cal_idx = self._indices(cal_mask)
+        strict_shift = np.array([], dtype=np.int64)
+        if heldout_day is not None and heldout_rx is not None:
+            strict_shift = self._indices(strict_mask & self.meta["day_id"].eq(heldout_day) & self.meta["receiver_id"].eq(heldout_rx))
+        self.protocol_indices = {
+            "train_known_indices": train_known,
+            "validation_known_indices": val_known,
+            "calibration_unknown_indices": cal_idx,
+            "strict_zero_day_test_indices": strict_idx,
+            "cross_day_validation_indices": cross_day,
+            "cross_receiver_validation_indices": cross_rx,
+            "cross_day_receiver_validation_indices": cross_day_rx,
+            "strict_zero_day_shift_test_indices": strict_shift,
+        }
+        self.meta["partition"] = "excluded_low_coverage"
+        self.meta.loc[train_known, "partition"] = "train_known"
+        self.meta.loc[val_known, "partition"] = "validation_known_p0"
+        self.meta.loc[cal_idx, "partition"] = "calibration_unknown"
+        self.meta.loc[strict_idx, "partition"] = "strict_zero_day_test"
+        self.meta["protocol"] = "not_assigned"
+        self.meta.loc[train_known, "protocol"] = "TRAIN_KNOWN"
+        self.meta.loc[val_known, "protocol"] = "P0_IN_DOMAIN_KNOWN_VALIDATION"
+        self.meta.loc[cross_day, "protocol"] = "P1_CROSS_DAY_KNOWN_VALIDATION"
+        self.meta.loc[cross_rx, "protocol"] = "P2_CROSS_RECEIVER_KNOWN_VALIDATION"
+        self.meta.loc[cross_day_rx, "protocol"] = "P3_CROSS_DAY_RECEIVER_KNOWN_VALIDATION"
+        self.meta.loc[cal_idx, "protocol"] = "PROTOCOL_B_CALIBRATION_UNKNOWN"
+        self.meta.loc[strict_idx, "protocol"] = "P4_STRICT_ZERO_DAY"
+        self.meta.loc[strict_shift, "protocol"] = "P5_STRICT_ZERO_DAY_DOMAIN_SHIFT"
+        self.meta["is_train"] = self.meta.index.isin(train_known)
+        self.meta["is_validation"] = self.meta.index.isin(np.concatenate([val_known, cross_day, cross_rx, cross_day_rx, cal_idx]))
+        self.meta["is_test"] = self.meta.index.isin(strict_idx)
+        self.meta["is_calibration_unknown"] = self.meta.index.isin(cal_idx)
+        self.meta["is_strict_zero_day"] = self.meta.index.isin(strict_idx)
+        self.meta["normalization_version"] = "per_sample_rms_v1_train_independent"
+        feasibility = {
+            "P0": "FEASIBLE" if len(val_known) else "SCIENTIFICALLY_INFEASIBLE_UNDER_SOURCE_DATA",
+            "P1": "FEASIBLE" if len(cross_day) else "SCIENTIFICALLY_INFEASIBLE_UNDER_SOURCE_DATA",
+            "P2": "FEASIBLE" if len(cross_rx) else "SCIENTIFICALLY_INFEASIBLE_UNDER_SOURCE_DATA",
+            "P3": "FEASIBLE" if len(cross_day_rx) else "SCIENTIFICALLY_INFEASIBLE_UNDER_SOURCE_DATA",
+            "P4": "FEASIBLE" if len(strict_idx) else "SCIENTIFICALLY_INFEASIBLE_UNDER_SOURCE_DATA",
+            "P5": "FEASIBLE" if len(strict_shift) else "SCIENTIFICALLY_INFEASIBLE_UNDER_SOURCE_DATA",
+        }
+        for name, values in self.protocol_indices.items():
+            atomic_save_npy(self.dirs["splits"] / f"{name}.npy", values)
+        domain_report = {
+            "heldout_day": heldout_day,
+            "heldout_receiver": heldout_rx,
+            "protocol_feasibility": feasibility,
+            "split_counts": {k: int(len(v)) for k, v in self.protocol_indices.items()},
+            "split_files": {k: f"splits/{k}.npy" for k in self.protocol_indices},
+        }
+        atomic_write_json(self.dirs["splits"] / "domain_protocols.json", domain_report)
+        atomic_write_json(self.dirs["manifests"] / "SPLIT_MANIFEST.json", domain_report)
+        lines = [
+            "# Domain Protocol Report",
+            "",
+            f"- Held-out day/session for P1: {heldout_day if heldout_day is not None else 'not supported'}",
+            f"- Held-out receiver for P2: {heldout_rx if heldout_rx is not None else 'not supported'}",
+            "",
+            "## Feasibility",
+            *(f"- {k}: {v}" for k, v in feasibility.items()),
+        ]
+        atomic_write_text(self.dirs["reports"] / "domain_protocol_report.md", "\n".join(lines) + "\n")
+        self._checkpoint(stage, "PASS", {"summary": "Day/receiver protocols frozen", **domain_report})
+
