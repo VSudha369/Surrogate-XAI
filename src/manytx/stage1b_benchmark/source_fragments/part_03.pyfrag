@@ -1,0 +1,244 @@
+        self._checkpoint(stage, "PASS", {"summary": "Source verified", **archive_info})
+
+    def _find_source(self) -> Path:
+        candidates: List[Path] = []
+        if self.cfg.source is not None:
+            candidates.append(self.cfg.source)
+        env_source = os.environ.get("MANYTX_SOURCE")
+        if env_source:
+            candidates.append(Path(env_source))
+        candidates.extend(
+            [
+                self.cfg.project_root.parent / "ManyTx.pkl.zip",
+                self.cfg.project_root / "ManyTx.pkl.zip",
+                Path("/content/drive/MyDrive/colab files /Surrogate-XAI/ManyTx.pkl.zip"),
+                Path.cwd() / "ManyTx.pkl.zip",
+            ]
+        )
+        for candidate in candidates:
+            if candidate and candidate.exists() and candidate.is_file():
+                return candidate.resolve()
+        search_roots = [Path.cwd(), self.cfg.project_root.parent]
+        for root in search_roots:
+            if root.exists():
+                for found in root.glob("**/*ManyTx*.zip"):
+                    if found.is_file():
+                        return found.resolve()
+        raise ScientificAbort(
+            "ManyTx source archive was not found. Pass --source /path/to/ManyTx.pkl.zip or set MANYTX_SOURCE."
+        )
+
+    def stage02_schema_discovery(self) -> None:
+        stage = "stage_02_schema_discovery"
+        assert self.source_path is not None
+        payload = self._load_source_object(self.source_path, self.source_member)
+        self.source_object = payload
+        detector = SchemaDetector(self.cfg, self.logger)
+        self.schema_summary = detector.summarize(payload)
+        self.accessor, self.meta, notes = detector.discover(payload)
+        if self.accessor is None or len(self.accessor) == 0:
+            raise ScientificAbort("Schema discovery produced zero samples.")
+        self.meta = self.meta.reset_index(drop=True)
+        self.meta["sample_id"] = [f"manytx_{i:012d}" for i in range(len(self.meta))]
+        self.meta["source_archive"] = str(self.source_path)
+        atomic_write_json(self.dirs["source_audit"] / "source_schema_summary.json", self.schema_summary)
+        schema_report = [
+            "# Source Schema Report",
+            "",
+            f"Source: `{self.source_path}`",
+            f"Archive member: `{self.source_member}`",
+            "",
+            "## Discovery Notes",
+            *(f"- {note}" for note in notes),
+            "",
+            "## Object Summary",
+        ]
+        for row in self.schema_summary:
+            schema_report.append(f"- `{row['path']}`: {row}")
+        atomic_write_text(self.dirs["reports"] / "source_schema_report.md", "\n".join(schema_report) + "\n")
+        details = {
+            "summary": "Schema discovered",
+            "samples": len(self.meta),
+            "metadata_columns": list(self.meta.columns),
+            "notes": notes,
+        }
+        self._checkpoint(stage, "PASS", details)
+
+    def _load_source_object(self, source: Path, member: str) -> Any:
+        if zipfile.is_zipfile(source):
+            with zipfile.ZipFile(source, "r") as zf:
+                with zf.open(member, "r") as f:
+                    data = f.read()
+            return pickle.loads(data)
+        with source.open("rb") as f:
+            return pickle.load(f)
+
+    def stage03_inventory(self) -> None:
+        stage = "stage_03_dataset_inventory"
+        required = ["transmitter_id", "receiver_id", "day_id", "session_id"]
+        for col in required:
+            if col not in self.meta.columns:
+                raise ScientificAbort(f"Required manifest field missing after schema discovery: {col}")
+        counts = {
+            "total_samples": int(len(self.meta)),
+            "transmitters": int(self.meta["transmitter_id"].nunique()),
+            "receivers": int(self.meta["receiver_id"].nunique()),
+            "days": int(self.meta["day_id"].nunique()),
+            "sessions": int(self.meta["session_id"].nunique()),
+        }
+        if counts["transmitters"] < 3:
+            raise ScientificAbort("At least three transmitter identities are required for known/calibration/zero-day splits.")
+        self._write_count_table("samples_per_transmitter.csv", "transmitter_id")
+        self._write_count_table("samples_per_receiver.csv", "receiver_id")
+        self._write_count_table("samples_per_day.csv", "day_id")
+        coverage = (
+            self.meta.groupby(["transmitter_id", "receiver_id", "day_id"], dropna=False)
+            .size()
+            .reset_index(name="sample_count")
+        )
+        coverage.to_csv(self.dirs["tables"] / "tx_receiver_day_coverage.csv", index=False)
+        inventory_lines = [
+            "# Dataset Inventory Report",
+            "",
+            f"- Total samples: {counts['total_samples']}",
+            f"- Transmitters: {counts['transmitters']}",
+            f"- Receivers: {counts['receivers']}",
+            f"- Days/sessions: {counts['days']} days, {counts['sessions']} sessions",
+            "",
+            "This stage records observed coverage only. It does not fabricate missing combinations.",
+        ]
+        atomic_write_text(self.dirs["reports"] / "dataset_inventory_report.md", "\n".join(inventory_lines) + "\n")
+        self._checkpoint(stage, "PASS", {"summary": "Inventory complete", **counts})
+
+    def _write_count_table(self, filename: str, column: str) -> None:
+        table = self.meta.groupby(column, dropna=False).size().reset_index(name="sample_count")
+        table = table.sort_values(["sample_count", column], ascending=[False, True])
+        table.to_csv(self.dirs["tables"] / filename, index=False)
+
+    def stage04_signal_integrity(self) -> None:
+        stage = "stage_04_signal_integrity"
+        assert self.accessor is not None
+        rows: List[Dict[str, Any]] = []
+        lengths: Counter = Counter()
+        channels: Counter = Counter()
+        dtypes: Counter = Counter()
+        critical = 0
+        rms_values: List[float] = []
+        hashes: List[str] = []
+        for i in range(len(self.accessor)):
+            sample_id = self.meta.loc[i, "sample_id"]
+            row: Dict[str, Any] = {"sample_id": sample_id, "source_index": int(self.meta.loc[i, "source_index"])}
+            try:
+                x = canonicalize_iq(self.accessor.raw_sample(i))
+                row["shape"] = list(x.shape)
+                row["dtype"] = str(x.dtype)
+                row["signal_length"] = int(x.shape[1])
+                row["channels"] = int(x.shape[0])
+                row["nan_count"] = int(np.isnan(x).sum())
+                row["posinf_count"] = int(np.isposinf(x).sum())
+                row["neginf_count"] = int(np.isneginf(x).sum())
+                energy = float(np.sum(x.astype(np.float64) ** 2))
+                rms = float(math.sqrt(energy / max(1, x.size)))
+                row["energy"] = energy
+                row["rms"] = rms
+                row["zero_energy"] = bool(energy == 0.0)
+                row["near_zero_energy"] = bool(energy < self.cfg.near_zero_energy)
+                row["constant_signal"] = bool(np.allclose(x, x[:, :1]))
+                row["sample_sha256"] = sha256_bytes(np.ascontiguousarray(x, dtype=np.float32).tobytes())
+                row["decision"] = "PASS"
+                if row["nan_count"] or row["posinf_count"] or row["neginf_count"] or row["zero_energy"]:
+                    row["decision"] = "FAIL"
+                    critical += 1
+                elif row["near_zero_energy"] or row["constant_signal"]:
+                    row["decision"] = "WARN"
+                lengths[int(x.shape[1])] += 1
+                channels[int(x.shape[0])] += 1
+                dtypes[str(x.dtype)] += 1
+                rms_values.append(rms)
+                hashes.append(row["sample_sha256"])
+            except Exception as exc:
+                row.update({"decision": "FAIL", "error": str(exc), "sample_sha256": ""})
+                critical += 1
+            rows.append(row)
+        audit = pd.DataFrame(rows)
+        if len(lengths) != 1:
+            critical += 1
+            self.failures.append(f"Inconsistent signal lengths observed: {dict(lengths)}")
+        if set(channels.keys()) != {2}:
+            critical += 1
+            self.failures.append(f"Unexpected channel counts observed: {dict(channels)}")
+        if rms_values:
+            rms = np.asarray(rms_values, dtype=np.float64)
+            med = float(np.median(rms))
+            mad = float(np.median(np.abs(rms - med))) or 1.0e-12
+            robust_z = np.abs(rms - med) / (1.4826 * mad)
+            outliers = int(np.sum(robust_z > self.cfg.amplitude_outlier_z))
+        else:
+            outliers = 0
+        audit.to_csv(self.dirs["source_audit"] / "signal_integrity_row_audit.csv", index=False)
+        self.meta["signal_length"] = audit["signal_length"].fillna(-1).astype(int)
+        self.meta["channels"] = audit["channels"].fillna(-1).astype(int)
+        self.meta["dtype"] = audit["dtype"].fillna("UNREADABLE").astype(str)
+        self.meta["sample_sha256"] = audit["sample_sha256"].astype(str)
+        self.integrity = {
+            "critical_failures": critical,
+            "length_counts": dict(lengths),
+            "channel_counts": dict(channels),
+            "dtype_counts": dict(dtypes),
+            "amplitude_outliers": outliers,
+            "row_decisions": dict(Counter(audit["decision"])),
+        }
+        lines = [
+            "# Signal Integrity Report",
+            "",
+            f"- Critical failures: {critical}",
+            f"- Signal length counts: {dict(lengths)}",
+            f"- Channel counts: {dict(channels)}",
+            f"- Dtype counts: {dict(dtypes)}",
+            f"- Extreme amplitude outliers: {outliers}",
+        ]
+        atomic_write_text(self.dirs["reports"] / "signal_integrity_report.md", "\n".join(lines) + "\n")
+        if critical:
+            raise ScientificAbort(f"Signal integrity critical failures found: {critical}")
+        self._checkpoint(stage, "PASS", {"summary": "Signal integrity verified", **self.integrity})
+
+    def stage05_duplicate_audit(self) -> None:
+        stage = "stage_05_duplicate_conflict_audit"
+        dup_groups = self.meta.groupby("sample_sha256", dropna=False)
+        duplicate_hashes = []
+        conflict_hashes = []
+        across_days = 0
+        across_receivers = 0
+        for sample_hash, group in dup_groups:
+            if not sample_hash or len(group) <= 1:
+                continue
+            duplicate_hashes.append(str(sample_hash))
+            if group["transmitter_id"].nunique() > 1:
+                conflict_hashes.append(str(sample_hash))
+            if group["day_id"].nunique() > 1:
+                across_days += 1
+            if group["receiver_id"].nunique() > 1:
+                across_receivers += 1
+        detail = self.meta[self.meta["sample_sha256"].isin(duplicate_hashes)].copy()
+        detail.to_csv(self.dirs["source_audit"] / "duplicate_samples_detail.csv", index=False)
+        self.duplicate_audit = {
+            "duplicate_hash_count": len(duplicate_hashes),
+            "duplicate_sample_count": int(len(detail)),
+            "conflicting_label_duplicate_hash_count": len(conflict_hashes),
+            "duplicates_across_days": across_days,
+            "duplicates_across_receivers": across_receivers,
+            "conflicting_hashes": conflict_hashes[:100],
+        }
+        lines = [
+            "# Duplicate And Leakage Report",
+            "",
+            f"- Duplicate hashes: {len(duplicate_hashes)}",
+            f"- Duplicate samples: {len(detail)}",
+            f"- Conflicting-label duplicate hashes: {len(conflict_hashes)}",
+            f"- Duplicate hashes spanning days: {across_days}",
+            f"- Duplicate hashes spanning receivers: {across_receivers}",
+            "",
+            "No duplicate sample was deleted or repaired by Stage 1B.",
+        ]
+        atomic_write_text(self.dirs["reports"] / "duplicate_leakage_report.md", "\n".join(lines) + "\n")
+        if conflict_hashes:
