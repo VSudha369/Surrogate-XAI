@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Stage 2M — WiSig ManyTx Scientific Benchmark Diagnostics v1.0.5.
+
+This program performs diagnostics and learnability auditing only.  It does not
+train a deep teacher, modify the frozen benchmark, or access strict-zero-day
+signals, labels, or features.  All benchmark access is read-only and all
+generated artifacts are confined to ``02_benchmark_diagnostics``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import csv
+import hashlib
+import json
+import logging
+import math
+import os
+import platform
+import re
+import shutil
+import sys
+import tempfile
+import textwrap
+import time
+import traceback
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+
+import h5py
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import scipy
+from matplotlib.backends.backend_pdf import PdfPages
+from scipy import stats
+from scipy.spatial.distance import cdist, pdist, squareform
+from sklearn import __version__ as sklearn_version
+from sklearn.covariance import LedoitWolf
+from sklearn.decomposition import IncrementalPCA, PCA
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    calinski_harabasz_score,
+    confusion_matrix,
+    davies_bouldin_score,
+    f1_score,
+    precision_recall_fscore_support,
+    roc_auc_score,
+    silhouette_score,
+)
+from sklearn.model_selection import StratifiedShuffleSplit
+
+
+VERSION = "1.0.5"
+STAGE_NAME = "Stage 2M — WiSig ManyTx Scientific Benchmark Diagnostics & Zero-Day Learnability Audit"
+CANONICAL_NAME = "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3"
+EXPECTED_BENCHMARK_SHA256 = "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9"
+EXPECTED_SOURCE_SHA256 = "a8fc3e35134a240bfb4dab8862a6e482cef44de000b813d42417b853c47ccc7e"
+EXPECTED_TOTAL = 1_020_643
+EXPECTED_SIGNAL_LENGTH = 256
+EXPECTED_TX = 150
+EXPECTED_RX = 18
+EXPECTED_DAYS = 4
+EXPECTED_OUTLIERS = 5_307
+STRICT_ROLES = {"strict_zero_day", "strict_zero_day_shift"}
+ALLOWED_SPLITS: dict[str, tuple[str, int, str]] = {
+    "train_known": ("train_known_indices.npy", 388_139, "Train Known"),
+    "p0_known": ("validation_known_indices.npy", 68_495, "P0 Known Validation"),
+    "p1_cross_day": ("cross_day_validation_indices.npy", 153_529, "P1 Cross-Day Validation"),
+    "p2_cross_receiver": ("cross_receiver_validation_indices.npy", 27_088, "P2 Cross-Receiver Validation"),
+    "p3_cross_day_receiver": ("cross_day_receiver_validation_indices.npy", 8_992, "P3 Cross-Day+Receiver Validation"),
+    "calibration_unknown": ("calibration_unknown_indices.npy", 158_400, "Calibration Unknown"),
+}
+STRICT_SPLITS: dict[str, tuple[str, int, str]] = {
+    "strict_zero_day": ("strict_zero_day_test_indices.npy", 216_000, "Strict Zero-Day Final Test"),
+    "strict_zero_day_shift": ("strict_zero_day_shift_test_indices.npy", 3_000, "Strict Zero-Day Shifted Subset"),
+}
+SEEDS = {"python_seed": 42, "numpy_seed": 123, "diagnostic_seed": 20260809, "bootstrap_seed": 20260810}
+EPS = np.finfo(np.float64).eps
+
+
+class ScientificAbort(RuntimeError):
+    """Raised when a scientific safety or reproducibility gate fails."""
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def sha256_file(path: Path, chunk: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(chunk)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def sha256_json(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def atomic_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+
+
+def atomic_json(path: Path, value: Any) -> None:
+    atomic_text(path, json.dumps(value, indent=2, sort_keys=True, default=json_default) + "\n")
+
+
+def atomic_csv(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    frame.to_csv(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def atomic_numpy(path: Path, value: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True); tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("wb") as handle:
+        np.save(handle, value, allow_pickle=False); handle.flush(); os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def atomic_npz(path: Path, **values: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True); tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("wb") as handle:
+        np.savez_compressed(handle, **values); handle.flush(); os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating,)):
+        return None if not np.isfinite(value) else float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"Cannot JSON-serialize {type(value)!r}")
+
+
+def decode_values(array: np.ndarray) -> np.ndarray:
+    a = np.asarray(array)
+    if a.dtype.kind in {"S", "O"}:
+        return np.asarray([x.decode("utf-8", "replace") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in a])
+    if a.dtype.kind == "U":
+        return a.astype(str)
+    return a.astype(str)
+
+
+def safe_float(value: Any) -> float:
+    try:
+        result = float(value)
+        return result if np.isfinite(result) else float("nan")
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def bh_fdr(p_values: Sequence[float]) -> np.ndarray:
+    values = np.asarray(p_values, dtype=float)
+    answer = np.full(values.shape, np.nan)
+    finite = np.flatnonzero(np.isfinite(values))
+    if not len(finite):
+        return answer
+    order = finite[np.argsort(values[finite])]
+    ranked = values[order] * len(order) / np.arange(1, len(order) + 1)
+    ranked = np.minimum.accumulate(ranked[::-1])[::-1]
+    answer[order] = np.clip(ranked, 0.0, 1.0)
+    return answer
+
+
+def bootstrap_ci(values: np.ndarray, statistic: Callable[[np.ndarray], float] = np.mean, *, seed: int, n_boot: int = 1000) -> tuple[float, float]:
+    x = np.asarray(values)
+    if len(x) < 2:
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    out = np.empty(n_boot, dtype=float)
+    for i in range(n_boot):
+        out[i] = statistic(x[rng.integers(0, len(x), len(x))])
+    return tuple(np.quantile(out, [0.025, 0.975]).tolist())
+
+
+def stratified_auc_bootstrap(y: np.ndarray, score: np.ndarray, *, seed: int, n_boot: int = 500) -> tuple[float, float]:
+    y = np.asarray(y, dtype=np.int8)
+    score = np.asarray(score, dtype=float)
+    pos, neg = np.flatnonzero(y == 1), np.flatnonzero(y == 0)
+    if not len(pos) or not len(neg):
+        return float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    aucs = np.empty(n_boot)
+    for i in range(n_boot):
+        ip = rng.choice(pos, len(pos), replace=True)
+        ineg = rng.choice(neg, len(neg), replace=True)
+        ix = np.concatenate([ineg, ip])
+        aucs[i] = roc_auc_score(y[ix], score[ix])
+    return tuple(np.quantile(aucs, [0.025, 0.975]).tolist())
+
+
+def cliffs_delta(x: np.ndarray, y: np.ndarray, cap: int = 5000, seed: int = 0) -> float:
+    rng = np.random.default_rng(seed)
+    a, b = np.asarray(x), np.asarray(y)
+    if len(a) > cap:
+        a = rng.choice(a, cap, replace=False)
+    if len(b) > cap:
+        b = rng.choice(b, cap, replace=False)
+    return float((np.sum(a[:, None] > b[None, :]) - np.sum(a[:, None] < b[None, :])) / (len(a) * len(b)))
+
+
+def cramers_v(table: np.ndarray) -> tuple[float, float, float, str]:
+    table = np.asarray(table, dtype=np.float64)
+    if table.ndim != 2 or table.size == 0 or table.sum() <= 0 or np.any(~np.isfinite(table)) or np.any(table < 0):
+        return float("nan"), float("nan"), float("nan"), "NOT_ESTIMABLE_INVALID_OR_EMPTY_TABLE"
+    active_rows = table.sum(axis=1) > 0; active_columns = table.sum(axis=0) > 0
+    reduced = table[np.ix_(active_rows, active_columns)]
+    if reduced.shape[0] < 2:
+        return float("nan"), float("nan"), float("nan"), "NOT_ESTIMABLE_FEWER_THAN_TWO_NONEMPTY_GROUPS"
+    if reduced.shape[1] < 2:
+        return float("nan"), float("nan"), float("nan"), "NOT_ESTIMABLE_NO_OUTCOME_VARIATION"
+    expected = np.outer(reduced.sum(axis=1), reduced.sum(axis=0)) / reduced.sum()
+    if np.any(expected <= 0):
+        return float("nan"), float("nan"), float("nan"), "NOT_ESTIMABLE_ZERO_EXPECTED_FREQUENCY"
+    chi2, p, _, _ = stats.chi2_contingency(reduced, correction=False)
+    n, r, k = reduced.sum(), *reduced.shape
+    phi2 = chi2 / n
+    phi2c = max(0.0, phi2 - ((k - 1) * (r - 1)) / max(n - 1, 1))
+    rc = r - (r - 1) ** 2 / max(n - 1, 1)
+    kc = k - (k - 1) ** 2 / max(n - 1, 1)
+    denom = min(kc - 1, rc - 1)
+    value = float(math.sqrt(phi2c / denom)) if denom > 0 else float("nan")
+    status = "ESTIMABLE" if np.isfinite(value) else "NOT_ESTIMABLE_BIAS_CORRECTION_DEGENERATE"
+    return value, float(chi2), float(p), status
+
+
+def savefig_dual(fig: plt.Figure, base: Path) -> list[Path]:
+    base.parent.mkdir(parents=True, exist_ok=True)
+    png, pdf = base.with_suffix(".png"), base.with_suffix(".pdf")
+    fig.savefig(png, dpi=220, bbox_inches="tight", facecolor="white")
+    fig.savefig(pdf, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return [png, pdf]
+
+
+@dataclass
+class Stage2MConfig:
+    project_root: Path
+    stage1b_dir: Path
+    benchmark_path: Path
+    output_root: Path
+    start_stage: int = 1
+    end_stage: int = 10
+    chunk_size: int = 4096
+    stats_chunk_size: int = 4096
+    max_fit_samples: int = 120_000
+    max_domain_per_tx: int = 300
+    max_cluster_samples: int = 5000
+    max_pca_plot_samples: int = 12_000
+    bootstrap_replicates: int = 500
+    linear_epochs: int = 2
+    copy_local: bool = False
+    force: bool = False
+    seeds: dict[str, int] = field(default_factory=lambda: dict(SEEDS))
+
+    def normalized(self) -> dict[str, Any]:
+        d = asdict(self)
+        d.pop("force", None)
+        d.pop("start_stage", None)
+        d.pop("end_stage", None)
+        return d
+
+    @property
+    def config_sha256(self) -> str:
+        return sha256_json(self.normalized())
+
+    def validate(self) -> None:
+        if not 1 <= self.start_stage <= self.end_stage <= 10:
+            raise ScientificAbort("Stage range must satisfy 1 <= start <= end <= 10")
+        expected_parent = self.project_root / "MANYTX_ZERO_DAY_BRANCH_v1.0.3" / "02_benchmark_diagnostics"
+        if self.output_root.resolve() != expected_parent.resolve():
+            raise ScientificAbort(f"Output root must be exactly {expected_parent}")
+        if self.output_root.resolve() == self.stage1b_dir.resolve() or self.output_root.resolve() in self.stage1b_dir.resolve().parents:
+            raise ScientificAbort("Diagnostics output may not overwrite Stage 1B")
+
+
+@dataclass(frozen=True)
+class H5Schema:
+    signal_key: str
+    sample_id_key: str
+    tx_key: str
+    rx_key: str
+    day_key: str
+    equalization_key: str
+    signal_shape: tuple[int, ...]
+    signal_dtype: str
+    orientation: str
+
+
+@dataclass(frozen=True)
+class SplitRef:
+    role: str
+    display: str
+    path: Path
+    count: int
+
+
+class StrictTestGuard:
