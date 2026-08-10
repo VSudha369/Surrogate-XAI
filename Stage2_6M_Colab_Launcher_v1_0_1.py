@@ -42,13 +42,23 @@ def sha256_file(path: Path) -> str:
 
 
 def mount_drive() -> None:
-    if Path("/content").is_dir():
-        try:
-            from google.colab import drive  # type: ignore
+    mounted_root = Path("/content/drive/MyDrive")
+    if mounted_root.is_dir():
+        print("[PASS] Google Drive is already mounted and accessible")
+        return
+    if not Path("/content").is_dir():
+        return
+    try:
+        from google.colab import drive  # type: ignore
 
-            drive.mount("/content/drive", force_remount=False)
-        except ImportError:
-            pass
+        drive.mount("/content/drive", force_remount=False)
+    except (AttributeError, ImportError, RuntimeError) as exc:
+        raise RuntimeError(
+            "Google Drive is not accessible from this subprocess. "
+            "Mount Drive once in the parent Colab notebook before launching Stage 2.6M."
+        ) from exc
+    if not mounted_root.is_dir():
+        raise RuntimeError(f"Google Drive mount completed but {mounted_root} is not accessible")
 
 
 def find_one(root: Path, name: str) -> Path:

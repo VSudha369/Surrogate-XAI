@@ -32,7 +32,7 @@ Stage 1B and Stage 2M are opened read-only. `manifests/STAGE2M_FINAL_STATUS.json
 
 ## Colab execution
 
-The easiest route is to copy the complete contents of `Stage2_6M_Colab_Launcher_v1_0_1.py` into one Colab cell. The launcher mounts Drive, installs only missing dependencies, verifies upstream inputs, reports the GPU, and invokes the standalone program with `subprocess.check_call`. When run from a cloned repository it prefers the standalone script beside the launcher; `WISIG_STAGE2_6M_SCRIPT` remains the explicit override, and Drive-wide discovery is used only as a fallback.
+The easiest route is to mount Google Drive once in the parent Colab notebook and execute `Stage2_6M_Colab_Launcher_v1_0_1.py` as a subprocess. The launcher detects an accessible existing mount, installs only missing dependencies, verifies upstream inputs, reports the GPU, and invokes the standalone program with `subprocess.check_call`. When run from a cloned repository it prefers the standalone script beside the launcher; `WISIG_STAGE2_6M_SCRIPT` remains the explicit override, and Drive-wide discovery is used only as a fallback. If Drive is not already accessible, the launcher emits a clear instruction instead of attempting an unsupported mount from a non-IPython child process.
 
 Environment overrides are explicit:
 
