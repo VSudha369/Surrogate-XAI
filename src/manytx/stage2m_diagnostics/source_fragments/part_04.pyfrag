@@ -1,0 +1,97 @@
+        names = ["samples_by_tx.csv", "samples_by_receiver.csv", "samples_by_day.csv", "samples_by_equalization.csv", "tx_receiver_coverage.csv", "tx_day_coverage.csv", "tx_equalization_coverage.csv", "tx_receiver_day_coverage.csv", "tx_receiver_day_equalization_coverage.csv"]
+        paths = []
+        for name, frame in zip(names, combined):
+            path = self.dirs["tables"] / name; atomic_csv(path, frame); paths.append(path)
+        tx_counts = combined[0]
+        balance_rows = []
+        for (role, protocol), frame in tx_counts.groupby(["role", "protocol"]):
+            values = frame["count"].to_numpy(float)
+            balance_rows.append({"role": role, "protocol": protocol, "classes": len(values), "samples": int(values.sum()), "min": int(values.min()), "median": float(np.median(values)), "max": int(values.max()), "coefficient_of_variation": float(values.std() / (values.mean() + EPS)), "imbalance_ratio": float(values.max() / max(values.min(), 1))})
+        balance = pd.DataFrame(balance_rows); p_balance = self.dirs["tables"] / "class_balance_summary.csv"; atomic_csv(p_balance, balance); paths.append(p_balance)
+        train_tx = split_uniques["train_known"]["tx"]; calibration_tx = split_uniques["calibration_unknown"]["tx"]
+        if len(train_tx) != 98: raise ScientificAbort(f"train_known: expected 98 transmitter identities; found {len(train_tx)}")
+        if len(calibration_tx) != 22: raise ScientificAbort(f"calibration_unknown: expected 22 transmitter identities; found {len(calibration_tx)}")
+        overlap = train_tx & calibration_tx
+        if overlap: raise ScientificAbort(f"Calibration Unknown overlaps Train Known transmitter identities: {sorted(overlap)}")
+        identity_coverage_rows = []
+        for role in ("train_known", "p0_known", "p1_cross_day", "p2_cross_receiver", "p3_cross_day_receiver"):
+            observed_tx = split_uniques[role]["tx"]; unexpected = observed_tx - train_tx; missing = train_tx - observed_tx
+            if unexpected: raise ScientificAbort(f"{role}: contains transmitter identities absent from Train Known: {sorted(unexpected)}")
+            identity_coverage_rows.append({"role":role, "protocol":self.splits[role].display, "reference_role":"train_known", "reference_transmitter_identities":len(train_tx), "observed_transmitter_identities":len(observed_tx), "missing_transmitter_identities":len(missing), "identity_coverage_fraction":len(observed_tx)/len(train_tx), "missing_identity_codes":";".join(sorted(missing)), "validation_rule":"nonempty subset of Train Known; missing identities are reported coverage, not an abort"})
+        identity_coverage_rows.append({"role":"calibration_unknown", "protocol":self.splits["calibration_unknown"].display, "reference_role":"calibration_unknown frozen partition", "reference_transmitter_identities":22, "observed_transmitter_identities":len(calibration_tx), "missing_transmitter_identities":0, "identity_coverage_fraction":1.0, "missing_identity_codes":"", "validation_rule":"exactly 22 identities and disjoint from Train Known"})
+        identity_coverage = pd.DataFrame(identity_coverage_rows); p_identity_coverage = self.dirs["tables"] / "protocol_transmitter_identity_coverage.csv"; atomic_csv(p_identity_coverage, identity_coverage); paths.append(p_identity_coverage)
+        coverage_rows = []
+        dimensions = [(4, "tx_receiver"), (5, "tx_day"), (6, "tx_equalization"), (7, "tx_receiver_day"), (8, "tx_receiver_day_equalization")]
+        for idx, label in dimensions:
+            for (role, protocol), frame in combined[idx].groupby(["role", "protocol"]):
+                dims = [x for x in label.split("_") if x in {"tx", "receiver", "day", "equalization"}]
+                expected = 1
+                mapping = {"tx": "tx", "receiver": "rx", "day": "day", "equalization": "eq"}
+                for d in dims: expected *= len(global_uniques[mapping[d]])
+                observed = len(frame)
+                coverage_rows.append({"role": role, "protocol": protocol, "dimension": label, "observed_combinations": observed, "global_possible_combinations": expected, "coverage_ratio": observed / max(expected, 1), "missing_combinations": max(expected - observed, 0)})
+        coverage = pd.DataFrame(coverage_rows); p_cov = self.dirs["tables"] / "coverage_summary.csv"; atomic_csv(p_cov, coverage); paths.append(p_cov)
+        concentration_rows = []
+        for dimension, frame in zip(("transmitter", "receiver", "capture_date", "equalization"), combined[:4]):
+            for (role, protocol), group in frame.groupby(["role", "protocol"]):
+                values = group["count"].to_numpy(float); shares = values / values.sum()
+                concentration_rows.append({"role":role, "protocol":protocol, "dimension":dimension, "levels":len(values), "min_samples":int(values.min()), "median_samples":float(np.median(values)), "max_samples":int(values.max()), "coefficient_of_variation":float(values.std()/(values.mean()+EPS)), "maximum_share":float(shares.max()), "herfindahl_index":float(np.sum(shares**2))})
+        concentration_table = pd.DataFrame(concentration_rows); p_concentration = self.dirs["tables"] / "metadata_concentration_summary.csv"; atomic_csv(p_concentration, concentration_table); paths.append(p_concentration)
+        protocol = balance[["role", "protocol", "samples", "classes"]].copy().merge(identity_coverage[["role", "reference_transmitter_identities", "missing_transmitter_identities", "identity_coverage_fraction"]], on="role", how="left"); p_protocol = self.dirs["tables"] / "protocol_sample_summary.csv"; atomic_csv(p_protocol, protocol); paths.append(p_protocol)
+        codebook_path = self.dirs["cache"] / "metadata_codebooks.json"; atomic_json(codebook_path, {key: sorted(values) for key, values in global_uniques.items()}); paths.append(codebook_path)
+        fig_specs = [(combined[0], "tx", "samples_per_transmitter", "Samples per transmitter"), (combined[1], "rx", "samples_per_receiver", "Samples per receiver"), (combined[2], "day", "samples_per_day", "Samples per capture date"), (combined[3], "eq", "samples_per_equalization", "Samples per equalization state")]
+        for frame, col, filename, title in fig_specs:
+            totals = frame.groupby(col)["count"].sum().sort_values(ascending=False)
+            fig, ax = plt.subplots(figsize=(max(8, min(18, len(totals) * .12)), 5)); ax.bar(np.arange(len(totals)), totals.values, color="#315b7d")
+            ax.set_title(title + " — legally accessible Stage 2M data"); ax.set_ylabel("Samples"); ax.set_xlabel(col); ax.grid(axis="y", alpha=.25)
+            if len(totals) <= 30: ax.set_xticks(np.arange(len(totals)), totals.index, rotation=70)
+            paths += savefig_dual(fig, self.dirs["figures"] / filename)
+        for frame, rows, cols, filename, title in [(combined[4], "tx", "rx", "tx_receiver_coverage_heatmap", "Tx × receiver coverage"), (combined[5], "tx", "day", "tx_day_coverage_heatmap", "Tx × day coverage")]:
+            pivot = frame.groupby([rows, cols])["count"].sum().unstack(fill_value=0)
+            fig, ax = plt.subplots(figsize=(12, 8)); image = ax.imshow(np.log1p(pivot.to_numpy()), aspect="auto", cmap="viridis"); fig.colorbar(image, ax=ax, label="log(1 + samples)")
+            ax.set_title(title + " — strict zero-day not accessed"); ax.set_xlabel(cols); ax.set_ylabel(rows); paths += savefig_dual(fig, self.dirs["figures"] / filename)
+        report = self.dirs["reports"] / "dataset_balance_and_coverage_report.md"
+        atomic_text(report, "# Dataset Balance and Coverage Report\n\nAll counts below use legally accessible Stage 2M partitions only. Strict-zero-day identities and samples were not read. A known validation protocol may contain a strict subset of the 98 Train Known identities when that domain combination was unavailable; this is reported as coverage and is not benchmark corruption.\n\n## Protocol balance\n\n" + balance.to_markdown(index=False) + "\n\n## Transmitter identity coverage\n\n" + identity_coverage.to_markdown(index=False) + "\n\n## Coverage summary\n\n" + coverage.to_markdown(index=False) + "\n\n## Metadata concentration\n\n" + concentration_table.to_markdown(index=False) + "\n\nMissing combinations are reported without inventing session metadata. `session_id = NOT_REPRESENTED`.\n")
+        paths.append(report)
+        return paths
+
+    @staticmethod
+    def _sample_id_digest(value: str) -> int:
+        return int.from_bytes(hashlib.blake2b(str(value).encode("utf-8"), digest_size=8, person=b"stage2m1").digest(), "little")
+
+    @staticmethod
+    def _audit_column(header: Sequence[str], candidates: Sequence[str], semantic: str, optional: bool = False) -> int | None:
+        normalized = [re.sub(r"[^a-z0-9]+", "_", str(x).strip().lower()).strip("_") for x in header]
+        for candidate in candidates:
+            if candidate in normalized:
+                return normalized.index(candidate)
+        if semantic == "raw RMS":
+            fallback = [i for i, name in enumerate(normalized) if "rms" in name and not any(token in name for token in ("threshold", "flag", "zscore", "normalized"))]
+            if len(fallback) == 1:
+                return fallback[0]
+        if optional:
+            return None
+        raise ScientificAbort(f"signal_integrity_row_audit.csv: could not resolve {semantic} column; headers={list(header)}")
+
+    def extract_allowed_raw_rms(self) -> tuple[dict[str, Path], Path]:
+        """Parse only allowed CSV rows; strict rows are discarded as opaque text."""
+        assert self.schema is not None
+        audit_path = find_exact(self.cfg.stage1b_dir, "signal_integrity_row_audit.csv")
+        roles = list(self.splits); role_code = np.full(EXPECTED_TOTAL, -1, dtype=np.int8); position = np.full(EXPECTED_TOTAL, -1, dtype=np.int32)
+        expected_id_hash = np.zeros(EXPECTED_TOTAL, dtype=np.uint64); bench = self.benchmark()
+        for code, role in enumerate(roles):
+            split = self.splits[role]; indices = split_indices(split); role_code[indices] = code; position[indices] = np.arange(split.count, dtype=np.int32)
+            for _, chunk_indices in iter_split_chunks(split, self.cfg.chunk_size):
+                sample_ids = bench.read_metadata(split, chunk_indices, ("sample_id",))["sample_id"]
+                expected_id_hash[chunk_indices] = np.asarray([self._sample_id_digest(x) for x in sample_ids], dtype=np.uint64)
+        final_paths = {role:self.dirs["cache"] / f"stage03_{role}_raw_rms.npy" for role in roles}; temporary = {role:path.with_name(path.name + ".part") for role,path in final_paths.items()}
+        stores = {role:np.lib.format.open_memmap(temporary[role], mode="w+", dtype=np.float64, shape=(self.splits[role].count,)) for role in roles}
+        selected_rows = np.zeros(len(roles), dtype=np.int64); alignment_checks = 0; total_rows = 0
+        with audit_path.open("rb") as handle:
+            header_line = handle.readline().decode("utf-8-sig", "strict")
+            if not header_line: raise ScientificAbort("signal_integrity_row_audit.csv is empty")
+            header = next(csv.reader([header_line])); rms_col = self._audit_column(header, ["raw_rms", "raw_signal_rms", "signal_rms", "rms_amplitude", "rms", "rms_before_normalization", "pre_normalization_rms", "source_rms"], "raw RMS", optional=True); energy_col = self._audit_column(header, ["raw_energy", "raw_signal_energy", "signal_energy", "total_energy", "energy"], "raw total energy", optional=True)
+            if rms_col is None and energy_col is None: raise ScientificAbort(f"Row audit exposes neither a recognized raw RMS nor raw energy column; headers={header}")
+            sample_col = self._audit_column(header, ["sample_id", "sample_identifier"], "sample ID", optional=True)
+            index_col = self._audit_column(header, ["benchmark_index", "canonical_index", "global_index", "hdf5_index", "dataset_index"], "canonical row index", optional=True)
+            if sample_col is None and index_col is None:
