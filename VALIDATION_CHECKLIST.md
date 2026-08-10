@@ -21,7 +21,7 @@
 ## Strict zero-day
 
 - [ ] Strict index arrays are never passed to `numpy.load` or HDF5 row readers.
-- [ ] Frozen manifests provide strict file counts; byte-stream hashes are verified against path-bound records for the exact strict filenames.
+- [ ] Frozen manifests provide strict file counts through the canonical split keys; byte-stream hashes are verified against path-bound records for the exact strict filenames.
 - [ ] Signal, label, embedding, metric, and threshold strict violation counters are all zero and are not represented as complete HDF5 read instrumentation.
 - [ ] No strict prediction, embedding, score, AUROC, or threshold artifact exists.
 

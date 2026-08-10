@@ -15,7 +15,7 @@ The supplied prior notebook was reviewed for project history and engineering con
 
 Training reads only `Train Known`. P0–P3 are frozen validation protocols. Calibration Unknown is embedded only after training and never contributes gradients, prototypes, covariance fitting, thresholds, or primary model selection.
 
-`strict_zero_day_test_indices.npy` and `strict_zero_day_shift_test_indices.npy` are never loaded. The guard verifies only their existence, byte-stream hash, and count declared in frozen Stage 1B manifests. Hashes and counts are accepted only from manifest records directly bound to the exact strict filename, preventing unrelated manifest digests from being mistaken for the array hash. Its strict signal/label/embedding/metric/threshold fields are violation counters, while the primary evidence is structural: an authorized partition allowlist, strict-path prohibition, frozen-index-only resolution, output scanning, and a static forbidden-artifact guard.
+`strict_zero_day_test_indices.npy` and `strict_zero_day_shift_test_indices.npy` are never loaded. The guard verifies only their existence, byte-stream hash, and count declared in frozen Stage 1B manifests. Hashes are accepted only from records bound to the exact strict filename; counts may also use the frozen canonical split keys `strict_zero_day` and `strict_zero_day_shift`. This prevents unrelated manifest digests or split counts from being mistaken for strict-array declarations. Its strict signal/label/embedding/metric/threshold fields are violation counters, while the primary evidence is structural: an authorized partition allowlist, strict-path prohibition, frozen-index-only resolution, output scanning, and a static forbidden-artifact guard.
 
 ## Canonical layout
 

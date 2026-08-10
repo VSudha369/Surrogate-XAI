@@ -403,7 +403,13 @@ def manifest_name_matches(value: Any, filename: str) -> bool:
     basename = value.replace("\\", "/").rstrip("/").split("/")[-1]
     candidate = normalize_token(basename)
     stem = normalize_token(Path(filename).stem)
-    targets = {normalize_token(filename), stem, re.sub(r"_indices$", "", stem)}
+    without_indices = re.sub(r"_indices$", "", stem)
+    targets = {
+        normalize_token(filename),
+        stem,
+        without_indices,
+        re.sub(r"_test$", "", without_indices),
+    }
     return candidate in targets
 
 
@@ -422,6 +428,8 @@ def iter_bound_manifest_records(
             child_trail = trail + (str(key),)
             if manifest_name_matches(str(key), filename) and isinstance(child, str) and re.fullmatch(r"[0-9a-fA-F]{64}", child.strip()):
                 yield child_trail, {"sha256": child}
+            if manifest_name_matches(str(key), filename) and isinstance(child, (int, float)) and not isinstance(child, bool):
+                yield child_trail, {"count": child}
             yield from iter_bound_manifest_records(child, filename, child_trail)
     elif isinstance(value, list):
         for index, child in enumerate(value):
