@@ -20,9 +20,17 @@ All scientific runtime artifacts are written below the canonical branch's `03_re
 └── cache/
 ```
 
+The v1.0.2 runtime also creates `performance/` beneath the Stage 2.6M output and disposable cache/shard files only beneath `/content/wisig_stage2_6m_cache/`.
+
 ## Checkpoints
 
-Each arm/seed directory contains `last.pt`, `best_known_macro_f1.pt`, and `best_selection.pt`. Payloads include model, optimizer, scheduler, scaler, epoch, arm, seed, best metrics, frozen configuration, benchmark/Stage2M/script hashes, RNG states, EMA prototype state, sampler exposure state, architecture signature, loss coefficients, and synchronized group early-stopping state.
+Each arm/seed directory contains `last.pt`, alternating `resume_slot_0.pt`/`resume_slot_1.pt`, `best_known_macro_f1.pt`, and `best_selection.pt`. Payloads include model, optimizer, scheduler, scaler, epoch, arm, seed, best metrics, frozen configuration, benchmark/Stage2M/script hashes, RNG states, EMA prototype state, sampler exposure state, architecture signature, loss coefficients, and synchronized group early-stopping state.
+
+## Performance artifacts
+
+`performance/` contains `local_cache_report.json`, storage A/B CSV/JSON, storage selection, DataLoader autotune, evaluation-batch autotune, batch/epoch timing, hardware utilization, performance summary JSON/Markdown, exposure/model-input equivalence evidence, authorized shard manifest copies, and `PERFORMANCE_PREFLIGHT_STATUS.json`. Missing historical baseline telemetry is labeled `BASELINE_NOT_MEASURED`; values are never fabricated.
+
+`/content/wisig_stage2_6m_cache/LOCAL_CACHE_MANIFEST.json` and partition-local `LOCAL_SHARD_MANIFEST.json` files describe disposable runtime storage. These local files are not copied into scientific checkpoint identity and are never represented as a new benchmark.
 
 ## Embedding stores
 
@@ -70,7 +78,7 @@ PCA is visualization only. It is not used in quantitative selection.
 
 The manifest set includes input provenance, frozen config, strict guard, architecture, losses, sampler, seeds, checkpoints, statistics, per-stage manifests, final status, Stage 3M objective, file inventory, and SHA-256 inventory. `STRICT_TEST_GUARD.json` labels its numeric fields as violation counters and records the structural enforcement mechanisms.
 
-`STAGE2_6M_FINAL_STATUS.json` includes pipeline/script/configuration provenance, both frozen Stage 2M hashes, architecture signature, seed panel, profile, benchmark hash, decision, violation counters, and success gates. The artifact-manifest hash remains in the separate READY marker to avoid self-reference.
+`STAGE2_6M_FINAL_STATUS.json` includes pipeline/script/configuration provenance, both frozen Stage 2M hashes, architecture signature, seed panel, profile, canonical benchmark hash, runtime backend, local-cache/shard-equivalence status, DataLoader settings, evaluation batch size, vectorized-augmentation status, performance-preflight manifest SHA, decision, violation counters, and success gates. The artifact-manifest hash remains in the separate READY marker to avoid self-reference.
 
 `CANONICAL_STAGE3M_OBJECTIVE.json` freezes the decision, selected objective/coefficients when resolved, architecture signature, embedding dimension, sampler, augmentation, optimizer, budget, seed evidence, and rationale.
 
@@ -82,5 +90,6 @@ The manifest set includes input provenance, frozen config, strict guard, archite
 
 - `MANYTX_STAGE2_6M_READY.txt` exists only for a full successful run.
 - `MANYTX_STAGE2_6M_NOT_READY.txt` records a hard gate or execution failure.
+- `STAGE2_6M_PERFORMANCE_PREFLIGHT_PASS` is printed only by a non-training performance preflight whose cache, equivalence, tuning, and strict guards pass.
 
 READY includes the benchmark hash, strict-test violation counters, selected decision, and artifact-manifest hash.

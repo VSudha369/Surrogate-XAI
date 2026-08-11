@@ -18,12 +18,27 @@
 - [ ] All six authorized frozen `.npy` partition arrays exist and their counts match the protocol; no full-HDF5 split reconstruction path exists.
 - [ ] Train Known contains exactly 98 identities; Calibration Unknown contains 22 disjoint identities.
 
+## v1.0.2 performance preflight
+
+- [ ] Opaque Drive-to-`/content` copy is SHA-verified, fsynced, atomically finalized, and reported.
+- [ ] Corrupt/partial local copies are rejected; insufficient disk never silently falls back.
+- [ ] Authorized Train Known shard manifest and every shard SHA pass.
+- [ ] Single-local versus sharded-local signals and metadata are bitwise/order equivalent, including duplicates and shard boundaries.
+- [ ] Seed-42/epoch-1 exposure SHA, order, labels, equalization, and signals are identical across backends.
+- [ ] Common initialized model inputs, logits, embeddings, and objective values are equivalent across backends.
+- [ ] Vectorized circular shift exactly equals the reference loop for fixed shifts and remains gradient-compatible.
+- [ ] Storage selection applies the 10% throughput and P95 latency gates and reports measured percentages.
+- [ ] DataLoader autotune uses independent RNG and tests safe worker/prefetch candidates.
+- [ ] Evaluation batch autotune preserves top-1 predictions and strict logit tolerance with GPU-memory headroom.
+- [ ] Performance preflight performs no optimizer update, checkpoint mutation, Calibration Unknown signal access, READY creation, or strict-row access.
+
 ## Strict zero-day
 
 - [ ] Strict index arrays are never passed to `numpy.load` or HDF5 row readers.
 - [ ] Frozen manifests provide strict file counts through the canonical split keys; byte-stream hashes are verified against path-bound records for the exact strict filenames.
 - [ ] Signal, label, embedding, metric, and threshold strict violation counters are all zero and are not represented as complete HDF5 read instrumentation.
 - [ ] No strict prediction, embedding, score, AUROC, or threshold artifact exists.
+- [ ] Shard builder has no strict partition enum value or strict shard path and accepts only caller-supplied authorized frozen indices.
 
 ## Controlled experiment
 
@@ -64,3 +79,4 @@
 - [ ] `CANONICAL_STAGE3M_OBJECTIVE.json` contains the frozen policy and rationale.
 - [ ] `STAGE2_6M_FINAL_STATUS.json` contains pipeline/script/configuration hashes, Stage 2M hashes, architecture signature, seed panel, and profile.
 - [ ] READY is written only after all gates pass under the full profile.
+- [ ] Final status separates canonical benchmark identity from runtime backend and includes preflight-manifest SHA.

@@ -1,0 +1,22 @@
+{
+  "branch_root": "/content/drive/MyDrive/colab files /Surrogate-XAI/project_root/MANYTX_ZERO_DAY_BRANCH_v1.0.3",
+  "profile": "full",
+  "max_epochs": 40,
+  "minimum_epochs": 12,
+  "early_stopping_patience": 10,
+  "batch_size": 256,
+  "samples_per_tx": 4,
+  "eval_batch_size": 1024,
+  "num_workers": 2,
+  "prefetch_factor": 2,
+  "storage_mode": "auto",
+  "local_cache_root": "/content/wisig_stage2_6m_cache",
+  "local_shard_count": 128,
+  "local_shards_enabled": true,
+  "loader_autotune_enabled": true,
+  "performance_preflight": false,
+  "storage_benchmark_warmup_batches": 20,
+  "storage_benchmark_measured_batches": 200,
+  "resume": true,
+  "device": "auto"
+}

@@ -54,7 +54,15 @@ Prototype targets use one normalized EMA prototype per known transmitter with mo
 
 Each batch selects transmitters as its primary units and draws multiple examples per Tx by cycling available `(receiver, day, equalization)` cells before reusing a cell. Both equalization states are retained and batch totals are recorded.
 
-The single frozen augmentation policy applies small phase rotation, amplitude jitter, low-intensity AWGN relative to per-sample RMS, and bounded circular shift. The epoch augmentation random stream is identical across arms.
+The single frozen augmentation policy applies small phase rotation, amplitude jitter, low-intensity AWGN relative to per-sample RMS, and bounded circular shift. The epoch augmentation random stream is identical across arms. Version 1.0.2 implements the identical per-sample circular shift with vectorized gather indexing; fixed-shift equivalence requires exact tensor equality and gradient compatibility.
+
+## Execution-only performance layer
+
+Performance settings are excluded from the scientific configuration SHA. Training batch size remains 256, validation remains every epoch, and no arm, seed, model, objective, optimizer, scheduler, augmentation magnitude, or protocol is changed.
+
+The Drive benchmark is first verified against the canonical SHA. A local whole-file copy is permitted only as an opaque byte stream, is written through a temporary file, fsynced, SHA-verified, and atomically renamed. Optional shards are local disposable execution artifacts. Their builder has an explicit six-partition authorization enum and requires the frozen authorized index array; strict-zero-day partitions have no construction route. Train Known is eligible during preflight/training, P0–P3 only when known evaluation is required, and Calibration Unknown only upon entry to Stage 08.
+
+Storage microbenchmarks and autotuners use independent RNG state that is captured and restored. They perform no optimizer update and do not alter scientific sampler exposure. Sharded storage is selected automatically only after bitwise signal/metadata equivalence, exposure equivalence, model-input equivalence, a throughput improvement of at least 10%, and an acceptable P95 latency result.
 
 ## Known evaluation
 
@@ -91,7 +99,7 @@ An auxiliary arm is selected over CE only if its primary mean gain is at least 0
 
 Python, NumPy, and Torch RNGs are seeded; CUDA seeds and deterministic cuDNN settings are recorded. Deterministic algorithms use warning mode so any unavailable deterministic kernel is surfaced without silently changing the experiment.
 
-AMP applies only on CUDA. CE, pairwise similarity, and prototype distances are computed in FP32. Gradient norms are checked and clipped. Two persistent non-finite events abort a run; no silent `nan_to_num` repair is used. The epoch scheduler advances only after successful optimizer work.
+AMP applies only on CUDA. CE, pairwise similarity, and prototype distances are computed in FP32. Gradient norms are checked and clipped. A non-finite forward loss uses the strict two-event abort gate. AMP gradient overflow is different: GradScaler canonically skips the optimizer step, reduces its scale, and may adapt for at most 32 consecutive overflows; a successful step resets that counter. An epoch with no successful optimizer step aborts. Prototype updates occur only after successful optimizer steps, no silent `nan_to_num` repair is used, and the epoch scheduler advances only after successful optimizer work.
 
 ## Claims boundary
 

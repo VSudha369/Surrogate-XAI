@@ -1,6 +1,6 @@
 # Stage 2.6M — WiSig ManyTx controlled representation ablation
 
-This repository contains the executable Stage 2.6M v1.0.1 experiment for the frozen `WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3` benchmark. It compares exactly four representation objectives under one common RF temporal network:
+This repository contains the executable Stage 2.6M v1.0.2 performance-engineered experiment for the frozen `WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3` benchmark. Versioned v1.0.1 sources remain as historical provenance. The scientific experiment still compares exactly four representation objectives under one common RF temporal network:
 
 | Arm | Objective |
 |---|---|
@@ -32,7 +32,17 @@ Stage 1B and Stage 2M are opened read-only. `manifests/STAGE2M_FINAL_STATUS.json
 
 ## Colab execution
 
-The easiest route is to mount Google Drive once in the parent Colab notebook and execute `Stage2_6M_Colab_Launcher_v1_0_1.py` as a subprocess. The launcher detects an accessible existing mount, installs only missing dependencies, verifies upstream inputs, reports the GPU, and invokes the standalone program with `subprocess.check_call`. When run from a cloned repository it prefers the standalone script beside the launcher; `WISIG_STAGE2_6M_SCRIPT` remains the explicit override, and Drive-wide discovery is used only as a fallback. If Drive is not already accessible, the launcher emits a clear instruction instead of attempting an unsupported mount from a non-IPython child process.
+Mount Google Drive once in the parent Colab notebook and use `Stage2_6M_Colab_Launcher_v1_0_2.py`. The launcher detects an accessible existing mount, installs only missing dependencies, verifies upstream inputs, reports the GPU, and invokes the standalone program with `subprocess.check_call`.
+
+```bash
+git pull --ff-only origin codex/stage2-6m
+git rev-parse HEAD
+python -u Stage2_6M_Colab_Launcher_v1_0_2.py --performance-preflight
+python -u Stage2_6M_Colab_Launcher_v1_0_2.py --reset-seed 42
+python -u Stage2_6M_Colab_Launcher_v1_0_2.py
+```
+
+The preflight performs no model training and cannot create READY. It makes an opaque SHA-verified local copy, builds only authorized Train Known shards, checks bitwise backend/exposure/model-input equivalence, benchmarks storage, tunes execution-only loader/evaluation settings, and writes measured performance reports. The full v1.0.2 run requires a passing current preflight status.
 
 Full-profile training resumes only from a complete synchronized four-arm epoch checkpoint. Two alternating resume slots retain the current and preceding epoch so an interruption during one arm rolls back to the latest common epoch. The v1.0.1 AMP recovery corrections explicitly accept checkpoints written by predecessor script SHA-256 values `421e3c64ce33b3b7929e10d5af84debe9e735c9b2a8709475080cfa0346fd6ac` and `7493e709bf0cd4a41b990b950f8603900ce4904299497c400ab5df7de346a141`; every other benchmark, Stage 2M, configuration, architecture, arm, and seed provenance gate remains mandatory, and all newly written checkpoints record the current script SHA-256. AMP gradient overflows use GradScaler's canonical skipped-step recovery and abort only after 32 consecutive overflows without a successful optimizer step; non-finite forward losses retain their stricter abort gate.
 
@@ -41,7 +51,7 @@ Environment overrides are explicit:
 ```python
 import os
 os.environ["WISIG_BRANCH_ROOT"] = "/content/drive/MyDrive/.../MANYTX_ZERO_DAY_BRANCH_v1.0.3"
-os.environ["WISIG_STAGE2_6M_SCRIPT"] = "/content/drive/MyDrive/.../Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_1.py"
+os.environ["WISIG_STAGE2_6M_SCRIPT"] = "/content/Surrogate-XAI/Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py"
 os.environ["WISIG_STAGE2_6M_PROFILE"] = "full"
 ```
 
@@ -50,7 +60,7 @@ Never invoke the standalone pipeline with `%run`; that can leak Jupyter's `-f ke
 ## Direct execution
 
 ```bash
-python Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_1.py \
+python Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py \
   --branch-root "/path/to/MANYTX_ZERO_DAY_BRANCH_v1.0.3" \
   --profile full
 ```
@@ -60,11 +70,19 @@ Resume is enabled by default. A checkpoint is rejected unless benchmark, Stage 2
 For dependency and finite-gradient validation without benchmark access:
 
 ```bash
-python Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_1.py \
+python Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py \
   --synthetic-validation --device cpu
 ```
 
 This command produces no scientific metrics and cannot create READY.
+
+## v1.0.2 storage and security design
+
+The canonical HDF5 identity never changes. `/content/wisig_stage2_6m_cache` is disposable execution storage and is excluded from scientific configuration identity. The whole-HDF5 local operation is an opaque filesystem copy plus SHA-256 verification; it does not parse rows.
+
+Shard generation accepts only an explicit authorized partition name and the already-verified frozen index array. Train Known is the only shard constructed during preflight. P0–P3 shards are delayed until known evaluation is required, and Calibration Unknown shards are structurally rejected until Stage 08. Strict-zero-day names are absent from the authorization enum, rejected by path guards, never supplied by split discovery, and never passed to an HDF5 signal reader. Local shards are never persisted to Drive.
+
+`storage-mode=auto` selects sharded local storage only after equivalence passes, measured samples/s improves by at least 10%, and P95 latency remains within its gate. Otherwise the verified single local HDF5 is selected. `single_drive` is available only as an explicit controlled fallback; insufficient local disk never triggers a silent fallback.
 
 ## Controlled training design
 

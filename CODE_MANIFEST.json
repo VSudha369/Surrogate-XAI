@@ -1,7 +1,7 @@
 {
-  "artifact": "Stage 2.6M — WiSig ManyTx Controlled Representation Learning & Domain-Robust Embedding Ablation",
-  "version": "1.0.1",
-  "generated_date": "2026-08-10",
+  "artifact": "Stage 2.6M - WiSig ManyTx Controlled Representation Learning & Domain-Robust Embedding Ablation",
+  "version": "1.0.2",
+  "generated_date": "2026-08-11",
   "canonical_benchmark": "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3",
   "canonical_benchmark_sha256": "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9",
   "source_provenance": [
@@ -14,6 +14,11 @@
       "name": "Stage 2.6M master generation prompt",
       "sha256": "c225368963152c882b1637ab0055547406efdd9329d1430226087e2e807fd631",
       "role": "Authoritative scientific and engineering specification"
+    },
+    {
+      "name": "Stage 2.6M v1.0.2 performance-engineering task",
+      "sha256": "7b086d6d47075f4617dec017193ad2e34c304b7e5716e76fb679f610da3ed3f7",
+      "role": "Authoritative execution-engine and strict authorized-sharding specification"
     }
   ],
   "files": [
@@ -24,55 +29,66 @@
     },
     {
       "path": "README.md",
-      "bytes": 6738,
-      "sha256": "3cd62da17241e1971bf8f0d0b670d1de4efe3c0c771e47c1602837bc51760084"
+      "bytes": 8268,
+      "sha256": "e18e52d1d0892ddbe0b655acf2da909cbf89cc4a5126270c74761b1163156e5b"
     },
     {
       "path": "SCIENTIFIC_PROTOCOL.md",
-      "bytes": 8031,
-      "sha256": "9bd646b7b15ed97a3bb7086b6cd3cc12c11e3104939613772cc79ce715a64f3a"
+      "bytes": 9812,
+      "sha256": "8ac9909272fcd9136748024866735c81ac8fb1b3ae91251a7a8c227e5a767fae"
     },
     {
       "path": "OUTPUT_SCHEMA.md",
-      "bytes": 4914,
-      "sha256": "8b42b75382910d3fe71402e61bf59cde97aa37c646f25d4ba05d06e1e975e8c7"
+      "bytes": 6187,
+      "sha256": "469f4141e1b33b1a0338330280c9472c7bf54a072e999c3a6efe58b6b3cdc5e9"
     },
     {
       "path": "VALIDATION_CHECKLIST.md",
-      "bytes": 4006,
-      "sha256": "999905e3ac56b985fba8f0e9b884e825a094acef8bf4d2f0a85af82890ab8fce"
+      "bytes": 5488,
+      "sha256": "9d2a4913f414115018ff3d2979364fa29aa584b171d6e564c46a9b3fe5ca5cfe"
     },
     {
       "path": "requirements.txt",
-      "bytes": 144,
-      "sha256": "b88d3e652ed928637f886b2541a5d4314885c5df8a64a502ddc56cbc0b84fb00"
+      "bytes": 159,
+      "sha256": "d2c8fc63ae8c2df2fbc5e98b6f06a73f69cd24daa397c400028585aaa95063c9"
     },
     {
-      "path": "stage2_6m_config.example.json",
-      "bytes": 343,
-      "sha256": "d92b2f7f01e70fabe79bbd10d44184090f15afaf2b8050527bf251f89a6cc588"
+      "path": "stage2_6m_config_v1_0_2.example.json",
+      "bytes": 665,
+      "sha256": "4e71ba86faaf0bfcbf3334e0bad3816dfff18f086f984fe556fef4975b72a5fb"
     },
     {
-      "path": "Stage2_6M_Colab_Launcher_v1_0_1.py",
-      "bytes": 9107,
-      "sha256": "2294931bd1d863a383323d425c009e3ecd42fd49d02c21a26fd9c806187ff0d4"
+      "path": "Stage2_6M_Colab_Launcher_v1_0_2.py",
+      "bytes": 10429,
+      "sha256": "e8201ceeb526008e4ac87ed14bc41fc916c0ac7fa02c8c50dcd8eeb7359185aa"
     },
     {
-      "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_1.py",
-      "bytes": 186579,
-      "sha256": "1b66b23ff0b0810a0f7070c450dff038fb38d962bd65bbe6fc3f56f551b850f3"
+      "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py",
+      "bytes": 224477,
+      "sha256": "3a7f795a07163a590f1b24d66ba9cc1574de1e6966bc87157886e8668a79d5d1"
     },
     {
-      "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_1.ipynb",
-      "bytes": 2378,
-      "sha256": "04dd6507d7705afe9144aeed66183c0da89dfd3c5f838c4a19ecf10195afc7cb"
+      "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.ipynb",
+      "bytes": 2470,
+      "sha256": "b72301746e189abc8a00d6ce29e432e5ce55d23bc646fb2fd40ac220ca0b86b3"
+    },
+    {
+      "path": "stage2_6m_performance_v1_0_2.py",
+      "bytes": 41268,
+      "sha256": "2d2245967fffb99ca4f7fc1508b02d5ab48a228c4bb0edeb790aec68c672de70"
+    },
+    {
+      "path": "validate_stage2_6m_v1_0_2.py",
+      "bytes": 10264,
+      "sha256": "22f101bd42c4eabab403a14bc38944db493a51e31de87c1c6d564b10d4c9713c"
     }
   ],
   "validation": {
     "python_ast_parse": "PASS",
     "notebook_json_parse": "PASS",
-    "undefined_global_symbol_audit": "PASS (__file__ is the only runtime-provided symbol)",
-    "scientific_execution": "NOT_RUN_LOCALLY — frozen benchmark and ML runtime are not present in this workspace",
-    "synthetic_execution": "NOT_RUN_LOCALLY — torch/scipy/scikit-learn/h5py/matplotlib are not installed in the bundled document runtime"
+    "undefined_name_audit": "PASS (pyflakes)",
+    "benchmark_independent_runtime_equivalence": "PASS",
+    "synthetic_four_arm_finite_gradient": "PASS",
+    "scientific_execution": "NOT_RUN_LOCALLY - frozen canonical WiSig benchmark and Stage 2M artifacts are not present in this workspace"
   }
 }
