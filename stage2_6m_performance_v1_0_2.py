@@ -31,6 +31,13 @@ try:
 except ImportError:  # pragma: no cover - launcher installs the declared dependency
     psutil = None
 
+_PSUTIL_PROCESS = psutil.Process() if psutil is not None else None
+if _PSUTIL_PROCESS is not None:
+    # Prime the interval counters so later snapshots are never presented as
+    # first-call utilization estimates.
+    _PSUTIL_PROCESS.cpu_percent(interval=None)
+    psutil.cpu_percent(interval=None)
+
 
 SCHEMA_VERSION = "stage2_6m_runtime_storage_v1"
 AUTHORIZED_PARTITIONS = frozenset({"train_known", "p0", "p1", "p2", "p3", "calibration_unknown"})
@@ -99,21 +106,23 @@ def percentile(values: Sequence[float], value: float) -> float:
     return float(np.percentile(np.asarray(values, dtype=np.float64), value)) if values else math.nan
 
 
-def memory_snapshot() -> Dict[str, float]:
+def memory_snapshot() -> Dict[str, Any]:
     if psutil is None:
         return {
             "process_cpu_percent": math.nan,
             "system_cpu_percent": math.nan,
             "rss_bytes": math.nan,
             "available_ram_bytes": math.nan,
+            "cpu_utilization_sampling_semantics": "unavailable",
         }
-    process = psutil.Process()
+    process = _PSUTIL_PROCESS or psutil.Process()
     vm = psutil.virtual_memory()
     return {
         "process_cpu_percent": float(process.cpu_percent(interval=None)),
         "system_cpu_percent": float(psutil.cpu_percent(interval=None)),
         "rss_bytes": float(process.memory_info().rss),
         "available_ram_bytes": float(vm.available),
+        "cpu_utilization_sampling_semantics": "interval_since_previous_snapshot_not_epoch_average",
     }
 
 
@@ -125,6 +134,8 @@ def gpu_snapshot() -> Dict[str, Any]:
         "torch_memory_reserved_bytes": 0,
         "torch_peak_allocated_bytes": 0,
         "torch_peak_reserved_bytes": 0,
+        "gpu_utilization_sample_count": 0,
+        "gpu_utilization_sampling_semantics": "instantaneous_nvidia_smi_sample_not_epoch_average",
     }
     if torch.cuda.is_available():
         result.update({
@@ -147,6 +158,7 @@ def gpu_snapshot() -> Dict[str, Any]:
             utilization, memory_mib = [float(item.strip()) for item in text.split(",")[:2]]
             result["gpu_utilization_percent"] = utilization
             result["gpu_memory_used_bytes"] = int(memory_mib * 2**20)
+            result["gpu_utilization_sample_count"] = 1
         except (FileNotFoundError, IndexError, ValueError, subprocess.SubprocessError):
             pass
     return result
@@ -837,7 +849,9 @@ def write_performance_summary(performance_root: Path, payload: Mapping[str, Any]
         f"| P95 latency (s) | {storage.get('single_local_p95_seconds', math.nan):.6f} | {storage.get('sharded_local_p95_seconds', math.nan):.6f} | {storage.get('p95_latency_reduction_percent', math.nan):.3f}% reduction |",
         "",
         f"Selected backend: `{storage.get('selected_backend', 'unavailable')}`.",
+        "The selected backend applies to Train Known only. P0-P3 and Calibration Unknown use single-file storage unless single_drive was explicitly requested.",
         "",
+        "GPU phase durations are sampled CUDA-event measurements. CPU enqueue observations and instantaneous utilization snapshots are labeled separately and are not converted into invalid GPU bottleneck percentages.",
         "GPU utilization percentage-point and relative changes are reported only when both structured baseline and optimized telemetry exist; no values are invented.",
     ])
     (performance_root / "performance_summary.md").write_text(text + "\n", encoding="utf-8")

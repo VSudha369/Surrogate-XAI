@@ -19,6 +19,11 @@
       "name": "Stage 2.6M v1.0.2 performance-engineering task",
       "sha256": "7b086d6d47075f4617dec017193ad2e34c304b7e5716e76fb679f610da3ed3f7",
       "role": "Authoritative execution-engine and strict authorized-sharding specification"
+    },
+    {
+      "name": "Stage 2.6M v1.0.2 integration audit fix",
+      "sha256": "33b828797265820a34ef7488a21a729d268e76c78de47aa15a9266b6891b7d2c",
+      "role": "Authoritative non-recursive shard initialization, partition backend, and telemetry correction"
     }
   ],
   "files": [
@@ -29,23 +34,23 @@
     },
     {
       "path": "README.md",
-      "bytes": 8760,
-      "sha256": "72c6b53f76a6c40c583a35a10ce0f30d78e5adfd68482f547ef0b0fb3a48d3b6"
+      "bytes": 9689,
+      "sha256": "f0c442f807fc634da20ed4433ba9608c031818c8a28cab1ce402bf608217f179"
     },
     {
       "path": "SCIENTIFIC_PROTOCOL.md",
-      "bytes": 9812,
-      "sha256": "8ac9909272fcd9136748024866735c81ac8fb1b3ae91251a7a8c227e5a767fae"
+      "bytes": 10529,
+      "sha256": "32f0fdb54768e1738708a84ba7645782c6731d7d563309bf2f34b2111046f252"
     },
     {
       "path": "OUTPUT_SCHEMA.md",
-      "bytes": 6187,
-      "sha256": "469f4141e1b33b1a0338330280c9472c7bf54a072e999c3a6efe58b6b3cdc5e9"
+      "bytes": 6863,
+      "sha256": "bb3718cc3725c299d2b9dd7cef84224ef891c05f427eaae2b50d94b0aa5c3a8a"
     },
     {
       "path": "VALIDATION_CHECKLIST.md",
-      "bytes": 5488,
-      "sha256": "9d2a4913f414115018ff3d2979364fa29aa584b171d6e564c46a9b3fe5ca5cfe"
+      "bytes": 6073,
+      "sha256": "fe6c3879e2dd83cfc224704ac6e17ac07bc7cc588959bfa9ab0836ac291121c1"
     },
     {
       "path": "requirements.txt",
@@ -59,13 +64,13 @@
     },
     {
       "path": "Stage2_6M_Colab_Launcher_v1_0_2.py",
-      "bytes": 10429,
-      "sha256": "e8201ceeb526008e4ac87ed14bc41fc916c0ac7fa02c8c50dcd8eeb7359185aa"
+      "bytes": 10885,
+      "sha256": "aadc7f6db4d54f8ae1f115422be4a201ea89280445a7e79c089445f8d3940007"
     },
     {
       "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py",
-      "bytes": 224477,
-      "sha256": "3a7f795a07163a590f1b24d66ba9cc1574de1e6966bc87157886e8668a79d5d1"
+      "bytes": 229097,
+      "sha256": "f5af2c7a364a6303c62f3c5875ea0b1dabeb9a6974dd46d40b9a758ae1ac09da"
     },
     {
       "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.ipynb",
@@ -74,13 +79,13 @@
     },
     {
       "path": "stage2_6m_performance_v1_0_2.py",
-      "bytes": 41268,
-      "sha256": "2d2245967fffb99ca4f7fc1508b02d5ab48a228c4bb0edeb790aec68c672de70"
+      "bytes": 42328,
+      "sha256": "6ad7256a6a1907873078d606685b6bad880b07cce37fe5bf7e5aa82a25626e71"
     },
     {
       "path": "validate_stage2_6m_v1_0_2.py",
-      "bytes": 10264,
-      "sha256": "22f101bd42c4eabab403a14bc38944db493a51e31de87c1c6d564b10d4c9713c"
+      "bytes": 20711,
+      "sha256": "286daacdb40982f27cb1795a29f9f0ead0583e9856c26d018753a2de2a8e304d"
     }
   ],
   "validation": {
@@ -88,6 +93,8 @@
     "notebook_json_parse": "PASS",
     "undefined_name_audit": "PASS (pyflakes)",
     "benchmark_independent_runtime_equivalence": "PASS",
+    "sharded_full_run_context_initialization": "PASS",
+    "storage_context_cases_a_b_c_d": "PASS",
     "synthetic_four_arm_finite_gradient": "PASS",
     "scientific_execution": "NOT_RUN_LOCALLY - frozen canonical WiSig benchmark and Stage 2M artifacts are not present in this workspace"
   }

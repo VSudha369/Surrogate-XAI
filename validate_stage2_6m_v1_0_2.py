@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib.util
 import json
+import logging
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +80,31 @@ def static_validation() -> None:
     assert ".copying" in performance_source and "os.replace(temporary, destination)" in performance_source
     assert "Local cache/shards must remain under /content on Colab" in performance_source
     assert "command.extend(sys.argv[1:])" in launcher_source
+    compatible_v102_sha = "3a7f795a07163a590f1b24d66ba9cc1574de1e6966bc87157886e8668a79d5d1"
+    assert compatible_v102_sha in main_source and compatible_v102_sha in launcher_source
+    pipeline = next(node for node in main_tree.body if isinstance(node, ast.ClassDef) and node.name == "Stage26Pipeline")
+    pipeline_source = ast.get_source_segment(main_source, pipeline) or ""
+    assert "def _ensure_partition_shard_for_benchmark(" in pipeline_source
+    internal_method = next(
+        node for node in pipeline.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_ensure_partition_shard_for_benchmark"
+    )
+    internal_source = ast.get_source_segment(main_source, internal_method) or ""
+    assert "ensure_context(" not in internal_source
+    ensure_known_method = next(
+        node for node in pipeline.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "ensure_known_runtime_shards"
+    )
+    ensure_known_source = ast.get_source_segment(main_source, ensure_known_method) or ""
+    assert "for partition in" not in ensure_known_source
+    assert 'benchmark.backend_for(partition)' in main_source
+    for timing_name in (
+        "sampled_gpu_forward_ms", "sampled_gpu_objective_ms", "sampled_gpu_backward_ms",
+        "sampled_gpu_optimizer_ms", "sampled_gpu_total_ms",
+    ):
+        assert timing_name in main_source
     for class_name in ("ConvNormAct", "ResidualTemporalBlock", "WiSigRepresentationNet", "EMAPrototypeBank"):
         current = next(node for node in main_tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
         predecessor = next(node for node in predecessor_tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
@@ -102,6 +130,185 @@ class Guard:
         assert np.isin(indices, self.allowed).all(), operation
 
 
+def load_main_module():
+    module_name = "stage2_6m_v1_0_2_integration_fixture"
+    spec = importlib.util.spec_from_file_location(module_name, MAIN)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def pipeline_storage_context_validation(root: Path) -> None:
+    """Exercise the actual Stage26Pipeline context/shard call graph without WiSig data."""
+    module = load_main_module()
+    zero_counters = {
+        "strict_test_signal_reads": 0,
+        "strict_test_label_reads": 0,
+        "strict_test_embedding_reads": 0,
+        "strict_test_metric_reads": 0,
+        "strict_test_threshold_reads": 0,
+    }
+
+    class FixtureGuard:
+        strict_file_audit = [{"status": "fixture_verified"}]
+
+        def counters(self):
+            return dict(zero_counters)
+
+        def assert_zero(self):
+            assert not any(self.counters().values())
+
+    class FixtureCacheManager:
+        ensure_calls = 0
+
+        def __init__(self, cache_root, performance_root):
+            self.cache_root = Path(cache_root)
+
+        def ensure(self, source, expected_sha):
+            type(self).ensure_calls += 1
+            return Path(source), {"status": "VERIFIED", "sha256": expected_sha}
+
+    architecture_before = module.architecture_signature(module.WiSigRepresentationNet(98, 128, 0.10))
+    fixed_batches = [[0, 1, 2, 3], [4, 5, 6, 7]]
+    exposure_before = module.batch_exposure_sha256(fixed_batches)
+
+    cases = (
+        ("A", "auto", "single_local", 0),
+        ("B", "auto", "sharded_local", 1),
+        ("C", "single_drive", "single_drive", 0),
+        ("D", "sharded_local", "sharded_local", 1),
+    )
+    for name, requested_mode, selected_backend, expected_builds in cases:
+        case_root = root / f"context_case_{name.lower()}"
+        branch_root = case_root / "MANYTX_ZERO_DAY_BRANCH_v1.0.3"
+        output_root = branch_root / "03_representation_ablation"
+        performance_root = output_root / "performance"
+        benchmark_path = branch_root / "01_benchmark_engineering" / "benchmark" / "canonical.h5"
+        index_path = branch_root / "01_benchmark_engineering" / "splits" / "train_known_indices.npy"
+        benchmark_path.parent.mkdir(parents=True, exist_ok=True)
+        index_path.parent.mkdir(parents=True, exist_ok=True)
+        performance_root.mkdir(parents=True, exist_ok=True)
+        benchmark_path.write_bytes(b"opaque-fixture")
+        np.save(index_path, np.asarray([0, 1, 2, 3], dtype=np.int64), allow_pickle=False)
+
+        config = module.Stage26Config(
+            branch_root=str(branch_root),
+            benchmark_path=str(benchmark_path),
+            stage2m_dir=str(branch_root / "02_benchmark_diagnostics"),
+            output_dir=str(output_root),
+            storage_mode=requested_mode,
+            local_cache_root=str(case_root / "cache"),
+            performance_preflight=False,
+        )
+        scientific_sha_before = config.configuration_sha256()
+        if requested_mode == "auto":
+            (performance_root / "PERFORMANCE_PREFLIGHT_STATUS.json").write_text(
+                json.dumps({
+                    "canonical_benchmark_sha256": module.EXPECTED_BENCHMARK_SHA256,
+                    "storage_selection": {"selected_backend": selected_backend},
+                    "runtime_settings": {"storage_backend": selected_backend},
+                }),
+                encoding="utf-8",
+            )
+
+        partitions = {
+            partition: Metadata(
+                indices=np.asarray([0, 1, 2, 3], dtype=np.int64),
+                labels=np.asarray([0, 1, 2, 3], dtype=np.int16),
+                receiver=np.asarray(["r0"] * 4, dtype=object),
+                day=np.asarray(["d0"] * 4, dtype=object),
+                equalized=np.asarray([0, 1, 0, 1], dtype=np.int8),
+            )
+            for partition in ("train_known", "p0", "p1", "p2", "p3", "calibration_unknown")
+        }
+
+        def resolved_fixture(_config, _guard, runtime_path):
+            initial = "single_drive" if requested_mode == "single_drive" else "single_local"
+            benchmark = module.ResolvedBenchmark(
+                h5_path=Path(runtime_path),
+                signal_key="signals",
+                signal_orientation="channels_first",
+                total_samples=4,
+                metadata_fields={},
+                partitions=partitions,
+                transmitter_mapping={},
+                schema_rows=[],
+                canonical_h5_path=benchmark_path,
+                runtime_backend=initial,
+            )
+            module.apply_partition_backend_policy(benchmark, initial)
+            return benchmark
+
+        class FixtureShardManager:
+            def __init__(self):
+                self.build_calls = 0
+
+            def build(self, source, partition, metadata, frozen_indices, shard_count, guard, **kwargs):
+                self.build_calls += 1
+                assert partition == "train_known"
+                manifest = case_root / "cache" / "authorized_train_known_manifest.json"
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text(json.dumps({
+                    "partition": partition,
+                    "benchmark_sha256": module.EXPECTED_BENCHMARK_SHA256,
+                    "strict_zero_day_rows_read": 0,
+                }), encoding="utf-8")
+                return manifest
+
+        shard_manager = FixtureShardManager()
+        pipeline = module.Stage26Pipeline.__new__(module.Stage26Pipeline)
+        pipeline.config = config
+        pipeline.stage2m_provenance = None
+        pipeline.guard = FixtureGuard()
+        pipeline.benchmark = None
+        pipeline.performance_root = performance_root
+        pipeline.cache_report = {}
+        pipeline.storage_selection = {}
+        pipeline.performance_preflight_status = {}
+        pipeline.logger = logging.getLogger(f"stage26-fixture-{name}")
+        pipeline._shard_manager = lambda benchmark: shard_manager
+
+        original_verify = module.verify_stage2m
+        original_resolve = module.resolve_benchmark
+        original_cache = module.LocalCacheManager
+        original_discover = module.discover_partition_index_files
+        FixtureCacheManager.ensure_calls = 0
+        try:
+            module.verify_stage2m = lambda _config: {"status": "PASS"}
+            module.resolve_benchmark = resolved_fixture
+            module.LocalCacheManager = FixtureCacheManager
+            module.discover_partition_index_files = lambda _root: {"train_known": index_path}
+            benchmark = pipeline.ensure_context()
+            same_benchmark = pipeline.ensure_context()
+        finally:
+            module.verify_stage2m = original_verify
+            module.resolve_benchmark = original_resolve
+            module.LocalCacheManager = original_cache
+            module.discover_partition_index_files = original_discover
+
+        assert same_benchmark is benchmark
+        assert benchmark.backend_for("train_known") == selected_backend
+        non_training_expected = "single_drive" if selected_backend == "single_drive" else "single_local"
+        for partition in ("p0", "p1", "p2", "p3", "calibration_unknown"):
+            assert benchmark.backend_for(partition) == non_training_expected
+            assert partition not in benchmark.shard_manifests
+        assert shard_manager.build_calls == expected_builds
+        assert ("train_known" in benchmark.shard_manifests) == (expected_builds == 1)
+        assert FixtureCacheManager.ensure_calls == (0 if requested_mode == "single_drive" else 1)
+        assert config.configuration_sha256() == scientific_sha_before
+        assert module.EXPECTED_BENCHMARK_SHA256 == "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9"
+        assert pipeline.guard.counters() == zero_counters
+        forbidden_tokens = ("strict_zero_day", "zero_day_shift_test", "strict_test")
+        assert not any(token in path.name.lower() for path in case_root.rglob("*") for token in forbidden_tokens)
+        assert module.architecture_signature(module.WiSigRepresentationNet(98, 128, 0.10)) == architecture_before
+        assert module.batch_exposure_sha256(fixed_batches) == exposure_before
+
+    print("SHARDED_FULL_RUN_CONTEXT_INITIALIZATION_PASS")
+    print("STORAGE_CONTEXT_CASES_A_B_C_D_PASS")
+
+
 def runtime_validation() -> None:
     try:
         import h5py
@@ -112,7 +319,9 @@ def runtime_validation() -> None:
             BatchedSignalDataset,
             LocalCacheManager,
             PerformanceAbort,
+            gpu_snapshot,
             identity_collate,
+            memory_snapshot,
             reset_seed_state,
             sha256_file,
             validate_shard_equivalence,
@@ -179,6 +388,13 @@ def runtime_validation() -> None:
         else:
             raise AssertionError("Strict shard generation was not rejected")
         validate_vectorized_shift(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        host_snapshot = memory_snapshot()
+        device_snapshot = gpu_snapshot()
+        assert host_snapshot["cpu_utilization_sampling_semantics"] in {
+            "interval_since_previous_snapshot_not_epoch_average", "unavailable"
+        }
+        assert device_snapshot["gpu_utilization_sampling_semantics"] == "instantaneous_nvidia_smi_sample_not_epoch_average"
+        assert "torch_peak_allocated_bytes" in device_snapshot and "available_ram_bytes" in host_snapshot
         single.close()
         sharded.close()
         shard_payload = json.loads(manifest.read_text(encoding="utf-8"))
@@ -198,6 +414,7 @@ def runtime_validation() -> None:
         removed = reset_seed_state(output_root, 42)
         assert len(removed) == 5 and unrelated.read_text(encoding="utf-8") == "keep"
         assert (output_root / "performance" / "RESET_SEED_42_STATUS.json").is_file()
+        pipeline_storage_context_validation(root)
     print("BENCHMARK_INDEPENDENT_RUNTIME_EQUIVALENCE_PASS")
 
 

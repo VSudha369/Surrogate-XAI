@@ -28,9 +28,13 @@
 - [ ] Common initialized model inputs, logits, embeddings, and objective values are equivalent across backends.
 - [ ] Vectorized circular shift exactly equals the reference loop for fixed shifts and remains gradient-compatible.
 - [ ] Storage selection applies the 10% throughput and P95 latency gates and reports measured percentages.
+- [ ] `SHARDED_FULL_RUN_CONTEXT_INITIALIZATION_PASS` proves Train Known shard initialization is non-recursive, occurs exactly once, registers its manifest, and is reused.
+- [ ] Storage matrix cases A–D pass: automatic single local, automatic sharded Train Known, explicit single Drive, and forced sharded Train Known.
+- [ ] P0/P1/P2/P3/Calibration Unknown resolve to one-file storage and do not inherit Train Known's 128-shard backend.
 - [ ] DataLoader autotune uses independent RNG and tests safe worker/prefetch candidates.
 - [ ] Evaluation batch autotune preserves top-1 predictions and strict logit tolerance with GPU-memory headroom.
 - [ ] Performance preflight performs no optimizer update, checkpoint mutation, Calibration Unknown signal access, READY creation, or strict-row access.
+- [ ] CUDA phase fields are sampled event durations; CPU enqueue observations and CPU/GPU utilization snapshots carry explicit sampling semantics.
 
 ## Strict zero-day
 

@@ -18,6 +18,11 @@ EXPECTED_BENCHMARK_SHA256 = "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe0308
 EXPECTED_STAGE2M_VERSION = "1.0.5"
 EXPECTED_STAGE2M_SCRIPT_SHA256 = "46c95bbf9fb6806a5f463b4e173434a5f03f013367b1bcd38ebb73c07d0f67ba"
 EXPECTED_STAGE2M_HASH_MANIFEST_SHA256 = "0a8853d782006ce8af2d7b798a61c1e141afbeb55066cb70115ae41c8d24f16a"
+CHECKPOINT_COMPATIBLE_SCRIPT_SHA256 = frozenset({
+    "421e3c64ce33b3b7929e10d5af84debe9e735c9b2a8709475080cfa0346fd6ac",
+    "7493e709bf0cd4a41b990b950f8603900ce4904299497c400ab5df7de346a141",
+    "3a7f795a07163a590f1b24d66ba9cc1574de1e6966bc87157886e8668a79d5d1",
+})
 SCRIPT_NAME = "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py"
 BRANCH_NAME = "MANYTX_ZERO_DAY_BRANCH_v1.0.3"
 REQUIRED = {
@@ -208,7 +213,11 @@ def main() -> None:
         if current_v102_state:
             try:
                 current_v102_state = all(
-                    torch.load(path, map_location="cpu", weights_only=False).get("script_sha") == current_script_sha
+                    (
+                        (checkpoint_script_sha := torch.load(path, map_location="cpu", weights_only=False).get("script_sha"))
+                        == current_script_sha
+                        or checkpoint_script_sha in CHECKPOINT_COMPATIBLE_SCRIPT_SHA256
+                    )
                     for path in checkpoint_paths
                 )
             except Exception:

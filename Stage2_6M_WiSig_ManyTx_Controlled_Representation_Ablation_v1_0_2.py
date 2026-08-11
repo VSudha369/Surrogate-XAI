@@ -88,6 +88,7 @@ EXPECTED_STAGE2M_HASH_MANIFEST_SHA256 = "0a8853d782006ce8af2d7b798a61c1e141afbeb
 CHECKPOINT_COMPATIBLE_SCRIPT_SHA256 = frozenset({
     "421e3c64ce33b3b7929e10d5af84debe9e735c9b2a8709475080cfa0346fd6ac",
     "7493e709bf0cd4a41b990b950f8603900ce4904299497c400ab5df7de346a141",
+    "3a7f795a07163a590f1b24d66ba9cc1574de1e6966bc87157886e8668a79d5d1",
 })
 MAX_CONSECUTIVE_AMP_OVERFLOWS = 32
 EXPECTED_SIGNAL_SHAPE = (2, 256)
@@ -686,7 +687,27 @@ class ResolvedBenchmark:
     schema_rows: List[Dict[str, Any]]
     canonical_h5_path: Optional[Path] = None
     runtime_backend: str = "single_drive"
+    partition_backends: Dict[str, str] = field(default_factory=dict)
     shard_manifests: Dict[str, Path] = field(default_factory=dict)
+
+    def backend_for(self, partition: str) -> str:
+        if partition not in self.partitions:
+            raise KeyError(partition)
+        fallback = "single_drive" if self.runtime_backend == "single_drive" else "single_local"
+        return self.partition_backends.get(partition, self.runtime_backend if partition == "train_known" else fallback)
+
+
+def apply_partition_backend_policy(benchmark: ResolvedBenchmark, train_backend: str) -> Dict[str, str]:
+    """Apply the conservative v1.0.2 policy: only Train Known may be sharded."""
+    if train_backend not in {"single_local", "sharded_local", "single_drive"}:
+        raise ScientificAbort(f"Unsupported Train Known runtime backend: {train_backend}")
+    non_training_backend = "single_drive" if train_backend == "single_drive" else "single_local"
+    benchmark.runtime_backend = train_backend
+    benchmark.partition_backends = {
+        partition: (train_backend if partition == "train_known" else non_training_backend)
+        for partition in benchmark.partitions
+    }
+    return dict(benchmark.partition_backends)
 
 
 def decode_string_array(values: np.ndarray) -> np.ndarray:
@@ -923,7 +944,8 @@ def resolve_benchmark(
     calibration_tx_count = len(set(partitions["calibration_unknown"].transmitter_raw))
     if calibration_tx_count != EXPECTED_CAL_UNKNOWN_CLASSES:
         raise ScientificAbort(f"Calibration Unknown contains {calibration_tx_count} transmitters, expected 22")
-    return ResolvedBenchmark(
+    initial_backend = "single_drive" if h5_path == canonical_h5_path else "single_local"
+    benchmark = ResolvedBenchmark(
         h5_path=h5_path,
         signal_key=signal_key,
         signal_orientation=orientation,
@@ -933,8 +955,10 @@ def resolve_benchmark(
         transmitter_mapping=tx_mapping,
         schema_rows=rows,
         canonical_h5_path=canonical_h5_path,
-        runtime_backend="single_drive" if h5_path == canonical_h5_path else "single_local",
+        runtime_backend=initial_backend,
     )
+    apply_partition_backend_policy(benchmark, initial_backend)
+    return benchmark
 
 
 class WiSigH5Dataset(BatchedSignalDataset):
@@ -946,7 +970,7 @@ class WiSigH5Dataset(BatchedSignalDataset):
         metadata = benchmark.partitions[partition]
         guard.authorize_rows(partition, metadata.indices, "batched dataset construction")
         shard_manifest = benchmark.shard_manifests.get(partition)
-        backend = benchmark.runtime_backend
+        backend = benchmark.backend_for(partition)
         if backend == "sharded_local" and shard_manifest is None:
             raise ScientificAbort(f"Authorized shard backend selected but {partition} shards are unavailable")
         super().__init__(
@@ -1634,54 +1658,78 @@ def train_one_epoch(
     epoch_started = time.perf_counter()
     previous_batch_finished = epoch_started
     data_wait_seconds = 0.0
-    transfer_seconds = 0.0
-    augmentation_seconds = 0.0
-    forward_seconds = 0.0
-    objective_seconds = 0.0
-    backward_seconds = 0.0
-    optimizer_seconds = 0.0
-    sampled_cuda_batch_milliseconds: List[float] = []
+    cpu_enqueue_transfer_seconds = 0.0
+    cpu_enqueue_augmentation_seconds = 0.0
+    cpu_enqueue_forward_seconds = 0.0
+    cpu_enqueue_objective_seconds = 0.0
+    cpu_enqueue_backward_seconds = 0.0
+    cpu_enqueue_optimizer_seconds = 0.0
+    sampled_gpu_milliseconds: Dict[str, List[float]] = defaultdict(list)
+
+    def finish_sampled_gpu_timing(events: Mapping[str, torch.cuda.Event]) -> None:
+        if not events or "after_optimizer" not in events:
+            return
+        # One synchronization per sampled batch makes all event pairs queryable
+        # without imposing a device-wide synchronization on every batch.
+        events["after_optimizer"].synchronize()
+        pairs = {
+            "sampled_gpu_transfer_ms": ("start", "after_transfer"),
+            "sampled_gpu_augmentation_ms": ("after_transfer", "after_augmentation"),
+            "sampled_gpu_forward_ms": ("after_augmentation", "after_forward"),
+            "sampled_gpu_objective_ms": ("after_forward", "after_objective"),
+            "sampled_gpu_backward_ms": ("after_objective", "after_backward"),
+            "sampled_gpu_optimizer_ms": ("after_backward", "after_optimizer"),
+            "sampled_gpu_total_ms": ("start", "after_optimizer"),
+        }
+        for name, (start_name, end_name) in pairs.items():
+            sampled_gpu_milliseconds[name].append(float(events[start_name].elapsed_time(events[end_name])))
+
     for batch_number, batch in enumerate(loader):
         batch_started = time.perf_counter()
         data_wait_seconds += batch_started - previous_batch_finished
-        cuda_start: Optional[torch.cuda.Event] = None
-        cuda_end: Optional[torch.cuda.Event] = None
-        if use_amp and batch_number % 50 == 0:
-            cuda_start = torch.cuda.Event(enable_timing=True)
-            cuda_end = torch.cuda.Event(enable_timing=True)
-            cuda_start.record()
+        sample_gpu_timing = device.type == "cuda" and batch_number % 50 == 0
+        cuda_events: Dict[str, torch.cuda.Event] = {}
+
+        def record_cuda_event(name: str) -> None:
+            if sample_gpu_timing:
+                event = torch.cuda.Event(enable_timing=True)
+                event.record()
+                cuda_events[name] = event
+
+        record_cuda_event("start")
         phase_started = time.perf_counter()
         x = batch["x"].to(device, non_blocking=True)
         y = batch["y"].to(device, non_blocking=True)
-        transfer_seconds += time.perf_counter() - phase_started
+        cpu_enqueue_transfer_seconds += time.perf_counter() - phase_started
+        record_cuda_event("after_transfer")
         eq = batch["equalized"].cpu().numpy()
         equalized_counts += np.bincount(eq, minlength=2)[:2]
         phase_started = time.perf_counter()
         x = augmentation(x, generator)
-        augmentation_seconds += time.perf_counter() - phase_started
+        cpu_enqueue_augmentation_seconds += time.perf_counter() - phase_started
+        record_cuda_event("after_augmentation")
         run.optimizer.zero_grad(set_to_none=True)
         phase_started = time.perf_counter()
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             outputs = run.model(x)
-        forward_seconds += time.perf_counter() - phase_started
+        cpu_enqueue_forward_seconds += time.perf_counter() - phase_started
+        record_cuda_event("after_forward")
         phase_started = time.perf_counter()
         loss, components = objective_loss(run.arm, outputs, y, run.prototypes, config)
-        objective_seconds += time.perf_counter() - phase_started
+        cpu_enqueue_objective_seconds += time.perf_counter() - phase_started
+        record_cuda_event("after_objective")
         if not torch.isfinite(loss):
             nonfinite_events += 1
             nonfinite_loss_events += 1
             if nonfinite_loss_events >= 2:
                 raise ScientificAbort(f"Persistent non-finite loss for {run.arm}, seed {run.seed}")
-            if cuda_start is not None and cuda_end is not None:
-                cuda_end.record()
-                cuda_end.synchronize()
-                sampled_cuda_batch_milliseconds.append(float(cuda_start.elapsed_time(cuda_end)))
             previous_batch_finished = time.perf_counter()
             continue
         previous_scale = float(run.scaler.get_scale())
         phase_started = time.perf_counter()
         run.scaler.scale(loss).backward()
-        backward_seconds += time.perf_counter() - phase_started
+        cpu_enqueue_backward_seconds += time.perf_counter() - phase_started
+        record_cuda_event("after_backward")
         phase_started = time.perf_counter()
         run.scaler.unscale_(run.optimizer)
         gradient_norm = torch.nn.utils.clip_grad_norm_(run.model.parameters(), max_norm=5.0)
@@ -1697,16 +1745,14 @@ def train_one_epoch(
             run.scaler.update()
             if consecutive_amp_overflows >= MAX_CONSECUTIVE_AMP_OVERFLOWS:
                 raise ScientificAbort(f"Persistent non-finite gradients for {run.arm}, seed {run.seed}")
-            optimizer_seconds += time.perf_counter() - phase_started
-            if cuda_start is not None and cuda_end is not None:
-                cuda_end.record()
-                cuda_end.synchronize()
-                sampled_cuda_batch_milliseconds.append(float(cuda_start.elapsed_time(cuda_end)))
+            cpu_enqueue_optimizer_seconds += time.perf_counter() - phase_started
+            record_cuda_event("after_optimizer")
+            finish_sampled_gpu_timing(cuda_events)
             previous_batch_finished = time.perf_counter()
             continue
         run.scaler.step(run.optimizer)
         run.scaler.update()
-        optimizer_seconds += time.perf_counter() - phase_started
+        cpu_enqueue_optimizer_seconds += time.perf_counter() - phase_started
         current_scale = float(run.scaler.get_scale())
         step_succeeded = not use_amp or current_scale >= previous_scale
         if step_succeeded:
@@ -1714,19 +1760,18 @@ def train_one_epoch(
             consecutive_amp_overflows = 0
             if ARM_DEFINITIONS[run.arm]["prototype_weight"] > 0:
                 run.prototypes.update(outputs["embedding_normalized"].detach(), y)
+        record_cuda_event("after_optimizer")
         batch_n = len(y)
         samples += batch_n
         for key, value in components.items():
             sums[key] += value * batch_n
         sums["gradient_norm"] += float(gradient_norm.detach().cpu()) * batch_n
-        if cuda_start is not None and cuda_end is not None:
-            cuda_end.record()
-            cuda_end.synchronize()
-            sampled_cuda_batch_milliseconds.append(float(cuda_start.elapsed_time(cuda_end)))
+        finish_sampled_gpu_timing(cuda_events)
         previous_batch_finished = time.perf_counter()
     if samples == 0 or successful_steps == 0:
         raise ScientificAbort(f"No successful optimizer steps for {run.arm}, seed {run.seed}")
     run.scheduler.step()
+    epoch_train_seconds = time.perf_counter() - epoch_started
     result = {key: value / samples for key, value in sums.items()}
     result.update({
         "samples": float(samples),
@@ -1736,19 +1781,26 @@ def train_one_epoch(
         "equalized_1": float(equalized_counts[1]),
         "learning_rate": float(run.optimizer.param_groups[0]["lr"]),
         "data_wait_seconds": data_wait_seconds,
-        "host_to_device_seconds": transfer_seconds,
-        "augmentation_seconds": augmentation_seconds,
-        "forward_seconds": forward_seconds,
-        "objective_seconds": objective_seconds,
-        "backward_seconds": backward_seconds,
-        "optimizer_seconds": optimizer_seconds,
-        "epoch_train_seconds": time.perf_counter() - epoch_started,
-        "training_samples_per_second": samples / max(time.perf_counter() - epoch_started, 1e-12),
-        "sampled_cuda_batch_milliseconds_mean": (
-            statistics.fmean(sampled_cuda_batch_milliseconds) if sampled_cuda_batch_milliseconds else math.nan
-        ),
+        "data_wait_percent": 100.0 * data_wait_seconds / max(epoch_train_seconds, 1e-12),
+        "cpu_enqueue_host_to_device_seconds": cpu_enqueue_transfer_seconds,
+        "cpu_enqueue_augmentation_seconds": cpu_enqueue_augmentation_seconds,
+        "cpu_enqueue_forward_seconds": cpu_enqueue_forward_seconds,
+        "cpu_enqueue_objective_seconds": cpu_enqueue_objective_seconds,
+        "cpu_enqueue_backward_seconds": cpu_enqueue_backward_seconds,
+        "cpu_enqueue_optimizer_seconds": cpu_enqueue_optimizer_seconds,
+        "cpu_phase_timing_semantics": "host_wall_or_cuda_enqueue_observation_not_gpu_kernel_duration",
+        "epoch_train_seconds": epoch_train_seconds,
+        "training_samples_per_second": samples / max(epoch_train_seconds, 1e-12),
+        "sampled_gpu_timing_windows": float(len(sampled_gpu_milliseconds.get("sampled_gpu_total_ms", []))),
         "sampled_cuda_timing_interval_batches": 50.0,
     })
+    for name in (
+        "sampled_gpu_transfer_ms", "sampled_gpu_augmentation_ms", "sampled_gpu_forward_ms",
+        "sampled_gpu_objective_ms", "sampled_gpu_backward_ms", "sampled_gpu_optimizer_ms",
+        "sampled_gpu_total_ms",
+    ):
+        values = sampled_gpu_milliseconds.get(name, [])
+        result[name] = statistics.fmean(values) if values else math.nan
     return result
 
 
@@ -2640,22 +2692,25 @@ class Stage26Pipeline:
                     self.storage_selection = dict(status.get("storage_selection", {}))
                     runtime = dict(status.get("runtime_settings", {}))
                     if self.config.storage_mode == "auto":
-                        self.benchmark.runtime_backend = str(runtime.get("storage_backend", "single_local"))
-                    elif self.config.storage_mode != "single_drive":
-                        self.benchmark.runtime_backend = self.config.storage_mode
+                        selected_backend = str(runtime.get("storage_backend", "single_local"))
+                    elif self.config.storage_mode == "single_drive":
+                        selected_backend = "single_drive"
+                    else:
+                        selected_backend = self.config.storage_mode
+                    apply_partition_backend_policy(self.benchmark, selected_backend)
                     self.config.num_workers = int(runtime.get("num_workers", self.config.num_workers))
                     self.config.prefetch_factor = int(runtime.get("prefetch_factor", self.config.prefetch_factor))
                     self.config.eval_batch_size = int(runtime.get("eval_batch_size", self.config.eval_batch_size))
             elif self.config.storage_mode in {"auto", "single_local"}:
-                self.benchmark.runtime_backend = "single_local"
+                apply_partition_backend_policy(self.benchmark, "single_local")
             elif self.config.storage_mode == "sharded_local":
-                self.benchmark.runtime_backend = "sharded_local"
+                apply_partition_backend_policy(self.benchmark, "sharded_local")
         if (
             self.benchmark.runtime_backend == "sharded_local"
             and not self.config.performance_preflight
             and "train_known" not in self.benchmark.shard_manifests
         ):
-            self.ensure_partition_shard("train_known")
+            self._ensure_partition_shard_for_benchmark(self.benchmark, "train_known")
         return self.benchmark
 
     def _shard_manager(self, benchmark: ResolvedBenchmark) -> AuthorizedShardManager:
@@ -2666,10 +2721,19 @@ class Stage26Pipeline:
             benchmark.signal_orientation,
         )
 
-    def ensure_partition_shard(self, partition: str, *, allow_calibration: bool = False) -> Path:
-        benchmark = self.ensure_context()
-        if benchmark.runtime_backend != "sharded_local" and not self.config.performance_preflight:
-            raise ScientificAbort("Shard creation requested while sharded_local is not the runtime backend")
+    def _ensure_partition_shard_for_benchmark(
+        self,
+        benchmark: ResolvedBenchmark,
+        partition: str,
+        *,
+        allow_calibration: bool = False,
+    ) -> Path:
+        """Build or verify an authorized shard without resolving pipeline context."""
+        existing = benchmark.shard_manifests.get(partition)
+        if existing is not None and existing.is_file():
+            return existing
+        if benchmark.backend_for(partition) != "sharded_local" and not self.config.performance_preflight:
+            raise ScientificAbort(f"Shard creation requested while {partition} does not use sharded_local")
         index_files = discover_partition_index_files(self.config.branch_root_path)
         if partition not in index_files:
             raise ScientificAbort(f"Frozen authorized index file missing for shard partition {partition}")
@@ -2687,12 +2751,19 @@ class Stage26Pipeline:
         atomic_write_json(persisted, json.loads(manifest.read_text(encoding="utf-8")), self.config.output_root)
         return manifest
 
+    def ensure_partition_shard(self, partition: str, *, allow_calibration: bool = False) -> Path:
+        benchmark = self.ensure_context()
+        return self._ensure_partition_shard_for_benchmark(
+            benchmark,
+            partition,
+            allow_calibration=allow_calibration,
+        )
+
     def ensure_known_runtime_shards(self) -> None:
         benchmark = self.ensure_context()
-        if benchmark.runtime_backend != "sharded_local":
+        if benchmark.backend_for("train_known") != "sharded_local":
             return
-        for partition in ("train_known", "p0", "p1", "p2", "p3"):
-            self.ensure_partition_shard(partition)
+        self._ensure_partition_shard_for_benchmark(benchmark, "train_known")
 
     def _model_input_equivalence(
         self,
@@ -2915,10 +2986,10 @@ class Stage26Pipeline:
                     raise ScientificAbort("sharded_local was forced but authorized shards are disabled")
                 selection["selected_backend"] = self.config.storage_mode
                 selection["selection_rationale"] = f"Explicit storage-mode override: {self.config.storage_mode}"
-            benchmark.runtime_backend = str(selection["selected_backend"])
-            if benchmark.runtime_backend == "sharded_local" and shard_manifest is not None:
+            partition_backends = apply_partition_backend_policy(benchmark, str(selection["selected_backend"]))
+            if benchmark.backend_for("train_known") == "sharded_local" and shard_manifest is not None:
                 benchmark.shard_manifests["train_known"] = shard_manifest
-            selected_dataset = sharded if benchmark.runtime_backend == "sharded_local" else single
+            selected_dataset = sharded if benchmark.backend_for("train_known") == "sharded_local" else single
             assert selected_dataset is not None
             if self.config.loader_autotune_enabled:
                 loader_result = dataloader_autotune(selected_dataset, batches, worker_init_fn, 2_602_000_003)
@@ -2966,6 +3037,7 @@ class Stage26Pipeline:
             atomic_write_csv(self.performance_root / "hardware_utilization.csv", pd.DataFrame([hardware]), self.config.output_root)
             runtime_settings = {
                 "storage_backend": benchmark.runtime_backend,
+                "partition_backends": partition_backends,
                 "num_workers": self.config.num_workers,
                 "prefetch_factor": self.config.prefetch_factor,
                 "pin_memory": self.config.pin_memory and self.device.type == "cuda",
@@ -2976,6 +3048,7 @@ class Stage26Pipeline:
                 "status": "STAGE2_6M_PERFORMANCE_PREFLIGHT_PASS",
                 "pipeline_version": PIPELINE_VERSION,
                 "script_sha256": self.script_sha,
+                "scientific_configuration_sha256": self.config.configuration_sha256(),
                 "canonical_benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
                 "local_cache_verified": bool(self.cache_report.get("status") == "VERIFIED"),
                 "controlled_single_drive_fallback": benchmark.runtime_backend == "single_drive",
@@ -3018,7 +3091,8 @@ class Stage26Pipeline:
             print(f"\nSingle-local throughput:\n{selection['single_local_samples_per_second']:.3f} samples/s")
             print(f"\nSharded-local throughput:\n{selection['sharded_local_samples_per_second']:.3f} samples/s")
             print(f"\nSharded vs single difference:\n{selection['percentage_difference']:.3f} %")
-            print("\nSelected storage backend:\n" + benchmark.runtime_backend)
+            print("\nSelected Train Known storage backend:\n" + benchmark.backend_for("train_known"))
+            print("\nPartition storage backends:\n" + json.dumps(partition_backends, indent=2, sort_keys=True))
             print(f"\nSelected DataLoader workers:\n{self.config.num_workers}")
             print(f"\nSelected prefetch factor:\n{self.config.prefetch_factor}")
             print(f"\nSelected evaluation batch:\n{self.config.eval_batch_size}")
@@ -3274,9 +3348,13 @@ Scientific interpretation: loss composition is the only major intentional variab
                 torch.cuda.empty_cache()
         frame = pd.concat(all_history, ignore_index=True)
         timing_columns = [
-            "seed", "epoch", "arm", "train_data_wait_seconds", "train_host_to_device_seconds",
-            "train_augmentation_seconds", "train_forward_seconds", "train_objective_seconds",
-            "train_backward_seconds", "train_optimizer_seconds", "train_epoch_train_seconds",
+            "seed", "epoch", "arm", "train_data_wait_seconds", "train_data_wait_percent",
+            "train_cpu_enqueue_host_to_device_seconds", "train_cpu_enqueue_augmentation_seconds",
+            "train_cpu_enqueue_forward_seconds", "train_cpu_enqueue_objective_seconds",
+            "train_cpu_enqueue_backward_seconds", "train_cpu_enqueue_optimizer_seconds",
+            "train_sampled_gpu_forward_ms", "train_sampled_gpu_objective_ms",
+            "train_sampled_gpu_backward_ms", "train_sampled_gpu_optimizer_ms",
+            "train_sampled_gpu_total_ms", "train_sampled_gpu_timing_windows", "train_epoch_train_seconds",
             "validation_seconds", "checkpoint_write_seconds", "arm_epoch_total_seconds",
             "train_training_samples_per_second",
         ]
@@ -3465,8 +3543,6 @@ Measured fact: last, best-known-macro-F1, and best-selection checkpoints exist f
 
     def stage_08(self) -> None:
         benchmark = self.ensure_context()
-        if benchmark.runtime_backend == "sharded_local":
-            self.ensure_partition_shard("calibration_unknown", allow_calibration=True)
         summary_rows: List[Dict[str, Any]] = []
         matched_rows: List[Dict[str, Any]] = []
         plot_samples: List[pd.DataFrame] = []
@@ -3989,6 +4065,7 @@ Domain AUROC is interpreted jointly with Tx performance; a value nearer 0.5 is n
             "benchmark_sha256": self.benchmark_sha,
             "canonical_benchmark_sha256": self.benchmark_sha,
             "runtime_storage_backend": performance_status["runtime_settings"]["storage_backend"],
+            "partition_storage_backends": performance_status["runtime_settings"]["partition_backends"],
             "local_cache_verification_status": performance_status["local_cache_verified"],
             "shard_equivalence_status": performance_status["shard_equivalence"]["status"],
             "dataloader_settings": {
@@ -4083,6 +4160,7 @@ Domain AUROC is interpreted jointly with Tx performance; a value nearer 0.5 is n
                 performance_status.get("status") != "STAGE2_6M_PERFORMANCE_PREFLIGHT_PASS"
                 or performance_status.get("pipeline_version") != PIPELINE_VERSION
                 or performance_status.get("script_sha256") != self.script_sha
+                or performance_status.get("scientific_configuration_sha256") != self.config.configuration_sha256()
                 or performance_status.get("canonical_benchmark_sha256") != EXPECTED_BENCHMARK_SHA256
                 or performance_status.get("strict_zero_day_shard_files") != 0
                 or any(performance_status.get("strict_zero_day_violation_counters", {}).values())

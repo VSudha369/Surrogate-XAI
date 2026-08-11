@@ -28,7 +28,9 @@ Each arm/seed directory contains `last.pt`, alternating `resume_slot_0.pt`/`resu
 
 ## Performance artifacts
 
-`performance/` contains `local_cache_report.json`, storage A/B CSV/JSON, storage selection, DataLoader autotune, evaluation-batch autotune, batch/epoch timing, hardware utilization, performance summary JSON/Markdown, exposure/model-input equivalence evidence, authorized shard manifest copies, and `PERFORMANCE_PREFLIGHT_STATUS.json`. Missing historical baseline telemetry is labeled `BASELINE_NOT_MEASURED`; values are never fabricated.
+`performance/` contains `local_cache_report.json`, storage A/B CSV/JSON, Train Known storage selection, the complete per-partition backend map, DataLoader autotune, evaluation-batch autotune, batch/epoch timing, hardware utilization, performance summary JSON/Markdown, exposure/model-input equivalence evidence, the authorized Train Known shard-manifest copy, and `PERFORMANCE_PREFLIGHT_STATUS.json`. Missing historical baseline telemetry is labeled `BASELINE_NOT_MEASURED`; values are never fabricated.
+
+`epoch_timing.csv` reports samples/s, DataLoader wait seconds/percentage, epoch/validation/checkpoint wall time, CPU-side `cpu_enqueue_*` observations, and sampled CUDA-event fields `sampled_gpu_forward_ms`, `sampled_gpu_objective_ms`, `sampled_gpu_backward_ms`, `sampled_gpu_optimizer_ms`, and `sampled_gpu_total_ms`. CPU enqueue observations are not GPU kernel durations. `hardware_utilization.csv` labels CPU interval samples and instantaneous GPU-utilization samples and includes allocated/reserved/peak Torch memory, process RSS, and available RAM.
 
 `/content/wisig_stage2_6m_cache/LOCAL_CACHE_MANIFEST.json` and partition-local `LOCAL_SHARD_MANIFEST.json` files describe disposable runtime storage. These local files are not copied into scientific checkpoint identity and are never represented as a new benchmark.
 
@@ -78,7 +80,7 @@ PCA is visualization only. It is not used in quantitative selection.
 
 The manifest set includes input provenance, frozen config, strict guard, architecture, losses, sampler, seeds, checkpoints, statistics, per-stage manifests, final status, Stage 3M objective, file inventory, and SHA-256 inventory. `STRICT_TEST_GUARD.json` labels its numeric fields as violation counters and records the structural enforcement mechanisms.
 
-`STAGE2_6M_FINAL_STATUS.json` includes pipeline/script/configuration provenance, both frozen Stage 2M hashes, architecture signature, seed panel, profile, canonical benchmark hash, runtime backend, local-cache/shard-equivalence status, DataLoader settings, evaluation batch size, vectorized-augmentation status, performance-preflight manifest SHA, decision, violation counters, and success gates. The artifact-manifest hash remains in the separate READY marker to avoid self-reference.
+`STAGE2_6M_FINAL_STATUS.json` includes pipeline/script/configuration provenance, both frozen Stage 2M hashes, architecture signature, seed panel, profile, canonical benchmark hash, Train Known runtime backend, the complete per-partition backend policy, local-cache/shard-equivalence status, DataLoader settings, evaluation batch size, vectorized-augmentation status, performance-preflight manifest SHA, decision, violation counters, and success gates. The artifact-manifest hash remains in the separate READY marker to avoid self-reference.
 
 `CANONICAL_STAGE3M_OBJECTIVE.json` freezes the decision, selected objective/coefficients when resolved, architecture signature, embedding dimension, sampler, augmentation, optimizer, budget, seed evidence, and rationale.
 
