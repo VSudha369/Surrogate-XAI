@@ -2,6 +2,10 @@
 
 This repository contains the executable Stage 2.6M v1.0.2 performance-engineered experiment for the frozen `WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3` benchmark. Versioned v1.0.1 sources remain as historical provenance. The scientific experiment still compares exactly four representation objectives under one common RF temporal network:
 
+## Repository context
+
+This work belongs to **Ultra-Low Latency Surrogate-Assisted Explainable AI for Zero-Day Threat Detection in Non-Stationary Physical Layer Communications**. The active path is the WiSig ManyTx transmitter-centric zero-day branch; earlier RadioML/AMC code is legacy provenance only. Stage 1B and Stage 2M are frozen, Stage 2.6M v1.0.2 is the current controlled-representation implementation candidate, and Stage 3M remains contingent on the Stage 2.6M selection result.
+
 | Arm | Objective |
 |---|---|
 | A0 | CE |
