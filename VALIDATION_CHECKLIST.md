@@ -46,6 +46,10 @@
 
 ## Controlled experiment
 
+- [ ] Training resume and Stage 05–10 evaluation loading use the same centralized script-SHA compatibility predicate.
+- [ ] Current script SHA and the explicitly approved canonical predecessor SHA pass evaluation loading; an arbitrary SHA fails.
+- [ ] Benchmark/configuration/architecture/loss/arm/seed mismatches and a non-strict model state all fail evaluation loading.
+- [ ] An `INCOMPLETE` Stage-05 embedding store is not reused; a complete checkpoint-bound store remains reusable.
 - [ ] A0–A3 have identical parameter counts and architecture signatures.
 - [ ] Same-seed initial model states are byte-identical.
 - [ ] Sampler exposure SHA is identical across all arms per seed/epoch.

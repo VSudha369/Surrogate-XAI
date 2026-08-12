@@ -311,6 +311,7 @@ def pipeline_storage_context_validation(root: Path) -> None:
 
     print("SHARDED_FULL_RUN_CONTEXT_INITIALIZATION_PASS")
     print("STORAGE_CONTEXT_CASES_A_B_C_D_PASS")
+    print("STRICT_ZERO_DAY_ZERO_ACCESS_PASS")
 
 
 def evaluation_checkpoint_compatibility_validation(root: Path) -> None:
@@ -326,30 +327,100 @@ def evaluation_checkpoint_compatibility_validation(root: Path) -> None:
         device="cpu",
     )
     run = module.create_training_runs(config, 42, torch.device("cpu"))["A0"]
-    payload = module.checkpoint_payload(
+    predecessor_sha = "f5af2c7a364a6303c62f3c5875ea0b1dabeb9a6974dd46d40b9a758ae1ac09da"
+    current_sha = "current-patched-script-sha"
+    base_payload = module.checkpoint_payload(
         run,
         config,
         epoch=40,
         benchmark_sha=module.EXPECTED_BENCHMARK_SHA256,
-        script_sha="f5af2c7a364a6303c62f3c5875ea0b1dabeb9a6974dd46d40b9a758ae1ac09da",
+        script_sha=current_sha,
         exposure_sha="fixture-exposure",
         group_state={"epochs_without_any_improvement": 0},
     )
     checkpoint = module.checkpoint_dir(config, "A0", 42) / "best_selection.pt"
     checkpoint.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(payload, checkpoint)
-    model, loaded, checkpoint_sha = module.load_trained_model(
-        config,
-        "A0",
-        42,
-        torch.device("cpu"),
-        module.EXPECTED_BENCHMARK_SHA256,
-        "current-patched-script-sha",
-    )
-    assert loaded["script_sha"] == payload["script_sha"]
+
+    def load(payload, *, script_sha=current_sha, benchmark_sha=module.EXPECTED_BENCHMARK_SHA256):
+        torch.save(payload, checkpoint)
+        return module.load_trained_model(
+            config,
+            "A0",
+            42,
+            torch.device("cpu"),
+            benchmark_sha,
+            script_sha,
+        )
+
+    def expect_rejected(name: str, payload) -> None:
+        try:
+            load(payload)
+        except module.ScientificAbort:
+            return
+        raise AssertionError(f"Evaluation checkpoint mismatch was not rejected: {name}")
+
+    model, loaded, checkpoint_sha = load(dict(base_payload))
+    assert loaded["script_sha"] == current_sha
     assert checkpoint_sha == module.sha256_file(checkpoint)
-    assert module.architecture_signature(model) == payload["architecture_signature"]
+    assert module.architecture_signature(model) == base_payload["architecture_signature"]
+    print("EVALUATION_CHECKPOINT_CURRENT_SCRIPT_SHA_PASS")
+
+    predecessor_payload = dict(base_payload)
+    predecessor_payload["script_sha"] = predecessor_sha
+    model, loaded, checkpoint_sha = load(predecessor_payload)
+    assert loaded["script_sha"] == predecessor_sha
+    assert checkpoint_sha == module.sha256_file(checkpoint)
+    assert module.architecture_signature(model) == base_payload["architecture_signature"]
     print("EVALUATION_CHECKPOINT_COMPATIBLE_SCRIPT_SHA_PASS")
+
+    unknown = dict(base_payload)
+    unknown["script_sha"] = "0" * 64
+    expect_rejected("unknown script SHA", unknown)
+    print("EVALUATION_CHECKPOINT_UNKNOWN_SCRIPT_SHA_REJECTED")
+
+    mismatch_cases = {
+        "benchmark SHA": {"benchmark_sha": "1" * 64},
+        "configuration SHA": {"configuration_sha": "2" * 64},
+        "architecture signature": {"architecture_signature": "3" * 64},
+        "loss coefficients": {"loss_coefficients": module.ARM_DEFINITIONS["A1"]},
+        "arm": {"arm": "A1"},
+        "seed": {"seed": 123},
+    }
+    for name, changes in mismatch_cases.items():
+        candidate = dict(base_payload)
+        candidate.update(changes)
+        expect_rejected(name, candidate)
+    print("EVALUATION_CHECKPOINT_PROVENANCE_MISMATCH_MATRIX_REJECTED")
+
+    broken_state = dict(base_payload)
+    broken_state["model_state"] = dict(base_payload["model_state"])
+    broken_state["model_state"].pop(next(iter(broken_state["model_state"])))
+    try:
+        load(broken_state)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Strict model-state loading was not enforced")
+    print("EVALUATION_CHECKPOINT_STRICT_MODEL_STATE_REJECTED")
+
+    store = module.embedding_store_dir(config, "A0", 42, "p0")
+    store.mkdir(parents=True, exist_ok=True)
+    required = (
+        "embedding_normalized.npy", "logits.npy", "labels.npy", "global_indices.npy",
+        "receiver.npy", "day.npy", "equalized.npy",
+    )
+    for filename in required:
+        (store / filename).write_bytes(b"fixture")
+    (store / "store_manifest.json").write_text(json.dumps({
+        "complete": True,
+        "checkpoint_sha256": checkpoint_sha,
+        "rows": 4,
+    }), encoding="utf-8")
+    (store / "INCOMPLETE").write_text("interrupted", encoding="utf-8")
+    assert not module.store_is_current(store, checkpoint_sha, 4)
+    (store / "INCOMPLETE").unlink()
+    assert module.store_is_current(store, checkpoint_sha, 4)
+    print("INCOMPLETE_STAGE05_STORE_REBUILD_GATE_PASS")
 
 
 def runtime_validation() -> None:

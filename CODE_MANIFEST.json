@@ -54,8 +54,8 @@
     },
     {
       "path": "VALIDATION_CHECKLIST.md",
-      "bytes": 6073,
-      "sha256": "fe6c3879e2dd83cfc224704ac6e17ac07bc7cc588959bfa9ab0836ac291121c1"
+      "bytes": 6561,
+      "sha256": "eba9b1167e92b4b717a2481014a15651d46251e289a126fcb88ea42644f44e1e"
     },
     {
       "path": "requirements.txt",
@@ -89,8 +89,8 @@
     },
     {
       "path": "validate_stage2_6m_v1_0_2.py",
-      "bytes": 23251,
-      "sha256": "941a5f59672a8c43c88021c6f9b6964d53ac040b71503213e1b802688bab86d3"
+      "bytes": 26180,
+      "sha256": "57ee8f1bd2f5c8b7676fd4308c33d0d7de9f08d735497be725f8502b0763bb5d"
     }
   ],
   "validation": {
@@ -102,6 +102,12 @@
     "storage_context_cases_a_b_c_d": "PASS",
     "streaming_metrics_cross_device_label_alignment": "PASS",
     "evaluation_checkpoint_compatible_script_sha": "PASS",
+    "evaluation_checkpoint_current_script_sha": "PASS",
+    "evaluation_checkpoint_unknown_script_sha_rejected": "PASS",
+    "evaluation_checkpoint_provenance_mismatch_matrix_rejected": "PASS",
+    "evaluation_checkpoint_strict_model_state_rejected": "PASS",
+    "incomplete_stage05_store_rebuild_gate": "PASS",
+    "strict_zero_day_zero_access": "PASS",
     "synthetic_four_arm_finite_gradient": "PASS",
     "scientific_execution": "NOT_RUN_LOCALLY - frozen canonical WiSig benchmark and Stage 2M artifacts are not present in this workspace"
   }
