@@ -82,6 +82,9 @@ def static_validation() -> None:
     assert "command.extend(sys.argv[1:])" in launcher_source
     compatible_v102_sha = "3a7f795a07163a590f1b24d66ba9cc1574de1e6966bc87157886e8668a79d5d1"
     assert compatible_v102_sha in main_source and compatible_v102_sha in launcher_source
+    stage04_checkpoint_sha = "f5af2c7a364a6303c62f3c5875ea0b1dabeb9a6974dd46d40b9a758ae1ac09da"
+    assert stage04_checkpoint_sha in main_source and stage04_checkpoint_sha in launcher_source
+    assert "labels.detach().to(device=logits_f.device, dtype=torch.long, non_blocking=True)" in main_source
     pipeline = next(node for node in main_tree.body if isinstance(node, ast.ClassDef) and node.name == "Stage26Pipeline")
     pipeline_source = ast.get_source_segment(main_source, pipeline) or ""
     assert "def _ensure_partition_shard_for_benchmark(" in pipeline_source
@@ -388,6 +391,14 @@ def runtime_validation() -> None:
         else:
             raise AssertionError("Strict shard generation was not rejected")
         validate_vectorized_shift(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        metric_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        accumulator = load_main_module().StreamingClassificationMetrics(num_classes=3)
+        metric_logits = torch.tensor([[4.0, 1.0, -1.0], [0.0, 3.0, 1.0]], device=metric_device)
+        metric_labels = torch.tensor([0, 1], device="cpu")
+        accumulator.update(metric_logits, metric_labels)
+        metric_summary, _ = accumulator.finish()
+        assert metric_summary["accuracy"] == 1.0 and accumulator.count == 2
+        print("STREAMING_METRICS_CROSS_DEVICE_LABEL_ALIGNMENT_PASS")
         host_snapshot = memory_snapshot()
         device_snapshot = gpu_snapshot()
         assert host_snapshot["cpu_utilization_sampling_semantics"] in {

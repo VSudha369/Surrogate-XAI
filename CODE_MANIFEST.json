@@ -24,6 +24,11 @@
       "name": "Stage 2.6M v1.0.2 integration audit fix",
       "sha256": "33b828797265820a34ef7488a21a729d268e76c78de47aa15a9266b6891b7d2c",
       "role": "Authoritative non-recursive shard initialization, partition backend, and telemetry correction"
+    },
+    {
+      "name": "Stage 05 Colab device-mismatch failure log",
+      "sha256": "6a22c1705919c93fdf327ec765869caa9bd80cb04f9a6ce47efa0b7749b93b9c",
+      "role": "Runtime evidence for the streaming-metrics label-device integration correction"
     }
   ],
   "files": [
@@ -34,8 +39,8 @@
     },
     {
       "path": "README.md",
-      "bytes": 9689,
-      "sha256": "f0c442f807fc634da20ed4433ba9608c031818c8a28cab1ce402bf608217f179"
+      "bytes": 9786,
+      "sha256": "c444d43d550f2ebc5e005de145711507a71057dc3564c4141e21edad10854ceb"
     },
     {
       "path": "SCIENTIFIC_PROTOCOL.md",
@@ -64,13 +69,13 @@
     },
     {
       "path": "Stage2_6M_Colab_Launcher_v1_0_2.py",
-      "bytes": 10885,
-      "sha256": "aadc7f6db4d54f8ae1f115422be4a201ea89280445a7e79c089445f8d3940007"
+      "bytes": 10957,
+      "sha256": "822d135e0ae7168611bc6ea8b85a413810cd9de193880dcfc0a850b72a99509e"
     },
     {
       "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py",
-      "bytes": 229097,
-      "sha256": "f5af2c7a364a6303c62f3c5875ea0b1dabeb9a6974dd46d40b9a758ae1ac09da"
+      "bytes": 229226,
+      "sha256": "38dc08793d5f504fd953fc1232d1d0e179be74ac5d6b830488ad2a6e8f2de0cb"
     },
     {
       "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.ipynb",
@@ -84,8 +89,8 @@
     },
     {
       "path": "validate_stage2_6m_v1_0_2.py",
-      "bytes": 20711,
-      "sha256": "286daacdb40982f27cb1795a29f9f0ead0583e9856c26d018753a2de2a8e304d"
+      "bytes": 21588,
+      "sha256": "b36662e1a0a3e4f2487ea664d2678f49e845d12e5eedde9f688741858f72345e"
     }
   ],
   "validation": {
@@ -95,6 +100,7 @@
     "benchmark_independent_runtime_equivalence": "PASS",
     "sharded_full_run_context_initialization": "PASS",
     "storage_context_cases_a_b_c_d": "PASS",
+    "streaming_metrics_cross_device_label_alignment": "PASS",
     "synthetic_four_arm_finite_gradient": "PASS",
     "scientific_execution": "NOT_RUN_LOCALLY - frozen canonical WiSig benchmark and Stage 2M artifacts are not present in this workspace"
   }

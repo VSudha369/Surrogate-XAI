@@ -89,6 +89,7 @@ CHECKPOINT_COMPATIBLE_SCRIPT_SHA256 = frozenset({
     "421e3c64ce33b3b7929e10d5af84debe9e735c9b2a8709475080cfa0346fd6ac",
     "7493e709bf0cd4a41b990b950f8603900ce4904299497c400ab5df7de346a141",
     "3a7f795a07163a590f1b24d66ba9cc1574de1e6966bc87157886e8668a79d5d1",
+    "f5af2c7a364a6303c62f3c5875ea0b1dabeb9a6974dd46d40b9a758ae1ac09da",
 })
 MAX_CONSECUTIVE_AMP_OVERFLOWS = 32
 EXPECTED_SIGNAL_SHAPE = (2, 256)
@@ -1368,7 +1369,7 @@ class StreamingClassificationMetrics:
 
     def update(self, logits: torch.Tensor, labels: torch.Tensor) -> None:
         logits_f = logits.detach().float()
-        labels_l = labels.detach().long()
+        labels_l = labels.detach().to(device=logits_f.device, dtype=torch.long, non_blocking=True)
         probabilities = torch.softmax(logits_f, dim=1)
         predictions = logits_f.argmax(dim=1)
         top5 = logits_f.topk(k=min(5, logits_f.shape[1]), dim=1).indices
