@@ -104,6 +104,11 @@ EXPECTED_PARTITION_COUNTS: Dict[str, int] = {
     "p3": 8_992,
     "calibration_unknown": 158_400,
 }
+
+
+def checkpoint_script_sha_is_compatible(recorded_sha: Any, current_sha: str) -> bool:
+    """Apply one script-provenance policy to both resume and evaluation loads."""
+    return recorded_sha == current_sha or recorded_sha in CHECKPOINT_COMPATIBLE_SCRIPT_SHA256
 STRICT_INDEX_EXPECTATIONS = {
     "strict_zero_day_test_indices.npy": 216_000,
     "strict_zero_day_shift_test_indices.npy": 3_000,
@@ -1567,7 +1572,7 @@ def validate_checkpoint(
     checks = {
         "benchmark SHA": payload.get("benchmark_sha") == benchmark_sha,
         "Stage 2M SHA": payload.get("stage2m_sha") == EXPECTED_STAGE2M_SCRIPT_SHA256,
-        "script SHA": recorded_script_sha == script_sha or recorded_script_sha in CHECKPOINT_COMPATIBLE_SCRIPT_SHA256,
+        "script SHA": checkpoint_script_sha_is_compatible(recorded_script_sha, script_sha),
         "configuration SHA": payload.get("configuration_sha") == config.configuration_sha256(),
         "arm": payload.get("arm") == run.arm,
         "seed": int(payload.get("seed", -1)) == run.seed,
@@ -2081,7 +2086,7 @@ def load_trained_model(
         int(payload["seed"]) == seed,
         payload["benchmark_sha"] == benchmark_sha,
         payload["stage2m_sha"] == EXPECTED_STAGE2M_SCRIPT_SHA256,
-        payload["script_sha"] == script_sha,
+        checkpoint_script_sha_is_compatible(payload["script_sha"], script_sha),
         payload["configuration_sha"] == config.configuration_sha256(),
         payload["architecture_signature"] == architecture_signature(model),
         payload["loss_coefficients"] == ARM_DEFINITIONS[arm],

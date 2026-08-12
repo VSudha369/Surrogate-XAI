@@ -85,6 +85,7 @@ def static_validation() -> None:
     stage04_checkpoint_sha = "f5af2c7a364a6303c62f3c5875ea0b1dabeb9a6974dd46d40b9a758ae1ac09da"
     assert stage04_checkpoint_sha in main_source and stage04_checkpoint_sha in launcher_source
     assert "labels.detach().to(device=logits_f.device, dtype=torch.long, non_blocking=True)" in main_source
+    assert "checkpoint_script_sha_is_compatible(payload[\"script_sha\"], script_sha)" in main_source
     pipeline = next(node for node in main_tree.body if isinstance(node, ast.ClassDef) and node.name == "Stage26Pipeline")
     pipeline_source = ast.get_source_segment(main_source, pipeline) or ""
     assert "def _ensure_partition_shard_for_benchmark(" in pipeline_source
@@ -312,6 +313,45 @@ def pipeline_storage_context_validation(root: Path) -> None:
     print("STORAGE_CONTEXT_CASES_A_B_C_D_PASS")
 
 
+def evaluation_checkpoint_compatibility_validation(root: Path) -> None:
+    import torch
+
+    module = load_main_module()
+    branch_root = root / "MANYTX_ZERO_DAY_BRANCH_v1.0.3"
+    output_root = branch_root / "03_representation_ablation"
+    output_root.mkdir(parents=True, exist_ok=True)
+    config = module.Stage26Config(
+        branch_root=str(branch_root),
+        output_dir=str(output_root),
+        device="cpu",
+    )
+    run = module.create_training_runs(config, 42, torch.device("cpu"))["A0"]
+    payload = module.checkpoint_payload(
+        run,
+        config,
+        epoch=40,
+        benchmark_sha=module.EXPECTED_BENCHMARK_SHA256,
+        script_sha="f5af2c7a364a6303c62f3c5875ea0b1dabeb9a6974dd46d40b9a758ae1ac09da",
+        exposure_sha="fixture-exposure",
+        group_state={"epochs_without_any_improvement": 0},
+    )
+    checkpoint = module.checkpoint_dir(config, "A0", 42) / "best_selection.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, checkpoint)
+    model, loaded, checkpoint_sha = module.load_trained_model(
+        config,
+        "A0",
+        42,
+        torch.device("cpu"),
+        module.EXPECTED_BENCHMARK_SHA256,
+        "current-patched-script-sha",
+    )
+    assert loaded["script_sha"] == payload["script_sha"]
+    assert checkpoint_sha == module.sha256_file(checkpoint)
+    assert module.architecture_signature(model) == payload["architecture_signature"]
+    print("EVALUATION_CHECKPOINT_COMPATIBLE_SCRIPT_SHA_PASS")
+
+
 def runtime_validation() -> None:
     try:
         import h5py
@@ -426,6 +466,7 @@ def runtime_validation() -> None:
         assert len(removed) == 5 and unrelated.read_text(encoding="utf-8") == "keep"
         assert (output_root / "performance" / "RESET_SEED_42_STATUS.json").is_file()
         pipeline_storage_context_validation(root)
+        evaluation_checkpoint_compatibility_validation(root)
     print("BENCHMARK_INDEPENDENT_RUNTIME_EQUIVALENCE_PASS")
 
 

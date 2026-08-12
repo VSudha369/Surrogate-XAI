@@ -39,8 +39,8 @@
     },
     {
       "path": "README.md",
-      "bytes": 9786,
-      "sha256": "c444d43d550f2ebc5e005de145711507a71057dc3564c4141e21edad10854ceb"
+      "bytes": 9897,
+      "sha256": "25476ffe2872a4c24a3e630dcc9793c72d896eae597fb319e9bc48bd96255580"
     },
     {
       "path": "SCIENTIFIC_PROTOCOL.md",
@@ -74,8 +74,8 @@
     },
     {
       "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py",
-      "bytes": 229226,
-      "sha256": "38dc08793d5f504fd953fc1232d1d0e179be74ac5d6b830488ad2a6e8f2de0cb"
+      "bytes": 229498,
+      "sha256": "843623a6260304d048ed1627c18a0f8849b498b3d1b9b8a6ecdb5cb5c7dd58bc"
     },
     {
       "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.ipynb",
@@ -89,8 +89,8 @@
     },
     {
       "path": "validate_stage2_6m_v1_0_2.py",
-      "bytes": 21588,
-      "sha256": "b36662e1a0a3e4f2487ea664d2678f49e845d12e5eedde9f688741858f72345e"
+      "bytes": 23251,
+      "sha256": "941a5f59672a8c43c88021c6f9b6964d53ac040b71503213e1b802688bab86d3"
     }
   ],
   "validation": {
@@ -101,6 +101,7 @@
     "sharded_full_run_context_initialization": "PASS",
     "storage_context_cases_a_b_c_d": "PASS",
     "streaming_metrics_cross_device_label_alignment": "PASS",
+    "evaluation_checkpoint_compatible_script_sha": "PASS",
     "synthetic_four_arm_finite_gradient": "PASS",
     "scientific_execution": "NOT_RUN_LOCALLY - frozen canonical WiSig benchmark and Stage 2M artifacts are not present in this workspace"
   }
