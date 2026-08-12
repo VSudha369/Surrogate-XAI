@@ -1,0 +1,78 @@
+{
+  "artifact_name": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0",
+  "pipeline_version": "1.0.0",
+  "generation_timestamp": "2026-08-12T11:54:49.9486574+00:00",
+  "parent_git_commit": "90dfea2c3be0ba009387d4a1ad7fc6848104a4dd",
+  "benchmark": {
+    "name": "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3",
+    "sha256": "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9"
+  },
+  "stage2m": {
+    "version": "1.0.5",
+    "script_sha256": "46c95bbf9fb6806a5f463b4e173434a5f03f013367b1bcd38ebb73c07d0f67ba",
+    "artifact_manifest_sha256": "0a8853d782006ce8af2d7b798a61c1e141afbeb55066cb70115ae41c8d24f16a"
+  },
+  "stage2_6m": {
+    "artifact_sha256": "83b1eec28b36afd39fffb4d3b719d92ccd3f0caaa270df0d16f4f28eab209660",
+    "frozen_decision": "SELECT_CE_SUPCON_PROTOTYPE",
+    "source_arm": "A3",
+    "candidate_seeds": [42, 123, 2026]
+  },
+  "scientific_contract_summary": {
+    "canonical_mode": "PROMOTE_AND_VERIFY",
+    "teacher_source": "stage2_6m_promote",
+    "architecture_search": false,
+    "training_implemented": false,
+    "strict_zero_day_access": "FORBIDDEN",
+    "final_zero_day_evaluation": false,
+    "surrogate_training": false,
+    "xai": false,
+    "known_classes": 98,
+    "embedding_dimension": 128,
+    "parameter_count": 849634,
+    "objective": "CE + 0.1 SupCon + 0.1 Prototype",
+    "supcon_temperature": 0.07,
+    "prototype_momentum": 0.95
+  },
+  "files": [
+    {"path": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.py", "bytes": 74066, "sha256": "e39fb54c8b51f4ad7721c8d0c131c3eead68a4da2a38f0fe4cfdb5f2b9bd0819"},
+    {"path": "Stage3M_Colab_Launcher_v1_0_0.py", "bytes": 7890, "sha256": "e795c98386e3ebb3e8d6075d820bca732bd3cb281646dafff331b5fa2c097e84"},
+    {"path": "stage3m_config_v1_0_0.example.json", "bytes": 638, "sha256": "e41982dcaa3dcf257e10a4a090fe10d30566394a08dd834461cf47f73d8328ca"},
+    {"path": "validate_stage3m_v1_0_0.py", "bytes": 11631, "sha256": "b3ee38118e567f6b2ff1710d003a6a3b55830b6bf1201a567f0e401ad1c7fc03"},
+    {"path": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.ipynb", "bytes": 1747, "sha256": "8679157b83a1de22970b4112ee0b63ce2a7336bd5f47df417ecdda3510281619"},
+    {"path": "STAGE3M_SCIENTIFIC_PROTOCOL.md", "bytes": 3187, "sha256": "f086a36a3f7cb8647a5f78efae70b5877deff94dd1b3bce1fd0c07d4ac6ef0c4"},
+    {"path": "STAGE3M_OUTPUT_SCHEMA.md", "bytes": 2105, "sha256": "211ee600088687f85731ce0e165d5996508bbec9ea67b51734369a781099744f"},
+    {"path": "STAGE3M_VALIDATION_CHECKLIST.md", "bytes": 2157, "sha256": "061096eac7f67cd535efd81f34b172328903fcd3fdb786e3d308bed4c81ad53a"},
+    {"path": "STAGE3M_README.md", "bytes": 1397, "sha256": "8b354a72ac52675c0838a0d21149b4cb88dd8f194900f5f2be780169c3badb96"},
+    {"path": "requirements_stage3m.txt", "bytes": 134, "sha256": "f0388ee831d76fd81289e14c515817e652c7da32ecb360bcc2ade8bcfda25242"}
+  ],
+  "manifest_scope": {
+    "listed_files": 10,
+    "self_excluded_to_avoid_recursive_hashing": "STAGE3M_CODE_MANIFEST.json",
+    "package_excluded_to_avoid_manifest_package_hash_cycle": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.zip"
+  },
+  "validation_results": {
+    "python_compilation": "PASS",
+    "ast_parse": "PASS",
+    "pyflakes": "PASS",
+    "notebook_json": "PASS",
+    "architecture_equivalence": "PASS",
+    "parameter_count_equivalence": "PASS (849634)",
+    "checkpoint_provenance_regressions": "PASS",
+    "deterministic_selection_regressions": "PASS",
+    "strict_zero_day_guard_regressions": "PASS",
+    "embedding_store_resume_regressions": "PASS",
+    "logging_regression": "PASS",
+    "ready_gate_regressions": "PASS",
+    "synthetic_validation": "PASS",
+    "offline_validator": "PASS (8/8)",
+    "manifest_and_zip_validation": "PASS (CRC AND BYTE-FOR-BYTE MEMBERS)"
+  },
+  "expected_colab_only_validation_status": {
+    "status": "PENDING_CANONICAL_COLAB_EXECUTION",
+    "stage3m_freeze_state": "IMPLEMENTED_BUT_NOT_SCIENTIFICALLY_FROZEN",
+    "requires_real_frozen_benchmark": true,
+    "requires_real_stage2_6m_drive_artifacts": true,
+    "required_terminal_marker": "MANYTX_STAGE3M_READY"
+  }
+}

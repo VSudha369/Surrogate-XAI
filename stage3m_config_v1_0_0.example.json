@@ -1,0 +1,20 @@
+{
+  "branch_root": "/content/drive/MyDrive/colab files /Surrogate-XAI/project_root/MANYTX_ZERO_DAY_BRANCH_v1.0.3",
+  "repository_root": "/content/Surrogate-XAI",
+  "teacher_source": "stage2_6m_promote",
+  "seeds": [42, 123, 2026],
+  "eval_batch_size": 1024,
+  "num_workers": 2,
+  "prefetch_factor": 4,
+  "pin_memory": true,
+  "persistent_workers": true,
+  "local_cache_root": "/content/wisig_stage3m_cache",
+  "representation_samples_per_class": 100,
+  "representation_sampling_seed": 3000001,
+  "calibration_unknown_diagnostic": false,
+  "amp_enabled": true,
+  "device": "auto",
+  "stage_start": 1,
+  "stage_end": 10,
+  "resume": true
+}
