@@ -15,6 +15,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Mapping
 
 import numpy as np
@@ -173,6 +174,51 @@ def test_selection(module: Any) -> None:
     assert selected(module, neutral) == 42
 
 
+def synthetic_representation(observed_labels: list[int], samples_per_class: int = 4) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    embeddings, labels = [], []
+    for label in observed_labels:
+        center = np.zeros(128, dtype=np.float32); center[label] = 1.0
+        for sample in range(samples_per_class):
+            value = center.copy(); value[(label + sample + 1) % 128] += 0.01 * (sample + 1)
+            value /= np.linalg.norm(value)
+            embeddings.append(value); labels.append(label)
+    global_indices = np.arange(10_000, 10_000 + len(labels), dtype=np.int64)
+    return np.asarray(embeddings, dtype=np.float32), np.asarray(labels, dtype=np.int64), global_indices
+
+
+def test_representation_missing_classes(module: Any) -> None:
+    pipeline = module.Stage3MPipeline.__new__(module.Stage3MPipeline)
+    pipeline.config = SimpleNamespace(representation_sampling_seed=3_000_001, representation_samples_per_class=3)
+    geometry = (
+        "silhouette_score", "davies_bouldin_index", "calinski_harabasz_index",
+        "mean_intra_class_distance", "mean_inter_class_distance", "inter_intra_ratio",
+        "fisher_ratio", "prototype_separation", "prototype_compactness",
+    )
+    cases = {
+        "p0": list(range(98)),
+        "p2": [0, 3, 7, 12, 19, 31, 48, 63, 77, 97],
+        "p3": [2, 17, 44, 89],
+    }
+    for protocol, observed in cases.items():
+        embedding, labels, global_indices = synthetic_representation(observed)
+        first_metrics, first_positions = pipeline.representation_metrics(embedding, labels, 42, protocol)
+        second_metrics, second_positions = pipeline.representation_metrics(embedding, labels, 42, protocol)
+        first_hashes = module.representation_sampling_hashes(first_positions, global_indices)
+        second_hashes = module.representation_sampling_hashes(second_positions, global_indices)
+        assert np.array_equal(first_positions, second_positions) and first_hashes == second_hashes
+        assert first_metrics == second_metrics
+        assert first_metrics["observed_class_count"] == len(observed)
+        assert first_metrics["missing_class_count"] == 98 - len(observed)
+        assert first_metrics["representation_frame"] == "OBSERVED_CLASSES"
+        assert all(np.isfinite(float(first_metrics[key])) for key in geometry)
+    embedding, labels, _ = synthetic_representation(list(range(97)))
+    expect_abort(module, lambda: pipeline.representation_metrics(embedding, labels, 42, "p0"))
+    embedding, labels, _ = synthetic_representation([0, 98])
+    expect_abort(module, lambda: pipeline.representation_metrics(embedding, labels, 42, "p2"))
+    embedding, labels, _ = synthetic_representation([7])
+    expect_abort(module, lambda: pipeline.representation_metrics(embedding, labels, 42, "p3"))
+
+
 def test_zero_day(module: Any) -> None:
     for kind in ("signal", "label", "embedding", "metric", "threshold"):
         guard = module.StrictZeroDayGuard()
@@ -210,6 +256,79 @@ def test_logging_and_ready(module: Any) -> None:
         assert not module.ready_gate(failed)
 
 
+def write_stage10_checkpoint(module: Any, pipeline: Any, outputs: list[Path]) -> None:
+    payload = {
+        "pipeline_version": module.PIPELINE_VERSION,
+        "executable_sha256": pipeline.script_sha,
+        "configuration_sha256": pipeline.config.configuration_sha256(),
+        "required_input_hashes": {},
+        "required_outputs": [{"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in outputs],
+    }
+    path = pipeline.stage_manifest_path(10); path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_interrupted_stage10_resume(module: Any) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        class FixtureConfig:
+            resume = True
+            output_root = root
+            @staticmethod
+            def configuration_sha256() -> str:
+                return "config-sha"
+        pipeline = module.Stage3MPipeline.__new__(module.Stage3MPipeline)
+        pipeline.config = FixtureConfig(); pipeline.script_sha = "script-sha"
+        checkpoint = root / "manifests" / "STAGE_10_CHECKPOINT.json"
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint.write_text(json.dumps({"pipeline_version": module.PIPELINE_VERSION}), encoding="utf-8")
+        assert not pipeline.stage_current(10)  # Case A: checkpoint-like partial state, no READY.
+        ready = root / "MANYTX_STAGE3M_READY.txt"; ready.write_text("MANYTX_STAGE3M_READY\n", encoding="utf-8")
+        corrupt = root / "manifests" / "STAGE3M_HASH_MANIFEST.json"; corrupt.write_text("{corrupt", encoding="utf-8")
+        assert not pipeline.stage_current(10)  # Case B: READY with corrupt final manifest.
+        for relative in module.FINAL_HASH_REQUIRED_RELATIVE_PATHS:
+            path = root / relative; path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(f"fixture:{relative}".encode())
+        rows = []
+        for relative in module.FINAL_HASH_REQUIRED_RELATIVE_PATHS:
+            path = root / relative
+            rows.append({"relative_path": relative, "sha256": sha256_file(path), "bytes": path.stat().st_size})
+        exclusions = [{"relative_path": path, "reason": reason} for path, reason in module.FINAL_HASH_EXCLUSIONS.items()]
+        corrupt.write_text(json.dumps({"algorithm": "SHA-256", "files": rows, "count": len(rows), "exclusions": exclusions}), encoding="utf-8")
+        outputs = [root / relative for relative in module.FINAL_STAGE_REQUIRED_RELATIVE_PATHS]
+        write_stage10_checkpoint(module, pipeline, outputs)
+        assert pipeline.stage_current(10)  # Case C: complete and hash-current final transaction.
+        (root / "publication" / "Stage3M_report.pdf").write_bytes(b"corrupt-after-checkpoint")
+        assert not pipeline.stage_current(10)
+
+
+def test_preflight_scope(module: Any) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        branch = Path(temporary) / module.CANONICAL_BRANCH
+        captured: Dict[str, Any] = {}
+        original_pipeline = module.Stage3MPipeline
+        class CapturePipeline:
+            def __init__(self, config: Any):
+                captured["config"] = config
+            def run(self) -> None:
+                captured["run"] = True
+        module.Stage3MPipeline = CapturePipeline
+        try:
+            assert module.main(["--preflight", "--branch-root", str(branch)]) == 0
+        finally:
+            module.Stage3MPipeline = original_pipeline
+        config = captured["config"]
+        assert captured["run"] and config.preflight is True and config.stage_start == 1 and config.stage_end == 3
+        calls: list[int] = []
+        harness = original_pipeline.__new__(original_pipeline)
+        harness.config = SimpleNamespace(stage_start=1, stage_end=3, preflight=True)
+        harness.stage_current = lambda stage: False
+        for stage in range(1, 11):
+            setattr(harness, f"stage_{stage:02d}", lambda stage=stage: calls.append(stage))
+        original_pipeline.run(harness)
+        assert calls == [1, 2, 3]
+        assert not (branch / "04_canonical_teacher" / "MANYTX_STAGE3M_READY.txt").exists()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source-only", action="store_true", help="Skip manifest/ZIP checks while assembling the package")
@@ -222,9 +341,12 @@ def main() -> int:
         "architecture_equivalence": lambda: test_architecture(module, stage26),
         "checkpoint_provenance": lambda: test_checkpoint_provenance(module),
         "deterministic_selection": lambda: test_selection(module),
+        "missing_protocol_classes": lambda: test_representation_missing_classes(module),
         "strict_zero_day_guard": lambda: test_zero_day(module),
         "embedding_store_resume": lambda: test_storage(module),
         "logging_and_ready_gate": lambda: test_logging_and_ready(module),
+        "interrupted_stage10_resume": lambda: test_interrupted_stage10_resume(module),
+        "preflight_scope": lambda: test_preflight_scope(module),
     }
     for name, operation in tests.items():
         operation(); print(f"[PASS] {name}")

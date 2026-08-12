@@ -61,6 +61,36 @@ REQUIRED_OUTPUT_DIRS = (
     "configs", "checkpoints", "logs", "manifests", "metrics", "tables", "embeddings",
     "statistics", "figures", "reports", "publication", "performance",
 )
+FINAL_HASH_EXCLUSIONS = {
+    "manifests/STAGE3M_HASH_MANIFEST.json": "A cryptographic manifest cannot include its own digest.",
+    "manifests/STAGE_10_CHECKPOINT.json": "The atomic completion checkpoint is written only after the final manifest and READY marker verify.",
+    "MANYTX_STAGE3M_READY.txt": "READY is written only after the final manifest verifies and is instead hash-bound by the Stage-10 checkpoint.",
+    "MANYTX_STAGE3M_NOT_READY.txt": "Failure marker is mutually exclusive with READY and is never a scientific product.",
+}
+FINAL_HASH_REQUIRED_RELATIVE_PATHS = (
+    "manifests/STAGE3M_FINAL_STATUS.json",
+    "checkpoints/canonical/canonical_teacher_v1_0.pt",
+    "checkpoints/canonical/canonical_teacher_state_dict.pt",
+    "manifests/TEACHER_FREEZE.json",
+    "manifests/TEACHER_HASH_MANIFEST.json",
+    "reports/Stage3M_Canonical_Teacher_Report.md",
+    "statistics/teacher_candidate_metric_summary.csv",
+    "publication/Stage3M_report.pdf",
+    "publication/Stage3M_tables.xlsx",
+    "publication/Stage3M_latex_tables.tex",
+    "publication/FIGURE_MANIFEST.json",
+    "figures/known_protocol_macro_f1.pdf",
+    "figures/known_protocol_macro_f1.png",
+    "figures/domain_degradation.pdf",
+    "figures/domain_degradation.png",
+    "figures/representation_quality.pdf",
+    "figures/representation_quality.png",
+)
+FINAL_STAGE_REQUIRED_RELATIVE_PATHS = (
+    *FINAL_HASH_REQUIRED_RELATIVE_PATHS,
+    "manifests/STAGE3M_HASH_MANIFEST.json",
+    "MANYTX_STAGE3M_READY.txt",
+)
 
 SELECTION_POLICY = {
     "policy_version": "stage3m_teacher_selection_v1",
@@ -98,6 +128,47 @@ def sha256_file(path: Path) -> str:
 
 def sha256_object(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+
+
+def representation_effective_seed(base_seed: int, candidate_seed: int, protocol: str) -> int:
+    if protocol not in KNOWN_PROTOCOLS:
+        raise ScientificAbort(f"Unknown representation protocol: {protocol}")
+    return int(base_seed + candidate_seed * 101 + KNOWN_PROTOCOLS.index(protocol))
+
+
+def representation_sampling_hashes(positions: np.ndarray, global_indices: np.ndarray) -> Dict[str, str]:
+    selected = np.asarray(positions, dtype=np.int64)
+    globals_array = np.asarray(global_indices, dtype=np.int64)
+    if selected.ndim != 1 or globals_array.ndim != 1 or (len(selected) and (selected.min() < 0 or selected.max() >= len(globals_array))):
+        raise ScientificAbort("Representation sampling positions/global indices are invalid")
+    return {
+        "sampled_position_sha256": hashlib.sha256(selected.tobytes()).hexdigest(),
+        "sampled_global_index_sha256": hashlib.sha256(np.asarray(globals_array[selected], dtype=np.int64).tobytes()).hexdigest(),
+    }
+
+
+def final_hash_manifest_current(output_root: Path) -> bool:
+    manifest_path = output_root / "manifests" / "STAGE3M_HASH_MANIFEST.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        exclusions = {str(row["relative_path"]): str(row["reason"]) for row in payload["exclusions"]}
+        if exclusions != FINAL_HASH_EXCLUSIONS:
+            return False
+        rows = payload["files"]
+        if payload.get("algorithm") != "SHA-256" or payload.get("count") != len(rows):
+            return False
+        indexed: Dict[str, Mapping[str, Any]] = {}
+        for row in rows:
+            relative = str(row["relative_path"]).replace("\\", "/")
+            if relative in indexed or relative in exclusions:
+                return False
+            path = assert_within(output_root / relative, output_root)
+            if not path.is_file() or path.stat().st_size != int(row["bytes"]) or sha256_file(path) != row["sha256"]:
+                return False
+            indexed[relative] = row
+        return set(FINAL_HASH_REQUIRED_RELATIVE_PATHS).issubset(indexed)
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, ScientificAbort):
+        return False
 
 
 def assert_within(path: Path, root: Path) -> Path:
@@ -561,6 +632,10 @@ class Stage3MPipeline:
         path = self.stage_manifest_path(stage)
         if not self.config.resume or not path.is_file():
             return False
+        if stage == 10:
+            final_products = [self.config.output_root / relative for relative in FINAL_STAGE_REQUIRED_RELATIVE_PATHS]
+            if not all(product.is_file() for product in final_products) or not final_hash_manifest_current(self.config.output_root):
+                return False
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if payload.get("pipeline_version") != PIPELINE_VERSION or payload.get("executable_sha256") != self.script_sha or payload.get("configuration_sha256") != self.config.configuration_sha256():
@@ -868,23 +943,35 @@ class Stage3MPipeline:
                 store_outputs.extend(store / name for name in ("embedding_normalized.npy", "logits.npy", "labels.npy", "global_indices.npy", "store_manifest.json"))
         self.complete_stage(4, "Known-Domain Canonical Evaluation", [known_path, per_class_path, *outputs, *store_outputs], list(self.candidate_paths.values()))
 
-    def representation_metrics(self, embedding: np.ndarray, labels: np.ndarray, seed: int, protocol: str) -> Tuple[Dict[str, float], np.ndarray]:
-        rng = np.random.default_rng(self.config.representation_sampling_seed + seed * 101 + KNOWN_PROTOCOLS.index(protocol))
+    def representation_metrics(self, embedding: np.ndarray, labels: np.ndarray, seed: int, protocol: str) -> Tuple[Dict[str, Any], np.ndarray]:
+        labels = np.asarray(labels, dtype=np.int64)
+        if labels.ndim != 1 or len(labels) != len(embedding) or (len(labels) and (labels.min() < 0 or labels.max() >= 98)):
+            raise ScientificAbort(f"Representation labels must be one-dimensional known-class indices 0..97: seed={seed}, protocol={protocol}")
+        observed_labels = np.unique(labels)
+        if len(observed_labels) < 2:
+            raise ScientificAbort(f"Representation geometry requires at least two observed classes: seed={seed}, protocol={protocol}")
+        if protocol == "p0" and len(observed_labels) != 98:
+            raise ScientificAbort(f"P0 Fisher-ratio selection input requires all 98 observed classes: seed={seed}, observed={len(observed_labels)}")
+        missing_labels = np.setdiff1d(np.arange(98, dtype=np.int64), observed_labels, assume_unique=True)
+        effective_seed = representation_effective_seed(self.config.representation_sampling_seed, seed, protocol)
+        rng = np.random.default_rng(effective_seed)
         positions = []
-        for label in range(98):
+        for label in observed_labels:
             members = np.flatnonzero(labels == label)
-            if len(members) == 0:
-                raise ScientificAbort(f"Representation diagnostics missing fixed-98 class {label}: seed={seed}, protocol={protocol}")
             take = min(len(members), self.config.representation_samples_per_class)
             positions.extend(rng.choice(members, size=take, replace=False).tolist())
         positions_array = np.asarray(sorted(positions), dtype=np.int64)
         x = np.asarray(embedding[positions_array], dtype=np.float32); y = np.asarray(labels[positions_array], dtype=np.int64)
-        centroids = np.stack([x[y == label].mean(0) for label in range(98)])
+        sampled_counts = {int(label): int(np.count_nonzero(y == label)) for label in observed_labels}
+        if any(count < 2 for count in sampled_counts.values()):
+            raise ScientificAbort(f"Silhouette geometry requires at least two sampled rows per observed class: seed={seed}, protocol={protocol}")
+        centroid_by_label = {int(label): x[y == label].mean(0) for label in observed_labels}
+        centroids = np.stack([centroid_by_label[int(label)] for label in observed_labels])
         global_centroid = x.mean(0)
-        intra_sq = np.concatenate([np.sum((x[y == label] - centroids[label]) ** 2, axis=1) for label in range(98)])
+        intra_sq = np.concatenate([np.sum((x[y == label] - centroid_by_label[int(label)]) ** 2, axis=1) for label in observed_labels])
         between_sq = np.sum((centroids - global_centroid) ** 2, axis=1)
         centroid_distances = np.sqrt(np.maximum(((centroids[:, None] - centroids[None, :]) ** 2).sum(2), 0))
-        upper = centroid_distances[np.triu_indices(98, 1)]
+        upper = centroid_distances[np.triu_indices(len(observed_labels), 1)]
         compactness = float(np.sqrt(intra_sq).mean()); separation = float(upper.mean())
         result = {
             "silhouette_score": float(silhouette_score(x, y)), "davies_bouldin_index": float(davies_bouldin_score(x, y)),
@@ -892,6 +979,10 @@ class Stage3MPipeline:
             "mean_inter_class_distance": separation, "inter_intra_ratio": separation / max(compactness, 1e-12),
             "fisher_ratio": float(between_sq.mean() / max(intra_sq.mean(), 1e-12)),
             "prototype_separation": separation, "prototype_compactness": compactness, "sample_count": len(x),
+            "observed_class_count": int(len(observed_labels)), "missing_class_count": int(len(missing_labels)),
+            "observed_class_fraction": float(len(observed_labels) / 98),
+            "missing_class_indices": json.dumps(missing_labels.tolist(), separators=(",", ":")),
+            "representation_frame": "OBSERVED_CLASSES", "effective_sampling_seed": effective_seed,
         }
         return result, positions_array
 
@@ -902,10 +993,19 @@ class Stage3MPipeline:
                 store = self.embedding_store(seed, protocol)
                 if not self.store_current(store, sha256_file(self.candidate_paths[seed]), len(self.ensure_benchmark().partitions[protocol].indices)):
                     raise ScientificAbort(f"Stage 04 embedding store is incomplete: seed={seed}, protocol={protocol}")
-                embedding = np.load(store / "embedding_normalized.npy", mmap_mode="r"); labels = np.load(store / "labels.npy", mmap_mode="r")
+                embedding = np.load(store / "embedding_normalized.npy", mmap_mode="r"); labels = np.load(store / "labels.npy", mmap_mode="r"); global_indices = np.load(store / "global_indices.npy", mmap_mode="r")
                 metrics, positions = self.representation_metrics(embedding, labels, seed, protocol)
                 rows.append({"seed": seed, "protocol": protocol, **metrics})
-                samples.append({"seed": seed, "protocol": protocol, "positions_sha256": hashlib.sha256(positions.tobytes()).hexdigest(), "sample_count": len(positions), "sampling_seed": self.config.representation_sampling_seed})
+                hashes = representation_sampling_hashes(positions, global_indices)
+                samples.append({
+                    "candidate_seed": seed, "protocol": protocol,
+                    "base_sampling_seed": self.config.representation_sampling_seed,
+                    "effective_sampling_seed": representation_effective_seed(self.config.representation_sampling_seed, seed, protocol),
+                    "observed_class_count": metrics["observed_class_count"],
+                    "samples_per_class_cap": self.config.representation_samples_per_class,
+                    "total_sampled_rows": len(positions), **hashes,
+                    "representation_frame": "OBSERVED_CLASSES",
+                })
         table = self.config.output_root / "tables" / "teacher_representation_metrics.csv"
         sampling = self.config.output_root / "manifests" / "REPRESENTATION_METRIC_SAMPLING.json"
         atomic_csv(table, pd.DataFrame(rows), self.config.output_root); atomic_json(sampling, {"policy": "per-class deterministic without replacement", "records": samples}, self.config.output_root)
@@ -913,7 +1013,7 @@ class Stage3MPipeline:
         for seed in EXPECTED_SEEDS:
             for protocol in KNOWN_PROTOCOLS:
                 store = self.embedding_store(seed, protocol)
-                store_inputs.extend((store / "embedding_normalized.npy", store / "labels.npy", store / "store_manifest.json"))
+                store_inputs.extend((store / "embedding_normalized.npy", store / "labels.npy", store / "global_indices.npy", store / "store_manifest.json"))
         self.complete_stage(5, "Representation-Quality Diagnostics", [table, sampling], store_inputs)
 
     def stage_06(self) -> None:
@@ -995,15 +1095,20 @@ class Stage3MPipeline:
         known = pd.read_csv(self.config.output_root / "tables" / "teacher_candidate_known_metrics.csv"); degradation = pd.read_csv(self.config.output_root / "tables" / "teacher_domain_degradation.csv"); representation = pd.read_csv(self.config.output_root / "tables" / "teacher_representation_metrics.csv")
         figures: List[Path] = []
         specs = [
-            ("known_protocol_macro_f1", known, "protocol", "fixed98_macro_f1", "Known protocol fixed-98 macro-F1"),
-            ("domain_degradation", degradation, "target_protocol", "fixed98_macro_f1_degradation", "Known-domain macro-F1 degradation"),
-            ("representation_quality", representation, "protocol", "fisher_ratio", "Representation Fisher ratio"),
+            ("known_protocol_macro_f1", known, "protocol", "fixed98_macro_f1", "Known protocol fixed-98 macro-F1", "Fixed-98 macro-F1"),
+            ("domain_degradation", degradation, "target_protocol", "fixed98_macro_f1_degradation", "Known-domain macro-F1 degradation", "Fixed-98 macro-F1 degradation"),
+            ("representation_quality", representation, "protocol", "fisher_ratio", "Observed-class representation Fisher ratio", "Observed-class Fisher ratio"),
         ]
-        for name, frame, x_col, y_col, title in specs:
+        for name, frame, x_col, y_col, title, y_label in specs:
             fig, ax = plt.subplots(figsize=(8, 5))
             for seed, group in frame.groupby("seed"):
                 group.groupby(x_col)[y_col].mean().plot(marker="o", ax=ax, label=f"seed {seed}")
-            ax.set_title(title); ax.set_ylabel(y_col.replace("_", " ")); ax.grid(alpha=0.25); ax.legend(); fig.tight_layout()
+            ax.set_title(title); ax.set_ylabel(y_label); ax.grid(alpha=0.25); ax.legend()
+            if name == "representation_quality":
+                fig.text(0.5, 0.01, "Geometry uses observed identities per protocol; class coverage is recorded in the source table.", ha="center", fontsize=8)
+                fig.tight_layout(rect=(0, 0.04, 1, 1))
+            else:
+                fig.tight_layout()
             for suffix in ("png", "pdf"):
                 path = self.config.output_root / "figures" / f"{name}.{suffix}"; fig.savefig(path, dpi=220 if suffix == "png" else None); figures.append(path)
             plt.close(fig)
@@ -1015,7 +1120,8 @@ class Stage3MPipeline:
         summary = summary.reset_index()
         summary_path = self.config.output_root / "statistics" / "teacher_candidate_metric_summary.csv"
         atomic_csv(summary_path, summary, self.config.output_root)
-        atomic_text(report, f"# Stage 3M canonical teacher report\n\nMeasured known-validation results select A3 seed **{selection['selected_seed']}** by the frozen hierarchy. No retraining, strict-zero-day evaluation, surrogate training, or XAI occurred. With only three candidate seeds, no new significance claim is made.\n\n## Candidate summary\n\n{summary.to_markdown(index=False)}\n", self.config.output_root)
+        coverage = representation[["seed", "protocol", "observed_class_count", "missing_class_count", "observed_class_fraction", "representation_frame"]]
+        atomic_text(report, f"# Stage 3M canonical teacher report\n\nMeasured known-validation results select A3 seed **{selection['selected_seed']}** by the frozen hierarchy. No retraining, strict-zero-day evaluation, surrogate training, or XAI occurred. With only three candidate seeds, no new significance claim is made.\n\n## Candidate summary\n\n{summary.to_markdown(index=False)}\n\n## Representation class coverage\n\nRepresentation geometry is computed over observed identities in each protocol. P1/P2/P3 Fisher ratios are descriptive; only P0 Fisher ratio, which requires all 98 classes, participates in canonical selection.\n\n{coverage.to_markdown(index=False)}\n", self.config.output_root)
         workbook = self.config.output_root / "publication" / "Stage3M_tables.xlsx"
         with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
             known.to_excel(writer, sheet_name="known_metrics", index=False); degradation.to_excel(writer, sheet_name="degradation", index=False); representation.to_excel(writer, sheet_name="representation", index=False)
@@ -1031,6 +1137,10 @@ class Stage3MPipeline:
 
     def stage_10(self) -> None:
         self.ensure_candidates()
+        ready = self.config.output_root / "MANYTX_STAGE3M_READY.txt"
+        not_ready = self.config.output_root / "MANYTX_STAGE3M_NOT_READY.txt"
+        if ready.exists():
+            ready.unlink()
         self.guard.scan_output(self.config.output_root); self.guard.assert_zero()
         for stage in range(1, 10):
             if not self.stage_current(stage):
@@ -1050,23 +1160,15 @@ class Stage3MPipeline:
             raise ScientificAbort(f"Stage 3M READY gates failed: {gates}")
         final_status = self.config.output_root / "manifests" / "STAGE3M_FINAL_STATUS.json"
         atomic_json(final_status, {"status": "MANYTX_STAGE3M_READY", "pipeline_version": PIPELINE_VERSION, "selected_seed": seed, "gates": gates, "strict_zero_day_counters": self.guard.counters(), "generated_at": utc_now()}, self.config.output_root)
-        outputs = [final_status, *publication]
-        self.complete_stage(10, "Final Audit and READY Gate", outputs, [self.stage_manifest_path(stage) for stage in range(1, 10)])
         hash_manifest = self.config.output_root / "manifests" / "STAGE3M_HASH_MANIFEST.json"
-        excluded = {hash_manifest.resolve()}
-        files = [path for path in sorted(self.config.output_root.rglob("*")) if path.is_file() and path.resolve() not in excluded and path.name not in {"MANYTX_STAGE3M_READY.txt", "MANYTX_STAGE3M_NOT_READY.txt"}]
-        hash_rows = [{"relative_path": str(path.relative_to(self.config.output_root)), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in files]
-        atomic_json(hash_manifest, {"algorithm": "SHA-256", "files": hash_rows, "count": len(hash_rows)}, self.config.output_root)
-        verified_manifest = json.loads(hash_manifest.read_text(encoding="utf-8"))
-        if verified_manifest.get("count") != len(hash_rows) or any(
-            not (self.config.output_root / row["relative_path"]).is_file()
-            or sha256_file(self.config.output_root / row["relative_path"]) != row["sha256"]
-            or (self.config.output_root / row["relative_path"]).stat().st_size != row["bytes"]
-            for row in verified_manifest.get("files", [])
-        ):
+        excluded = {(self.config.output_root / relative).resolve() for relative in FINAL_HASH_EXCLUSIONS}
+        files = [path for path in sorted(self.config.output_root.rglob("*")) if path.is_file() and path.resolve() not in excluded]
+        hash_rows = [{"relative_path": path.relative_to(self.config.output_root).as_posix(), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in files]
+        exclusion_rows = [{"relative_path": path, "reason": reason} for path, reason in FINAL_HASH_EXCLUSIONS.items()]
+        atomic_json(hash_manifest, {"algorithm": "SHA-256", "files": hash_rows, "count": len(hash_rows), "exclusions": exclusion_rows}, self.config.output_root)
+        if not final_hash_manifest_current(self.config.output_root):
             raise ScientificAbort("Final Stage 3M hash manifest is inconsistent")
         freeze = json.loads((self.config.output_root / "manifests" / "TEACHER_FREEZE.json").read_text(encoding="utf-8")); policy_sha = sha256_object(SELECTION_POLICY)
-        ready = self.config.output_root / "MANYTX_STAGE3M_READY.txt"; not_ready = self.config.output_root / "MANYTX_STAGE3M_NOT_READY.txt"
         if not_ready.exists(): not_ready.unlink()
         ready_text = (
             "MANYTX_STAGE3M_READY\n" f"teacher_version={TEACHER_VERSION}\n" "objective=CE_SUPCON_PROTOTYPE\nsource_arm=A3\n"
@@ -1078,6 +1180,12 @@ class Stage3MPipeline:
             + "final_zero_day_evaluation_performed=NO\nsurrogate_training_performed=NO\nxai_performed=NO\nnext_stage=STAGE_3_5M\n"
         )
         atomic_text(ready, ready_text, self.config.output_root)
+        if not ready.is_file() or not final_hash_manifest_current(self.config.output_root):
+            raise ScientificAbort("READY marker or final hash manifest failed post-write verification")
+        final_products = [self.config.output_root / relative for relative in FINAL_STAGE_REQUIRED_RELATIVE_PATHS]
+        self.complete_stage(10, "Final Audit and READY Gate", final_products, [self.stage_manifest_path(stage) for stage in range(1, 10)])
+        if not self.stage_current(10):
+            raise ScientificAbort("Stage-10 atomic completion checkpoint failed final resume verification")
         print("\nMANYTX_STAGE3M_READY")
 
     def run(self) -> None:

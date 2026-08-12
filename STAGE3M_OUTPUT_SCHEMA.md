@@ -9,7 +9,7 @@ All persistent runtime outputs are confined to `<branch-root>/04_canonical_teach
 | `checkpoints/canonical/` | `canonical_teacher_v1_0.pt`, `canonical_teacher_state_dict.pt` |
 | `manifests/` | Input freeze, candidate provenance, architecture equivalence, sampling, stage checkpoints, final status, hash manifests |
 | `metrics/confusion_matrices/` | One 98×98 NumPy matrix per seed/protocol |
-| `tables/` | Known/per-class/representation/degradation/selection CSV tables and optional Calibration Unknown diagnostics |
+| `tables/` | Known/per-class/representation/degradation/selection CSV tables and optional Calibration Unknown diagnostics; representation rows persist observed/missing class coverage and `OBSERVED_CLASSES` frame |
 | `embeddings/seed_<seed>/<protocol>/` | Complete-manifest-bound float16 embedding/logit memmaps plus labels and global indices |
 | `statistics/` | Across-seed known-domain descriptive summaries |
 | `reports/` | Scientific report, model card, selection report, and robustness report |
@@ -18,8 +18,8 @@ All persistent runtime outputs are confined to `<branch-root>/04_canonical_teach
 | `performance/` | Verified opaque local-cache report |
 | `logs/` | Stage 3M execution log |
 
-An embedding store is reusable only when `INCOMPLETE` is absent, all four arrays exist, `store_manifest.json` says `complete: true`, and its checkpoint SHA and row count match the current request.
+An embedding store is reusable only when `INCOMPLETE` is absent, all four arrays exist with exact expected shapes, `store_manifest.json` says `complete: true`, and its checkpoint SHA and row count match the current request. `REPRESENTATION_METRIC_SAMPLING.json` records exact effective RNG seeds and hashes both selected store positions and selected frozen global indices.
 
 `TEACHER_FREEZE.json` records selected seed, source arm/objective, frozen hashes, architecture, selection-policy hash, source/canonical checkpoint hashes, metrics, provenance chain, strict counters, and freeze time. `TEACHER_HASH_MANIFEST.json` hashes both canonical exports and the freeze/model-card artifacts.
 
-`MANYTX_STAGE3M_READY.txt` is created last and is mutually exclusive with `MANYTX_STAGE3M_NOT_READY.txt`. It identifies the selected teacher and explicitly records final zero-day evaluation, surrogate training, and XAI as `NO`.
+`STAGE3M_HASH_MANIFEST.json` declares and justifies four recursion/transaction exclusions: itself, the Stage-10 completion checkpoint, and mutually exclusive READY/NOT_READY markers. `MANYTX_STAGE3M_READY.txt` is created only after that manifest verifies. The Stage-10 checkpoint is written last and hash-binds READY, the final manifest, canonical exports, freeze metadata, status, and required publication outputs. READY identifies the selected teacher and explicitly records final zero-day evaluation, surrogate training, and XAI as `NO`.

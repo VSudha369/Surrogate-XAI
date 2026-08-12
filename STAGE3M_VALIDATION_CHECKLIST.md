@@ -11,10 +11,14 @@
 - [ ] Stage 2.6M and Stage 3M parameter count, state keys, tensor shapes, forward shapes, embedding normalization, and deterministic evaluation match.
 - [ ] Correct synthetic A3 checkpoint is accepted; A0/A1/A2, wrong seed/hash/config/architecture/loss, and corrupt state are rejected.
 - [ ] All five deterministic selection hierarchy cases pass under shuffled row order.
+- [ ] P0 representation geometry passes with 98 observed classes and aborts with 97; sparse non-dense P2/P3 class panels pass with finite observed-class geometry.
+- [ ] Representation sampling reruns reproduce identical selected positions and identical position/global-index SHA-256 values.
 - [ ] Five strict-access kinds are rejected and a pristine production guard remains all-zero.
 - [ ] Partial/stale embedding stores are invalidated and complete hash/row-current stores are reusable.
 - [ ] No invalid `%,d` format exists and representative runtime formatting passes.
 - [ ] READY gate fails when any one required gate is false.
+- [ ] Stage 10 is stale when READY is absent or the final manifest is absent/corrupt, and current only when every final product/hash is valid.
+- [ ] `--preflight` maps to Stages 01–03 only and cannot evaluate, select, export, execute Stage 10, or create READY.
 
 Run:
 

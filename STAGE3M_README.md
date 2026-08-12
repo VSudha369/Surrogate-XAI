@@ -21,6 +21,8 @@ python -u Stage3M_Colab_Launcher_v1_0_0.py --teacher-source stage2_6m_promote --
 
 Set `WISIG_BRANCH_ROOT` only if Drive contains multiple matching branch roots. The value must end in `MANYTX_ZERO_DAY_BRANCH_v1.0.3`. The launcher accepts paths containing spaces.
 
-Preflight runs Stages 01–03 and cannot create READY. The full command uses hash-bound resume and evaluates the real Drive benchmark. It neither resets nor modifies Stage 2.6M.
+Preflight runs Stages 01–03 and cannot evaluate candidates, select/export a teacher, execute Stage 10, or create READY. The full command uses hash-bound resume and evaluates the real Drive benchmark. It neither resets nor modifies Stage 2.6M.
+
+Representation geometry is explicitly observed-class geometry. P2/P3 may contain fewer than 98 transmitter identities; coverage and deterministic sampling hashes are persisted per seed/protocol. P0 must contain all 98 classes because P0 Fisher ratio is the frozen fourth-level selection tie-break. Stage 10 is transaction-safe: the final hash manifest and READY marker verify before its atomic completion checkpoint is written.
 
 See [STAGE3M_SCIENTIFIC_PROTOCOL.md](STAGE3M_SCIENTIFIC_PROTOCOL.md), [STAGE3M_OUTPUT_SCHEMA.md](STAGE3M_OUTPUT_SCHEMA.md), and [STAGE3M_VALIDATION_CHECKLIST.md](STAGE3M_VALIDATION_CHECKLIST.md).

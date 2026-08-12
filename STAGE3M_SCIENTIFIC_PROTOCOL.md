@@ -33,8 +33,14 @@ The selection policy is written and hashed before selection. Candidates are orde
 
 Calibration Unknown and all strict/final data are excluded from selection.
 
+## Representation frame and sampling provenance
+
+Classification retains both observed-class and fixed-98 frames; absent identities receive zero only in the fixed-98 classification frame. Representation geometry is different: centroids and clustering statistics are defined only for identities with samples in a protocol. Silhouette, Davies–Bouldin, Calinski–Harabasz, intra/inter-class distance, Fisher ratio, separation, and compactness therefore use the explicitly labeled `OBSERVED_CLASSES` frame. P1/P2/P3 may legitimately omit identities. P0 must contain all 98 identities for every candidate because only P0 Fisher ratio participates in teacher selection.
+
+Each representation sampling record binds the base seed, derived effective seed, candidate seed, protocol, observed-class coverage, per-class cap, sampled row count, sampled-position SHA-256, and sampled global-index SHA-256. Original transmitter labels need not be dense; the implementation uses an explicit label-to-centroid mapping.
+
 ## Stages and freeze criterion
 
-The ten hash-bound resumable stages verify predecessors, audit candidates, prove architecture equivalence, evaluate known domains, calculate representation diagnostics, analyze degradation, optionally describe Calibration Unknown, select deterministically, export weights, and run the final READY audit. Stage manifests bind executable, configuration, benchmark, predecessor, input, and output hashes.
+The ten hash-bound resumable stages verify predecessors, audit candidates, prove architecture equivalence, evaluate known domains, calculate representation diagnostics, analyze degradation, optionally describe Calibration Unknown, select deterministically, export weights, and run the final READY audit. Stage manifests bind executable, configuration, benchmark, predecessor, input, and output hashes. Stage 10 writes and verifies its final hash manifest and READY marker before atomically writing `STAGE_10_CHECKPOINT.json`; an interrupted or corrupt final transaction is never considered reusable.
 
 Stage 3M is implemented but not scientifically frozen until a canonical Drive run produces `MANYTX_STAGE3M_READY.txt` with complete P0–P3 artifacts, exact source/export weight equivalence, all required hashes, and five zero strict-access counters.

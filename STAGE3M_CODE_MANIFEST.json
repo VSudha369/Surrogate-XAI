@@ -1,7 +1,7 @@
 {
   "artifact_name": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0",
   "pipeline_version": "1.0.0",
-  "generation_timestamp": "2026-08-12T11:54:49.9486574+00:00",
+  "generation_timestamp": "2026-08-12T12:54:55.1705312+00:00",
   "parent_git_commit": "90dfea2c3be0ba009387d4a1ad7fc6848104a4dd",
   "benchmark": {
     "name": "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3",
@@ -35,15 +35,15 @@
     "prototype_momentum": 0.95
   },
   "files": [
-    {"path": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.py", "bytes": 74066, "sha256": "e39fb54c8b51f4ad7721c8d0c131c3eead68a4da2a38f0fe4cfdb5f2b9bd0819"},
+    {"path": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.py", "bytes": 81251, "sha256": "37485a6496ea8bbc3499bc150f81c10cbe6cafadfd0e3fad0bc1121593601575"},
     {"path": "Stage3M_Colab_Launcher_v1_0_0.py", "bytes": 7890, "sha256": "e795c98386e3ebb3e8d6075d820bca732bd3cb281646dafff331b5fa2c097e84"},
     {"path": "stage3m_config_v1_0_0.example.json", "bytes": 638, "sha256": "e41982dcaa3dcf257e10a4a090fe10d30566394a08dd834461cf47f73d8328ca"},
-    {"path": "validate_stage3m_v1_0_0.py", "bytes": 11631, "sha256": "b3ee38118e567f6b2ff1710d003a6a3b55830b6bf1201a567f0e401ad1c7fc03"},
+    {"path": "validate_stage3m_v1_0_0.py", "bytes": 18863, "sha256": "8e7b83d5b55ea14928c02a86f122d70c992a0117a2fae96c7105a110905f3af5"},
     {"path": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.ipynb", "bytes": 1747, "sha256": "8679157b83a1de22970b4112ee0b63ce2a7336bd5f47df417ecdda3510281619"},
-    {"path": "STAGE3M_SCIENTIFIC_PROTOCOL.md", "bytes": 3187, "sha256": "f086a36a3f7cb8647a5f78efae70b5877deff94dd1b3bce1fd0c07d4ac6ef0c4"},
-    {"path": "STAGE3M_OUTPUT_SCHEMA.md", "bytes": 2105, "sha256": "211ee600088687f85731ce0e165d5996508bbec9ea67b51734369a781099744f"},
-    {"path": "STAGE3M_VALIDATION_CHECKLIST.md", "bytes": 2157, "sha256": "061096eac7f67cd535efd81f34b172328903fcd3fdb786e3d308bed4c81ad53a"},
-    {"path": "STAGE3M_README.md", "bytes": 1397, "sha256": "8b354a72ac52675c0838a0d21149b4cb88dd8f194900f5f2be780169c3badb96"},
+    {"path": "STAGE3M_SCIENTIFIC_PROTOCOL.md", "bytes": 4389, "sha256": "6285f25e84f6d4fe4c05352b18424c0ba1308aa68ad4df5b10910ac14e2c7819"},
+    {"path": "STAGE3M_OUTPUT_SCHEMA.md", "bytes": 2684, "sha256": "707133d308afb1b4a59aafbe040a3ec50635abd99f410b7334f5302b053c9e33"},
+    {"path": "STAGE3M_VALIDATION_CHECKLIST.md", "bytes": 2711, "sha256": "7139a781366c08bd9856145103fa4f90a453075630d3945439aa2c81c66e434b"},
+    {"path": "STAGE3M_README.md", "bytes": 1893, "sha256": "d0fd8e00fd39f5f902ce02e1ee2a6a829500fbc6e57dcbf1ca22a28b227513f1"},
     {"path": "requirements_stage3m.txt", "bytes": 134, "sha256": "f0388ee831d76fd81289e14c515817e652c7da32ecb360bcc2ade8bcfda25242"}
   ],
   "manifest_scope": {
@@ -64,8 +64,14 @@
     "embedding_store_resume_regressions": "PASS",
     "logging_regression": "PASS",
     "ready_gate_regressions": "PASS",
+    "missing_protocol_class_regressions": "PASS (P0=98; sparse non-dense P2/P3)",
+    "p0_full_class_enforcement": "PASS (97 observed classes rejected)",
+    "sampling_position_and_global_index_hash_reproducibility": "PASS",
+    "interrupted_stage10_resume_regressions": "PASS (A/B stale; C current)",
+    "preflight_scope_regression": "PASS (Stages 01-03 only; no READY)",
     "synthetic_validation": "PASS",
-    "offline_validator": "PASS (8/8)",
+    "stage2_6m_frozen_validator": "PASS",
+    "offline_validator": "PASS (11/11)",
     "manifest_and_zip_validation": "PASS (CRC AND BYTE-FOR-BYTE MEMBERS)"
   },
   "expected_colab_only_validation_status": {
