@@ -2,7 +2,7 @@
 
 ## Offline source validation
 
-- [ ] Python compilation and AST parsing pass for executable, launcher, and validator.
+- [ ] Python compilation and AST parsing pass for executable, launcher, Drive-audit module, and validator.
 - [ ] Pyflakes passes.
 - [ ] Notebook JSON parses as nbformat 4.
 - [ ] Code-manifest hashes and sizes match.
@@ -20,6 +20,10 @@
 - [ ] Stage 10 is stale when READY is absent or the final manifest is absent/corrupt, and current only when every final product/hash is valid.
 - [ ] `--preflight` maps to Stages 01–03 only and cannot evaluate, select, export, execute Stage 10, or create READY.
 
+- [ ] `--drive-audit` cannot instantiate the execution pipeline, run Stage 04+, train, select/export, or create READY.
+- [ ] Missing READY/hash/checkpoint/checkpoint-metadata evidence fails; all five structured strict-counter keys are mandatory.
+- [ ] P0 with 97 classes fails, P2/P3 missing identities pass, rounded report prose passes, and a scientific ranking disagreement fails.
+
 Run:
 
 ```bash
@@ -30,6 +34,7 @@ python Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.py --synthetic-validation
 ## Canonical Colab validation
 
 - [ ] Pull the reviewed `codex/stage3m` commit and install `requirements_stage3m.txt`.
+- [ ] `--drive-audit` writes five audit artifacts, reports `STAGE3M_DRIVE_AUDIT_PASS`, and creates no READY marker.
 - [ ] `--preflight` verifies the real benchmark, Stage 2M, Stage 2.6M READY/artifact, all three A3 checkpoints, and architecture equivalence.
 - [ ] Full `--resume` run completes P0–P3 metrics and representation diagnostics for every seed.
 - [ ] Selection is determined only by the predeclared hierarchy.

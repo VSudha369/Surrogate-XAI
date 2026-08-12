@@ -32,6 +32,7 @@ from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silho
 from torch.utils.data import DataLoader
 
 from stage2_6m_performance_v1_0_2 import BatchedSignalDataset, LocalCacheManager, identity_collate
+from stage3m_drive_audit_v1_0_0 import canonical_strict_counters, run_drive_audit
 
 
 PIPELINE_VERSION = "1.0.0"
@@ -336,6 +337,7 @@ class Stage3MConfig:
     stage_end: int = 10
     resume: bool = True
     preflight: bool = False
+    drive_audit: bool = False
 
     @property
     def branch_root_path(self) -> Path:
@@ -721,7 +723,7 @@ class Stage3MPipeline:
             raise ScientificAbort("Stage 2.6M final status is not the frozen A3 decision")
         if objective.get("decision") != EXPECTED_STAGE26_DECISION or objective.get("selected_arm") != "A3" or objective.get("loss_coefficients") != EXPECTED_LOSS:
             raise ScientificAbort("Stage 2.6M canonical objective mismatch")
-        if any(status.get("strict_zero_day_violation_counters", {}).values()):
+        if any(canonical_strict_counters(status).values()):
             raise ScientificAbort("Stage 2.6M final strict-zero-day counters are non-zero")
         self.stage26_status = status
         self.stage26_hash_manifest = json.loads(hash_path.read_text(encoding="utf-8"))
@@ -1229,7 +1231,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--config", type=Path); parser.add_argument("--branch-root"); parser.add_argument("--repository-root")
     parser.add_argument("--stage-start", type=int); parser.add_argument("--stage-end", type=int); parser.add_argument("--device")
     parser.add_argument("--teacher-source", choices=("stage2_6m_promote",)); parser.add_argument("--resume", action="store_true"); parser.add_argument("--no-resume", action="store_true")
-    parser.add_argument("--preflight", action="store_true"); parser.add_argument("--synthetic-validation", action="store_true")
+    parser.add_argument("--preflight", action="store_true"); parser.add_argument("--drive-audit", action="store_true"); parser.add_argument("--synthetic-validation", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -1245,16 +1247,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if value is not None: values[name] = value
     if args.resume and args.no_resume:
         raise ValueError("--resume and --no-resume are mutually exclusive")
+    if args.drive_audit and args.preflight:
+        raise ValueError("--drive-audit and --preflight are mutually exclusive; preflight runs the Drive audit automatically")
     if args.resume: values["resume"] = True
     if args.no_resume: values["resume"] = False
     if args.preflight:
         values.update({"preflight": True, "stage_start": 1, "stage_end": 3})
+    if args.drive_audit:
+        values["drive_audit"] = True
     if "branch_root" not in values:
         values["branch_root"] = os.environ.get("WISIG_BRANCH_ROOT", "/content/drive/MyDrive/colab files /Surrogate-XAI/project_root/MANYTX_ZERO_DAY_BRANCH_v1.0.3")
     config = Stage3MConfig(**values)
     try:
+        if config.drive_audit:
+            run_drive_audit(config, validate_candidate_checkpoint_payload)
+            print("STAGE3M_DRIVE_AUDIT_PASS")
+            return 0
+        if config.preflight:
+            run_drive_audit(config, validate_candidate_checkpoint_payload)
         Stage3MPipeline(config).run(); return 0
     except Exception as exc:
+        if config.drive_audit:
+            print(f"STAGE3M_DRIVE_AUDIT_FAIL\n{type(exc).__name__}: {exc}", file=sys.stderr)
+            raise
         output = config.output_root; output.mkdir(parents=True, exist_ok=True)
         ready = output / "MANYTX_STAGE3M_READY.txt"
         if ready.exists(): ready.unlink()

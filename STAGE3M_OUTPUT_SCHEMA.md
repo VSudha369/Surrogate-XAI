@@ -4,6 +4,7 @@ All persistent runtime outputs are confined to `<branch-root>/04_canonical_teach
 
 | Directory | Principal artifacts |
 |---|---|
+| `audit/` | Drive predecessor inventory/reconstruction, exact class coverage, CPU-only A3 checkpoint audit, report/table consistency, and Stage 2.6M embedding-store compatibility evidence |
 | `configs/` | Effective configuration and predeclared `CANONICAL_TEACHER_SELECTION_POLICY.json` |
 | `checkpoints/candidates/seed_<seed>/` | Byte-identical promoted A3 best-selection checkpoints |
 | `checkpoints/canonical/` | `canonical_teacher_v1_0.pt`, `canonical_teacher_state_dict.pt` |
@@ -19,6 +20,8 @@ All persistent runtime outputs are confined to `<branch-root>/04_canonical_teach
 | `logs/` | Stage 3M execution log |
 
 An embedding store is reusable only when `INCOMPLETE` is absent, all four arrays exist with exact expected shapes, `store_manifest.json` says `complete: true`, and its checkpoint SHA and row count match the current request. `REPRESENTATION_METRIC_SAMPLING.json` records exact effective RNG seeds and hashes both selected store positions and selected frozen global indices.
+
+`--drive-audit` writes `STAGE3M_DRIVE_PREDECESSOR_AUDIT.json/.md`, `STAGE3M_DRIVE_CLASS_COVERAGE_AUDIT.json`, `STAGE3M_DRIVE_A3_CHECKPOINT_AUDIT.json`, and `STAGE3M_DRIVE_REPORT_CONSISTENCY.json` under `audit/`. It never writes a READY marker and never opens strict-zero-day signal or label arrays.
 
 `TEACHER_FREEZE.json` records selected seed, source arm/objective, frozen hashes, architecture, selection-policy hash, source/canonical checkpoint hashes, metrics, provenance chain, strict counters, and freeze time. `TEACHER_HASH_MANIFEST.json` hashes both canonical exports and the freeze/model-card artifacts.
 

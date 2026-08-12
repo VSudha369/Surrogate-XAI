@@ -23,6 +23,13 @@ STRICT_KEYS = (
     "strict_zero_day_embedding_read_violations", "strict_zero_day_metric_read_violations",
     "strict_zero_day_threshold_read_violations",
 )
+FINAL_STATUS_STRICT_KEY_MAP = {
+    STRICT_KEYS[0]: "strict_test_signal_reads",
+    STRICT_KEYS[1]: "strict_test_label_reads",
+    STRICT_KEYS[2]: "strict_test_embedding_reads",
+    STRICT_KEYS[3]: "strict_test_metric_reads",
+    STRICT_KEYS[4]: "strict_test_threshold_reads",
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -58,7 +65,11 @@ def locate_branch_root() -> Path:
             raise RuntimeError(f"WISIG_BRANCH_ROOT must end in {BRANCH_NAME}")
         return candidate
     roots = [path for path in Path("/content/drive/MyDrive").rglob(BRANCH_NAME) if path.is_dir()]
-    valid = [path.resolve() for path in roots if (path / "03_representation_ablation" / "MANYTX_STAGE2_6M_READY.txt").is_file()]
+    valid = [
+        path.resolve() for path in roots
+        if all((path / name).is_dir() for name in ("01_benchmark_engineering", "02_benchmark_diagnostics", "03_representation_ablation"))
+        and (path / "03_representation_ablation" / "MANYTX_STAGE2_6M_READY.txt").is_file()
+    ]
     if len(valid) != 1:
         raise RuntimeError(f"Expected exactly one READY canonical branch root; found {valid}")
     return valid[0]
@@ -82,7 +93,14 @@ def verify_stage26(branch_root: Path) -> None:
     status = json.loads(status_path.read_text(encoding="utf-8"))
     if status.get("decision") != EXPECTED_DECISION or status.get("selected_arm") != "A3":
         raise RuntimeError("Stage 2.6M final status does not freeze A3")
-    if any(status.get("strict_zero_day_violation_counters", {}).values()):
+    structured = status.get("strict_zero_day_violation_counters")
+    if not isinstance(structured, dict):
+        raise RuntimeError("Stage 2.6M structured strict-counter object is missing")
+    missing = [source for source in FINAL_STATUS_STRICT_KEY_MAP.values() if source not in structured]
+    if missing:
+        raise RuntimeError(f"Stage 2.6M structured strict counters are incomplete: {missing}")
+    canonical = {target: int(structured[source]) for target, source in FINAL_STATUS_STRICT_KEY_MAP.items()}
+    if any(canonical.values()):
         raise RuntimeError("Stage 2.6M structured strict counters are non-zero")
     print("[PASS] Stage 2.6M READY, artifact SHA, A3 decision, and strict counters verified")
 
@@ -153,7 +171,7 @@ def main() -> None:
     command.extend(sys.argv[1:])
     environment = dict(os.environ); environment["PYTHONUNBUFFERED"] = "1"
     subprocess.check_call(command, env=environment)
-    if "--preflight" not in sys.argv[1:]:
+    if not ({"--preflight", "--drive-audit"} & set(sys.argv[1:])):
         ready = branch_root / "04_canonical_teacher" / "MANYTX_STAGE3M_READY.txt"
         if not ready.is_file():
             raise RuntimeError(f"Stage 3M READY marker missing after successful exit: {ready}")

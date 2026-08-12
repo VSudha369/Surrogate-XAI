@@ -30,6 +30,7 @@ STAGE26 = ROOT / "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0
 NOTEBOOK = ROOT / "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.ipynb"
 MANIFEST = ROOT / "STAGE3M_CODE_MANIFEST.json"
 PACKAGE = ROOT / "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.zip"
+DRIVE_AUDIT = ROOT / "stage3m_drive_audit_v1_0_0.py"
 
 
 def sha256_file(path: Path) -> str:
@@ -59,7 +60,7 @@ def expect_abort(module: Any, operation: Callable[[], Any]) -> None:
 
 
 def test_static(module: Any, require_package: bool) -> None:
-    for path in (MAIN, LAUNCHER, ROOT / "validate_stage3m_v1_0_0.py"):
+    for path in (MAIN, LAUNCHER, DRIVE_AUDIT, ROOT / "validate_stage3m_v1_0_0.py"):
         source = path.read_text(encoding="utf-8")
         ast.parse(source, filename=str(path))
         compile(source, str(path), "exec")
@@ -68,7 +69,7 @@ def test_static(module: Any, require_package: bool) -> None:
     notebook = json.loads(NOTEBOOK.read_text(encoding="utf-8"))
     assert notebook["nbformat"] == 4 and notebook.get("cells")
     pyflakes = subprocess.run(
-        [sys.executable, "-m", "pyflakes", str(MAIN), str(LAUNCHER), str(Path(__file__))],
+        [sys.executable, "-m", "pyflakes", str(MAIN), str(LAUNCHER), str(DRIVE_AUDIT), str(Path(__file__))],
         capture_output=True, text=True, check=False,
     )
     if pyflakes.returncode:
@@ -306,18 +307,21 @@ def test_preflight_scope(module: Any) -> None:
         branch = Path(temporary) / module.CANONICAL_BRANCH
         captured: Dict[str, Any] = {}
         original_pipeline = module.Stage3MPipeline
+        original_audit = module.run_drive_audit
         class CapturePipeline:
             def __init__(self, config: Any):
                 captured["config"] = config
             def run(self) -> None:
                 captured["run"] = True
         module.Stage3MPipeline = CapturePipeline
+        module.run_drive_audit = lambda config, validator: captured.setdefault("audit", True)
         try:
             assert module.main(["--preflight", "--branch-root", str(branch)]) == 0
         finally:
             module.Stage3MPipeline = original_pipeline
+            module.run_drive_audit = original_audit
         config = captured["config"]
-        assert captured["run"] and config.preflight is True and config.stage_start == 1 and config.stage_end == 3
+        assert captured["audit"] and captured["run"] and config.preflight is True and config.stage_start == 1 and config.stage_end == 3
         calls: list[int] = []
         harness = original_pipeline.__new__(original_pipeline)
         harness.config = SimpleNamespace(stage_start=1, stage_end=3, preflight=True)
@@ -327,6 +331,106 @@ def test_preflight_scope(module: Any) -> None:
         original_pipeline.run(harness)
         assert calls == [1, 2, 3]
         assert not (branch / "04_canonical_teacher" / "MANYTX_STAGE3M_READY.txt").exists()
+
+
+def test_drive_audit_mode(module: Any) -> None:
+    audit_module = load_module(DRIVE_AUDIT, "stage3m_drive_audit_validator")
+    good = {source: 0 for source in audit_module.FINAL_STATUS_STRICT_KEY_MAP.values()}
+    canonical = audit_module.canonical_strict_counters({"strict_zero_day_violation_counters": good})
+    assert set(canonical) == set(audit_module.READY_STRICT_KEYS) and not any(canonical.values())
+    for source in good:
+        malformed = dict(good); malformed.pop(source)
+        try:
+            audit_module.canonical_strict_counters({"strict_zero_day_violation_counters": malformed})
+        except audit_module.DriveAuditError:
+            pass
+        else:
+            raise AssertionError("Missing structured strict counter must fail")
+
+    rows = []
+    missing = {"p0": set(), "p1": set(), "p2": {72}, "p3": {50, 52, 58, 71, 72}}
+    for seed in (42, 123, 2026):
+        for protocol in ("p0", "p1", "p2", "p3"):
+            for label in range(98):
+                rows.append({"arm": "A3", "seed": seed, "protocol": protocol, "class_index": label, "support": 0 if label in missing[protocol] else 3})
+    coverage = audit_module.class_coverage_from_per_class(pd.DataFrame(rows))
+    assert coverage["protocols"]["p0"]["observed_class_count"] == 98
+    assert coverage["protocols"]["p2"]["missing_class_ids"] == [72]
+    assert coverage["protocols"]["p3"]["missing_class_ids"] == [50, 52, 58, 71, 72]
+    bad = pd.DataFrame(rows); bad.loc[(bad.protocol == "p0") & (bad.class_index == 97), "support"] = 0
+    try:
+        audit_module.class_coverage_from_per_class(bad)
+    except audit_module.DriveAuditError:
+        pass
+    else:
+        raise AssertionError("P0 with 97 observed classes must fail")
+
+    facts = {
+        "paired_mean_gain": 0.014854654467257533,
+        "paired_ci_low": 0.009930833520440108,
+        "paired_ci_high": 0.020772814494475544,
+        "a3_protocol_macro_f1": {"p0": 0.8638864, "p1": 0.62955027, "p2": 0.3919334, "p3": 0.3323978},
+        "a3_p0_fisher_mean": 1.9547617,
+    }
+    reports = {
+        "objective_selection_report": "`A3` ranked first. 0.014855 [0.009931, 0.020773] SELECT_CE_SUPCON_PROTOTYPE",
+        "known_tx_evaluation_report": "A3 0.863886 0.629550 0.391933 0.332398",
+        "embedding_separability_report": "A3 1.95476",
+        "statistical_comparison_report": "A3_vs_A0 0.014855 0.009931 0.020773",
+    }
+    assert audit_module.assess_report_consistency(facts, reports)["status"] == "PASS"
+    disagree = dict(reports); disagree["objective_selection_report"] = "`A0` ranked first. SELECT_CE"
+    assert audit_module.assess_report_consistency(facts, disagree)["status"] == "FAIL"
+
+    source = DRIVE_AUDIT.read_text(encoding="utf-8")
+    assert "checkpoint SHA mismatch" in source and "checkpoint_validator" in source
+    assert "Stage 2.6M READY marker disagrees" in source and "Required predecessor artifacts missing" in source
+    assert "MANYTX_STAGE3M_READY" not in source and "optimizer.step" not in source and "backward(" not in source
+    with tempfile.TemporaryDirectory() as temporary:
+        branch = Path(temporary) / module.CANONICAL_BRANCH
+        captured: Dict[str, Any] = {}
+        original_pipeline, original_audit = module.Stage3MPipeline, module.run_drive_audit
+        class ForbiddenPipeline:
+            def __init__(self, config: Any):
+                raise AssertionError("--drive-audit must not instantiate Stage3MPipeline")
+        module.Stage3MPipeline = ForbiddenPipeline
+        module.run_drive_audit = lambda config, validator: captured.setdefault("audit", config)
+        try:
+            assert module.main(["--drive-audit", "--branch-root", str(branch)]) == 0
+        finally:
+            module.Stage3MPipeline, module.run_drive_audit = original_pipeline, original_audit
+        assert captured["audit"].drive_audit is True
+        assert not (branch / "04_canonical_teacher" / "MANYTX_STAGE3M_READY.txt").exists()
+
+
+def test_drive_audit_failure_matrix() -> None:
+    audit_module = load_module(DRIVE_AUDIT, "stage3m_drive_audit_failure_validator")
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        try:
+            audit_module.discover_unique_drive_root(root)
+        except audit_module.DriveAuditError:
+            pass
+        else:
+            raise AssertionError("Missing READY root must fail")
+        candidate = root / "MANYTX_ZERO_DAY_BRANCH_v1.0.3"
+        for name in ("01_benchmark_engineering", "02_benchmark_diagnostics", "03_representation_ablation"):
+            (candidate / name).mkdir(parents=True)
+        ready = candidate / "03_representation_ablation/MANYTX_STAGE2_6M_READY.txt"
+        ready.write_text("MANYTX_STAGE2_6M_READY\n", encoding="utf-8")
+        assert audit_module.discover_unique_drive_root(root) == candidate.resolve()
+        second = root / "nested/MANYTX_ZERO_DAY_BRANCH_v1.0.3"
+        for name in ("01_benchmark_engineering", "02_benchmark_diagnostics", "03_representation_ablation"):
+            (second / name).mkdir(parents=True)
+        (second / "03_representation_ablation/MANYTX_STAGE2_6M_READY.txt").write_text("MANYTX_STAGE2_6M_READY\n", encoding="utf-8")
+        try:
+            audit_module.discover_unique_drive_root(root)
+        except audit_module.DriveAuditError:
+            pass
+        else:
+            raise AssertionError("Multiple READY roots must fail")
+    assert "Required predecessor artifacts missing" in DRIVE_AUDIT.read_text(encoding="utf-8")
+    assert "checkpoint SHA mismatch" in DRIVE_AUDIT.read_text(encoding="utf-8")
 
 
 def main() -> int:
@@ -347,6 +451,8 @@ def main() -> int:
         "logging_and_ready_gate": lambda: test_logging_and_ready(module),
         "interrupted_stage10_resume": lambda: test_interrupted_stage10_resume(module),
         "preflight_scope": lambda: test_preflight_scope(module),
+        "drive_audit_mode": lambda: test_drive_audit_mode(module),
+        "drive_audit_failure_matrix": test_drive_audit_failure_matrix,
     }
     for name, operation in tests.items():
         operation(); print(f"[PASS] {name}")

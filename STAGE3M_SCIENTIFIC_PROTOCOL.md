@@ -21,6 +21,14 @@ Candidate checkpoint acceptance requires exact arm, seed, benchmark SHA, Stage 2
 
 P0, P1, P2, and P3 are allowed for frozen forward-only known validation. Calibration Unknown is disabled by default and, if enabled, is descriptive only. Train Known is provenance-only in the canonical implementation. Strict Zero-Day Test and Strict Zero-Day Shift Test signals, labels, embeddings, metrics, and thresholds are structurally rejected and separately counted. Every counter must be zero at the READY gate.
 
+## Google Drive predecessor audit
+
+`--drive-audit` is a read-only predecessor command. It discovers the unique READY branch root, inventories Stage 1B/2M/2.6M, verifies hash manifests and report/table consistency, measures class coverage from the frozen per-class table, validates all three A3 checkpoints on CPU, and audits A3 embedding-store identity. It writes only evidence below `04_canonical_teacher/audit`, does not run Stages 04-10, and has no teacher-selection, export, training, strict-signal, surrogate, XAI, or READY path. `--preflight` requires this audit to pass before Stages 01-03.
+
+The Stage 2.6M READY marker publishes canonical `strict_zero_day_*_violations` names, while the frozen structured final status stores the five facts as `strict_test_*_reads` inside `strict_zero_day_violation_counters`. Stage 3M maps and requires every real structured key explicitly; a missing counter is a provenance failure, never an implicit zero.
+
+The audited frozen class coverage is P0=98, P1=98, P2=97 (missing 72), and P3=93 (missing 50, 52, 58, 71, 72). All observed classes have at least two samples. These are predecessor facts, not hard-coded replacements for Stage 3M evaluation.
+
 ## Deterministic selection
 
 The selection policy is written and hashed before selection. Candidates are ordered by:
