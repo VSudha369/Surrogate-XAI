@@ -1,0 +1,100 @@
+{
+  "artifact_name": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0",
+  "pipeline_version": "1.0.0",
+  "generation_timestamp": "2026-08-12T13:55:00+00:00",
+  "parent_git_commit": "3c1be1eb2e2b3ca60a9be95109e6656c4f7fbee5",
+  "benchmark": {
+    "name": "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3",
+    "sha256": "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9"
+  },
+  "stage2m": {
+    "version": "1.0.5",
+    "script_sha256": "46c95bbf9fb6806a5f463b4e173434a5f03f013367b1bcd38ebb73c07d0f67ba",
+    "artifact_manifest_sha256": "0a8853d782006ce8af2d7b798a61c1e141afbeb55066cb70115ae41c8d24f16a"
+  },
+  "stage2_6m": {
+    "artifact_sha256": "83b1eec28b36afd39fffb4d3b719d92ccd3f0caaa270df0d16f4f28eab209660",
+    "frozen_decision": "SELECT_CE_SUPCON_PROTOTYPE",
+    "source_arm": "A3",
+    "candidate_seeds": [42, 123, 2026]
+  },
+  "drive_audit": {
+    "status": "DRIVE_PREDECESSOR_AUDIT_PASS",
+    "canonical_root_discovery": "unique READY root",
+    "artifacts_written": "04_canonical_teacher/audit only",
+    "strict_zero_day_arrays_opened": false,
+    "stage3m_ready_created": false,
+    "class_coverage": {
+      "p0": {"observed": 98, "missing": []},
+      "p1": {"observed": 98, "missing": []},
+      "p2": {"observed": 97, "missing": [72]},
+      "p3": {"observed": 93, "missing": [50, 52, 58, 71, 72]}
+    }
+  },
+  "scientific_contract_summary": {
+    "canonical_mode": "PROMOTE_AND_VERIFY",
+    "teacher_source": "stage2_6m_promote",
+    "architecture_search": false,
+    "training_implemented": false,
+    "strict_zero_day_access": "FORBIDDEN",
+    "final_zero_day_evaluation": false,
+    "surrogate_training": false,
+    "xai": false,
+    "known_classes": 98,
+    "embedding_dimension": 128,
+    "parameter_count": 849634,
+    "objective": "CE + 0.1 SupCon + 0.1 Prototype",
+    "supcon_temperature": 0.07,
+    "prototype_momentum": 0.95
+  },
+  "files": [
+    {"path": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.py", "bytes": 82429, "sha256": "6628975ba5d3234e573ca3c1df050cd9e4654f06f68813522077ff9573511521"},
+    {"path": "Stage3M_Colab_Launcher_v1_0_0.py", "bytes": 8825, "sha256": "f3bcd9f4dd6dc2e2cfe242609a423e3f4f0f4e19e79ce417f442dc78fd1b7b44"},
+    {"path": "stage3m_drive_audit_v1_0_0.py", "bytes": 33245, "sha256": "6088d5d86820f0030449ce6ac56eed0be2075be1463d4b51262f895e5ed11c2f"},
+    {"path": "stage3m_config_v1_0_0.example.json", "bytes": 638, "sha256": "e41982dcaa3dcf257e10a4a090fe10d30566394a08dd834461cf47f73d8328ca"},
+    {"path": "validate_stage3m_v1_0_0.py", "bytes": 25082, "sha256": "8f53a58d738b36292702a15dbf910c56c314022e74e063496db9bcafd0ffc23c"},
+    {"path": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.ipynb", "bytes": 2055, "sha256": "a989214cdbff69286f6584cf23664f7effb19ddd0ed69cc492b6cd409c7b94a2"},
+    {"path": "STAGE3M_SCIENTIFIC_PROTOCOL.md", "bytes": 5582, "sha256": "ad5ea24a00fe03c3cf5ce9bc27cf0ebe14a8c71bcdb3d4e95895304f09679735"},
+    {"path": "STAGE3M_OUTPUT_SCHEMA.md", "bytes": 3175, "sha256": "645867a522ff79edefdba0f40abdf9d023d878d8f8c20ece22325edb48965fe8"},
+    {"path": "STAGE3M_VALIDATION_CHECKLIST.md", "bytes": 3231, "sha256": "64639d906c44ea725dedba1657a4e9f61c9f35bbdb0bf72fcff96545d95e9190"},
+    {"path": "STAGE3M_README.md", "bytes": 2619, "sha256": "415a8e56915e4a32a29822de587fd7d860b153946f29b936d974bde4a40218b6"},
+    {"path": "requirements_stage3m.txt", "bytes": 134, "sha256": "f0388ee831d76fd81289e14c515817e652c7da32ecb360bcc2ade8bcfda25242"}
+  ],
+  "manifest_scope": {
+    "listed_files": 11,
+    "self_excluded_to_avoid_recursive_hashing": "STAGE3M_CODE_MANIFEST.json",
+    "package_excluded_to_avoid_manifest_package_hash_cycle": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.zip"
+  },
+  "validation_results": {
+    "python_compilation": "PASS",
+    "ast_parse": "PASS",
+    "pyflakes": "PASS",
+    "notebook_json": "PASS",
+    "architecture_equivalence": "PASS",
+    "stage03_positive_boolean_gate_regression": "PASS (gradients_disabled=True; no inverted false-valued pass gate)",
+    "parameter_count_equivalence": "PASS (849634)",
+    "checkpoint_provenance_regressions": "PASS",
+    "deterministic_selection_regressions": "PASS",
+    "strict_zero_day_guard_regressions": "PASS",
+    "embedding_store_resume_regressions": "PASS",
+    "logging_regression": "PASS",
+    "ready_gate_regressions": "PASS",
+    "missing_protocol_class_regressions": "PASS (Drive-measured P0=98, P1=98, P2=97, P3=93)",
+    "p0_full_class_enforcement": "PASS (97 observed classes rejected)",
+    "sampling_position_and_global_index_hash_reproducibility": "PASS",
+    "interrupted_stage10_resume_regressions": "PASS (A/B stale; C current)",
+    "preflight_scope_regression": "PASS (Drive audit + Stages 01-03 only; no READY)",
+    "drive_audit_scope_and_failure_matrix": "PASS",
+    "synthetic_validation": "PASS",
+    "stage2_6m_frozen_validator": "PASS",
+    "offline_validator": "PASS (13/13)",
+    "manifest_and_zip_validation": "PASS (CRC AND BYTE-FOR-BYTE MEMBERS)"
+  },
+  "expected_colab_only_validation_status": {
+    "status": "PENDING_CANONICAL_COLAB_EXECUTION",
+    "stage3m_freeze_state": "IMPLEMENTED_BUT_NOT_SCIENTIFICALLY_FROZEN",
+    "requires_real_frozen_benchmark": true,
+    "requires_real_stage2_6m_drive_artifacts": true,
+    "required_terminal_marker": "MANYTX_STAGE3M_READY"
+  }
+}
