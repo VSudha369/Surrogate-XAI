@@ -30,7 +30,14 @@
 - [x] Recovery rejects any strict-label file and contains no strict-signal/teacher/fitting path
 - [x] Persisted overlapping predictions and score vectors pass exact/tolerance integrity checks
 - [x] READY schema discloses post-lock recovery and all no-recomputation flags
-- [x] Stage-11 transaction writes READY before its checkpoint and validates final hashes
+- [x] Explicit/environment/recursive Drive-root discovery; zero and multiple roots abort
+- [x] Launcher distinguishes fresh, reviewed post-lock recovery, and already-READY states
+- [x] Recovery interruption matrix covers final status, hash manifest, READY, and post-Stage11 cleanup
+- [x] Stage-11 checkpoint is verified before NOT_READY deletion
+- [x] Second finalization is idempotent; cleanup-only mode does not recompute science
+- [x] Independent partition/scorer bootstrap streams are byte-repeatable with persisted seeds
+- [x] Original lock, sidecar, and both strict-store file sets remain byte-identical through recovery
+- [x] Atomic output writers enforce the Stage 3.5M root boundary
 - [x] Logging formatting regression
 - [x] Frozen Stage 3M and Stage 2.6M validators remain passing
 - [ ] Colab preflight against canonical Drive artifacts

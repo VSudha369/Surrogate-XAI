@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,9 +45,12 @@ EXPECTED_TEACHER_SHA256 = "ed8698ca9ac6ba813e6d74734ac16987129b0e3079b865f950297
 EXPECTED_BENCHMARK_SHA256 = "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9"
 EXPECTED_STAGE26_ARTIFACT_SHA256 = "83b1eec28b36afd39fffb4d3b719d92ccd3f0caaa270df0d16f4f28eab209660"
 EXPECTED_STAGE3M_HASH_MANIFEST_SHA256 = "5aeaa4a2b0ec65642853426dfea56223ea223bbd027769009f705b6fd59d3ea0"
+EXPECTED_STAGE2M_HASH_MANIFEST_SHA256 = "0a8853d782006ce8af2d7b798a61c1e141afbeb55066cb70115ae41c8d24f16a"
 RECOVERY_REASON = "STRICT_SHIFT_IS_FROZEN_SUBSET_NOT_DISJOINT"
 BOOTSTRAP_REPLICATES = 1000
 BOOTSTRAP_MAX_PER_GROUP = 20_000
+BOOTSTRAP_BASE_SEED = 3_500_001
+OVERLAP_TOLERANCE = 1e-5
 EXPECTED_NOT_READY_LINES = (
     "MANYTX_STAGE3_5M_NOT_READY",
     "ScientificAbort: Strict main and strict shift partitions overlap",
@@ -75,6 +79,22 @@ FINAL_HASH_EXCLUSIONS = {
     "manifests/STAGE3_5M_HASH_MANIFEST.json", "manifests/STAGE_11_CHECKPOINT.json",
     "MANYTX_STAGE3_5M_READY.txt", "MANYTX_STAGE3_5M_NOT_READY.txt",
 }
+REQUIRED_BRANCH_DIRECTORIES = (
+    "01_benchmark_engineering", "02_benchmark_diagnostics",
+    "03_representation_ablation", "04_canonical_teacher",
+)
+IMMUTABLE_STRICT_RELATIVE_PATHS = (
+    "manifests/STRICT_ZERO_DAY_EVALUATION_LOCK.json",
+    "manifests/STRICT_ZERO_DAY_EVALUATION_LOCK.sha256",
+    "scores/strict_zero_day_test/scores.npy",
+    "scores/strict_zero_day_test/predictions.npy",
+    "scores/strict_zero_day_test/global_indices.npy",
+    "scores/strict_zero_day_test/store_manifest.json",
+    "scores/strict_zero_day_shift_test/scores.npy",
+    "scores/strict_zero_day_shift_test/predictions.npy",
+    "scores/strict_zero_day_shift_test/global_indices.npy",
+    "scores/strict_zero_day_shift_test/store_manifest.json",
+)
 
 
 class RecoveryAbort(RuntimeError):
@@ -101,12 +121,84 @@ def sha256_int64_array(values: np.ndarray) -> str:
     return hashlib.sha256(np.ascontiguousarray(np.asarray(values, dtype=np.int64).reshape(-1)).tobytes()).hexdigest()
 
 
-def atomic_text(path: Path, value: str, root: Path) -> None:
+def validate_branch_root(path: Path) -> Path:
+    candidate = path.expanduser().resolve()
+    missing = [name for name in REQUIRED_BRANCH_DIRECTORIES if not (candidate / name).is_dir()]
+    ready = candidate / "04_canonical_teacher" / "MANYTX_STAGE3M_READY.txt"
+    if candidate.name != CANONICAL_BRANCH or missing or not ready.is_file():
+        raise RecoveryAbort(
+            f"Invalid canonical branch root {candidate}; expected {CANONICAL_BRANCH}, "
+            f"required directories {list(REQUIRED_BRANCH_DIRECTORIES)}, and Stage 3M READY"
+        )
+    return candidate
+
+
+def discover_branch_root(
+    explicit: Optional[Path] = None,
+    search_root: Path = Path("/content/drive/MyDrive"),
+    environment: Optional[Mapping[str, str]] = None,
+) -> Path:
+    """Resolve explicit, environment, then unique Drive root without guessing."""
+    if explicit is not None:
+        return validate_branch_root(explicit)
+    environ = os.environ if environment is None else environment
+    configured = environ.get("WISIG_BRANCH_ROOT")
+    if configured:
+        return validate_branch_root(Path(configured))
+    base = search_root.expanduser().resolve()
+    if not base.is_dir():
+        raise RecoveryAbort(
+            f"Google Drive search root is unavailable: {base}. Mount the Google account containing the canonical artifacts."
+        )
+    candidates: List[Path] = []
+    for path in base.rglob(CANONICAL_BRANCH):
+        if not path.is_dir():
+            continue
+        try:
+            candidates.append(validate_branch_root(path))
+        except RecoveryAbort:
+            continue
+    candidates = sorted(set(candidates))
+    if not candidates:
+        raise RecoveryAbort(
+            f"No valid {CANONICAL_BRANCH} root found under {base}; the wrong Google account may be mounted."
+        )
+    if len(candidates) != 1:
+        raise RecoveryAbort("Multiple valid canonical roots found; refusing to guess:\n" + "\n".join(map(str, candidates)))
+    return candidates[0]
+
+
+def git_commit(repository_root: Path) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repository_root), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    value = result.stdout.strip()
+    return value if len(value) == 40 else None
+
+
+def bootstrap_seed(partition: str, scorer: str, base_seed: int = BOOTSTRAP_BASE_SEED) -> int:
+    material = f"{base_seed}|{partition}|{scorer}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(material).digest()[:8], "big") % (2**63 - 1)
+
+
+def assert_within(path: Path, root: Path) -> Path:
     resolved, boundary = path.resolve(), root.resolve()
     if resolved != boundary and boundary not in resolved.parents:
         raise RecoveryAbort(f"Recovery output escapes Stage 3.5M root: {resolved}")
+    return resolved
+
+
+def atomic_text(path: Path, value: str, root: Path) -> None:
+    assert_within(path, root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp"); temporary.write_text(value, encoding="utf-8"); os.replace(temporary, path)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(value); handle.flush(); os.fsync(handle.fileno())
+    os.replace(temporary, path)
 
 
 def atomic_json(path: Path, value: Mapping[str, Any], root: Path) -> None:
@@ -114,8 +206,45 @@ def atomic_json(path: Path, value: Mapping[str, Any], root: Path) -> None:
 
 
 def atomic_csv(path: Path, value: pd.DataFrame, root: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True); temporary = path.with_name(path.name + ".tmp")
-    value.to_csv(temporary, index=False); os.replace(temporary, path)
+    assert_within(path, root); path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        value.to_csv(handle, index=False); handle.flush(); os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def generated_temporary(path: Path, root: Path) -> Path:
+    assert_within(path, root); path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.stem + ".tmp" + path.suffix)
+    assert_within(temporary, root)
+    return temporary
+
+
+def commit_generated(temporary: Path, path: Path, root: Path) -> None:
+    assert_within(temporary, root); assert_within(path, root)
+    if not temporary.is_file():
+        raise RecoveryAbort(f"Generated temporary output is missing: {temporary}")
+    with temporary.open("r+b") as handle:
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def verify_hash_manifest(output_root: Path, manifest_path: Path) -> bool:
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if payload.get("algorithm") != "SHA-256":
+            return False
+        rows = payload.get("files", [])
+        if int(payload.get("count", -1)) != len(rows):
+            return False
+        for row in rows:
+            path = assert_within(output_root / row["relative_path"], output_root)
+            if not path.is_file() or path.stat().st_size != int(row["bytes"]) or sha256_file(path) != row["sha256"]:
+                return False
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError, RecoveryAbort):
+        return False
+    return True
 
 
 def strict_subset_relationship(
@@ -209,18 +338,50 @@ class RecoveryEvidence:
     stores: Dict[str, Dict[str, Any]]
     relationship: Dict[str, Any]
     overlap: Dict[str, Any]
+    immutable_hashes: Dict[str, str]
 
 
 class PostLockRecovery:
-    def __init__(self, branch_root: Path, repository_root: Path):
-        self.branch_root = branch_root.expanduser().resolve(); self.repository_root = repository_root.expanduser().resolve()
-        if self.branch_root.name != CANONICAL_BRANCH:
-            raise RecoveryAbort(f"Branch root must end in {CANONICAL_BRANCH}")
+    def __init__(self, branch_root: Optional[Path], repository_root: Path, search_root: Path = Path("/content/drive/MyDrive")):
+        self.branch_root = discover_branch_root(branch_root, search_root=search_root)
+        self.repository_root = repository_root.expanduser().resolve()
         self.output_root = self.branch_root / "05_zero_day_open_set"
         self.recovery_sha = sha256_file(Path(__file__).resolve())
+        self.recovery_commit = git_commit(self.repository_root)
 
     def path(self, relative: str) -> Path:
         return self.output_root / relative
+
+    def ready_content(self) -> str:
+        lines = [
+            "MANYTX_STAGE3_5M_READY",
+            "teacher_version=1.0",
+            "teacher_seed=123",
+            f"teacher_sha256={EXPECTED_TEACHER_SHA256}",
+            f"benchmark_sha256={EXPECTED_BENCHMARK_SHA256}",
+            f"stage2_6m_artifact_sha256={EXPECTED_STAGE26_ARTIFACT_SHA256}",
+            f"stage3m_hash_manifest_sha256={EXPECTED_STAGE3M_HASH_MANIFEST_SHA256}",
+            "strict_protocol=ZD_STRICT",
+            "canonical_scorer=ALL_PREDECLARED",
+            "post_lock_recovery=YES",
+            f"post_lock_recovery_reason={RECOVERY_REASON}",
+            f"original_strict_scoring_executable_sha256={ORIGINAL_EXECUTABLE_SHA256}",
+            f"original_evaluation_lock_sha256={ORIGINAL_LOCK_SHA256}",
+            f"recovery_executable_sha256={self.recovery_sha}",
+            "strict_signal_reinference=NO",
+            "strict_scores_recomputed=NO",
+            "scorer_refit=NO",
+            "threshold_refit=NO",
+            "policy_changed=NO",
+            "strict_labels_loaded=NO",
+            "strict_shift_subset_of_main=YES",
+            *[f"{key}=0" for key in STRICT_COUNTER_KEYS],
+            "teacher_retrained=NO",
+            "surrogate_training_performed=NO",
+            "xai_performed=NO",
+            "next_stage=STAGE_4M",
+        ]
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _verify_file(path: Path, expected_sha: str, label: str) -> None:
@@ -235,6 +396,117 @@ class PostLockRecovery:
         if tuple(value.decode("utf-8").splitlines()) != EXPECTED_NOT_READY_LINES:
             raise RecoveryAbort("Original NOT_READY failure does not exactly match the reviewed subset abort")
         return value
+
+    def immutable_snapshot(self) -> Dict[str, str]:
+        snapshot: Dict[str, str] = {}
+        for relative in IMMUTABLE_STRICT_RELATIVE_PATHS:
+            path = self.path(relative)
+            if not path.is_file():
+                raise RecoveryAbort(f"Immutable original strict evidence is missing: {path}")
+            snapshot[relative] = sha256_file(path)
+        return snapshot
+
+    def verify_immutable_snapshot(self, before: Mapping[str, str]) -> Dict[str, bool]:
+        changed = {
+            relative: (not self.path(relative).is_file() or sha256_file(self.path(relative)) != expected)
+            for relative, expected in before.items()
+        }
+        if any(changed.values()):
+            raise RecoveryAbort(f"Original lock/strict store changed during recovery: {changed}")
+        return {
+            "original_lock_modified": changed["manifests/STRICT_ZERO_DAY_EVALUATION_LOCK.json"],
+            "strict_main_store_modified": any(changed[key] for key in changed if "/strict_zero_day_test/" in key),
+            "strict_shift_store_modified": any(changed[key] for key in changed if "/strict_zero_day_shift_test/" in key),
+        }
+
+    def checkpoint_current(self, stage: int) -> bool:
+        checkpoint = self.path(f"manifests/STAGE_{stage:02d}_CHECKPOINT.json")
+        try:
+            payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+            if stage >= 8 and payload.get("recovery_executable_sha256") != self.recovery_sha:
+                return False
+            for source, expected in payload.get("required_input_hashes", {}).items():
+                path = Path(source)
+                if not path.is_file() or sha256_file(path) != expected:
+                    return False
+            for row in payload.get("required_outputs", []):
+                path = Path(row["path"])
+                if not path.is_file() or path.stat().st_size != int(row["bytes"]) or sha256_file(path) != row["sha256"]:
+                    return False
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return False
+        return True
+
+    def stage11_current(self) -> bool:
+        ready = self.path("MANYTX_STAGE3_5M_READY.txt")
+        manifest = self.path("manifests/STAGE3_5M_HASH_MANIFEST.json")
+        status = self.path("manifests/STAGE3_5M_FINAL_STATUS.json")
+        if not (ready.is_file() and status.is_file() and self.checkpoint_current(11) and verify_hash_manifest(self.output_root, manifest)):
+            return False
+        try:
+            return ready.read_text(encoding="utf-8") == self.ready_content()
+        except OSError:
+            return False
+
+    def recovery_state(self) -> str:
+        ready = self.path("MANYTX_STAGE3_5M_READY.txt")
+        not_ready = self.path("MANYTX_STAGE3_5M_NOT_READY.txt")
+        stage11 = self.stage11_current()
+        if stage11 and ready.is_file():
+            if not_ready.is_file():
+                self.verify_not_ready()
+                return "CLEANUP_ONLY"
+            return "COMPLETE"
+        if not not_ready.is_file():
+            raise RecoveryAbort("Unsafe recovery state: neither reviewed NOT_READY nor a valid completed Stage-11 transaction exists")
+        self.verify_not_ready()
+        return "RESUMABLE_PARTIAL" if ready.is_file() or any(self.checkpoint_current(stage) for stage in range(8, 11)) else "PENDING"
+
+    @staticmethod
+    def _ready_values(path: Path) -> Tuple[str, Dict[str, str]]:
+        if not path.is_file():
+            raise RecoveryAbort(f"Required frozen READY marker is missing: {path}")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        return (lines[0] if lines else "", dict(line.split("=", 1) for line in lines[1:] if "=" in line))
+
+    def verify_predecessors(self) -> Dict[str, Any]:
+        engineering = self.branch_root / "01_benchmark_engineering"
+        diagnostics = self.branch_root / "02_benchmark_diagnostics"
+        stage26 = self.branch_root / "03_representation_ablation"
+        stage3m = self.branch_root / "04_canonical_teacher"
+        benchmark = engineering / "benchmark" / "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3.h5"
+        stage1_hash = engineering / "manifests" / "HASH_MANIFEST.json"
+        if not stage1_hash.is_file() or not benchmark.is_file() or sha256_file(benchmark) != EXPECTED_BENCHMARK_SHA256:
+            raise RecoveryAbort("Stage 1B frozen benchmark/hash-manifest verification failed")
+        stage2_status = diagnostics / "manifests" / "STAGE2M_FINAL_STATUS.json"
+        stage2_hash = diagnostics / "manifests" / "HASH_MANIFEST.json"
+        if not stage2_status.is_file() or not stage2_hash.is_file() or sha256_file(stage2_hash) != EXPECTED_STAGE2M_HASH_MANIFEST_SHA256:
+            raise RecoveryAbort("Stage 2M frozen status/hash-manifest verification failed")
+        if json.loads(stage2_status.read_text(encoding="utf-8")).get("status") != "MANYTX_STAGE2M_READY":
+            raise RecoveryAbort("Stage 2M final status is not READY")
+        stage26_marker, stage26_values = self._ready_values(stage26 / "MANYTX_STAGE2_6M_READY.txt")
+        if stage26_marker != "MANYTX_STAGE2_6M_READY" or stage26_values.get("artifact_sha256") != EXPECTED_STAGE26_ARTIFACT_SHA256 or stage26_values.get("decision") != "SELECT_CE_SUPCON_PROTOTYPE":
+            raise RecoveryAbort("Stage 2.6M frozen READY contract mismatch")
+        stage3_marker, stage3_values = self._ready_values(stage3m / "MANYTX_STAGE3M_READY.txt")
+        stage3_manifest = stage3m / "manifests" / "STAGE3M_HASH_MANIFEST.json"
+        teacher = stage3m / "checkpoints" / "canonical" / "canonical_teacher_v1_0.pt"
+        if (
+            stage3_marker != "MANYTX_STAGE3M_READY" or stage3_values.get("selected_seed") != "123"
+            or stage3_values.get("canonical_teacher_sha256") != EXPECTED_TEACHER_SHA256
+            or not stage3_manifest.is_file() or sha256_file(stage3_manifest) != EXPECTED_STAGE3M_HASH_MANIFEST_SHA256
+            or not teacher.is_file() or sha256_file(teacher) != EXPECTED_TEACHER_SHA256
+        ):
+            raise RecoveryAbort("Stage 3M frozen teacher/READY contract mismatch")
+        stage3_status = json.loads((stage3m / "manifests" / "STAGE3M_FINAL_STATUS.json").read_text(encoding="utf-8"))
+        counters = stage3_status.get("strict_zero_day_counters", {})
+        if stage3_status.get("status") != "MANYTX_STAGE3M_READY" or int(stage3_status.get("selected_seed", -1)) != 123 or any(counters.values()):
+            raise RecoveryAbort("Stage 3M final status/strict-counter verification failed")
+        return {
+            "canonical_branch_root": str(self.branch_root), "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+            "stage2m_status": "MANYTX_STAGE2M_READY", "stage2_6m_status": stage26_marker,
+            "stage3m_status": stage3_marker, "teacher_seed": 123, "teacher_sha256": EXPECTED_TEACHER_SHA256,
+            "stage3m_strict_counters_zero": True,
+        }
 
     def verify_stage_checkpoints(self) -> None:
         for stage in range(1, 8):
@@ -357,7 +629,11 @@ class PostLockRecovery:
         return {"manifest": payload, "manifest_path": manifest_path, "scores": scores, "predictions": predictions, "indices": indices}
 
     def preflight(self) -> RecoveryEvidence:
+        state = self.recovery_state()
+        if state in {"COMPLETE", "CLEANUP_ONLY"}:
+            raise RecoveryAbort(f"Recovery is already finalized ({state}); preflight is not a finalization path")
         not_ready = self.verify_not_ready(); self.verify_stage_checkpoints(); lock = self.verify_lock()
+        immutable_hashes = self.immutable_snapshot()
         strict_indices, sealed_paths = self.sealed_indices(); relationship = strict_subset_relationship(
             strict_indices["strict_zero_day_test"], strict_indices["strict_zero_day_shift_test"], self.non_strict_indices(),
             STRICT_PARTITIONS["strict_zero_day_test"], STRICT_PARTITIONS["strict_zero_day_shift_test"],
@@ -367,8 +643,19 @@ class PostLockRecovery:
             strict_indices["strict_zero_day_test"], strict_indices["strict_zero_day_shift_test"],
             stores["strict_zero_day_test"]["predictions"], stores["strict_zero_day_shift_test"]["predictions"],
             stores["strict_zero_day_test"]["scores"], stores["strict_zero_day_shift_test"]["scores"],
+            OVERLAP_TOLERANCE,
         )
-        return RecoveryEvidence(self.output_root, not_ready, lock, strict_indices, sealed_paths, stores, relationship, overlap)
+        return RecoveryEvidence(self.output_root, not_ready, lock, strict_indices, sealed_paths, stores, relationship, overlap, immutable_hashes)
+
+    def drive_audit(self) -> None:
+        self.verify_predecessors()
+        state = self.recovery_state()
+        if state in {"COMPLETE", "CLEANUP_ONLY"}:
+            if not self.stage11_current():
+                raise RecoveryAbort("Completed recovery state is not hash-current")
+            self.immutable_snapshot()
+        else:
+            self.preflight()
 
     def _known_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
         scores = np.concatenate([np.load(self.path(f"scores/{partition}/scores.npy"), mmap_mode="r") for partition in KNOWN_VALIDATION])
@@ -376,18 +663,54 @@ class PostLockRecovery:
         return scores, correct
 
     def _complete_recovery_stage(self, stage: int, outputs: Iterable[Path], inputs: Iterable[Path]) -> None:
+        output_list = [assert_within(path, self.output_root) for path in outputs]
         payload = {
             "stage": stage, "status": "PASS_POST_LOCK_RECOVERY", "pipeline_version": PIPELINE_VERSION,
             "recovery_executable_sha256": self.recovery_sha, "original_executable_sha256": ORIGINAL_EXECUTABLE_SHA256,
             "configuration_sha256": ORIGINAL_CONFIGURATION_SHA256,
             "required_input_hashes": {str(path.resolve()): sha256_file(path) for path in inputs},
-            "required_outputs": [{"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in outputs],
+            "required_outputs": [{"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in output_list],
             "strict_signal_reinference": False, "completed_at": utc_now(),
         }
         atomic_json(self.path(f"manifests/STAGE_{stage:02d}_CHECKPOINT.json"), payload, self.output_root)
+        if not self.checkpoint_current(stage):
+            raise RecoveryAbort(f"Recovery Stage {stage:02d} checkpoint failed post-write verification")
 
     def finalize(self) -> None:
+        state = self.recovery_state()
+        not_ready = self.path("MANYTX_STAGE3_5M_NOT_READY.txt")
+        ready = self.path("MANYTX_STAGE3_5M_READY.txt")
+        if state == "COMPLETE":
+            print("STAGE3_5M_POSTLOCK_RECOVERY_ALREADY_COMPLETE")
+            return
+        if state == "CLEANUP_ONLY":
+            self.verify_not_ready()
+            not_ready.unlink()
+            if not self.stage11_current() or not_ready.exists() or not ready.is_file():
+                raise RecoveryAbort("Stage-11 cleanup-only transaction failed verification")
+            print("STAGE3_5M_POSTLOCK_RECOVERY_CLEANUP_COMPLETE")
+            return
         evidence = self.preflight()
+        if self.checkpoint_current(8):
+            print("[REUSE] Recovery Stage 08 — hash-current")
+        else:
+            self._finalize_stage08(evidence)
+        recovery_path = self.path("manifests/POST_LOCK_RECOVERY_MANIFEST.json")
+        strict_bundle_path = self.path("manifests/FINAL_STRICT_SCORE_BUNDLE.json")
+        known_scores, known_correct = self._known_arrays()
+        thresholds = json.loads(self.path("thresholds/ZD_STRICT_THRESHOLDS.json").read_text(encoding="utf-8"))["thresholds"]
+        if self.checkpoint_current(9):
+            print("[REUSE] Recovery Stage 09 — hash-current")
+        else:
+            self._finalize_statistics(evidence, known_scores, known_correct, thresholds, recovery_path, strict_bundle_path)
+        if self.checkpoint_current(10):
+            print("[REUSE] Recovery Stage 10 — hash-current")
+        else:
+            self._finalize_publication(evidence, known_scores, recovery_path, strict_bundle_path)
+        self.verify_immutable_snapshot(evidence.immutable_hashes)
+        self._finalize_ready(evidence, recovery_path, strict_bundle_path)
+
+    def _finalize_stage08(self, evidence: RecoveryEvidence) -> None:
         relationship_path = self.path("manifests/STRICT_PARTITION_RELATIONSHIP_AUDIT.json")
         overlap_path = self.path("manifests/STRICT_OVERLAP_SCORE_CONSISTENCY.json")
         atomic_json(relationship_path, {"status": "PASS", **evidence.relationship, "strict_labels_loaded": False, "generated_at": utc_now()}, self.output_root)
@@ -396,8 +719,10 @@ class PostLockRecovery:
         recovery_payload = {
             "status": "POST_LOCK_RECOVERY_AUTHORIZED_ARTIFACT", "recovery_reason": RECOVERY_REASON,
             "original_execution_commit": ORIGINAL_EXECUTION_COMMIT, "original_executable_sha256": ORIGINAL_EXECUTABLE_SHA256,
-            "original_evaluation_lock_sha256": ORIGINAL_LOCK_SHA256, "recovery_executable_sha256": self.recovery_sha,
-            "configuration_sha256": ORIGINAL_CONFIGURATION_SHA256, "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+            "original_configuration_sha256": ORIGINAL_CONFIGURATION_SHA256,
+            "original_evaluation_lock_sha256": ORIGINAL_LOCK_SHA256,
+            "recovery_commit": self.recovery_commit, "recovery_executable_sha256": self.recovery_sha,
+            "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
             "teacher_sha256": EXPECTED_TEACHER_SHA256, "scorer_fit_sha256": EXPECTED_FIT_SHA256,
             "threshold_manifest_sha256": EXPECTED_THRESHOLD_SHA256, "policy_freeze_sha256": EXPECTED_POLICY_SHA256,
             "known_score_bundle_sha256": EXPECTED_KNOWN_BUNDLE_SHA256, "inference_equivalence_sha256": EXPECTED_EQUIVALENCE_SHA256,
@@ -408,7 +733,8 @@ class PostLockRecovery:
             "original_not_ready_text": evidence.not_ready_bytes.decode("utf-8"),
             "strict_signals_re_read": False, "strict_scores_recomputed": False, "teacher_inference_performed": False,
             "scorer_refit": False, "threshold_refit": False, "policy_changed": False, "teacher_changed": False,
-            "strict_labels_loaded": False, "original_lock_modified": False, "generated_at": utc_now(),
+            "strict_labels_loaded": False, "original_lock_modified": False,
+            "strict_main_store_modified": False, "strict_shift_store_modified": False, "generated_at": utc_now(),
         }
         atomic_json(recovery_path, recovery_payload, self.output_root)
         known_scores, known_correct = self._known_arrays()
@@ -446,7 +772,9 @@ class PostLockRecovery:
             "configuration_sha256": ORIGINAL_CONFIGURATION_SHA256, "evaluation_lock_sha256": ORIGINAL_LOCK_SHA256,
             "post_lock_recovery_manifest_sha256": sha256_file(recovery_path),
             "partition_relationship_audit_sha256": sha256_file(relationship_path), "partition_relationship": evidence.relationship,
-            "shift_is_nested_subset": True, "strict_labels_included": False, "partitions": partition_records, "generated_at": utc_now(),
+            "shift_is_nested_subset": True, "strict_labels_included": False,
+            "strict_signal_reinference": False, "strict_scores_recomputed": False,
+            "partitions": partition_records, "generated_at": utc_now(),
         }
         canonical = dict(strict_bundle); canonical.pop("generated_at"); strict_bundle["canonical_content_sha256"] = sha256_object(canonical)
         atomic_json(strict_bundle_path, strict_bundle, self.output_root)
@@ -454,9 +782,7 @@ class PostLockRecovery:
             self.path("manifests/STRICT_ZERO_DAY_EVALUATION_LOCK.json"), self.path("manifests/PRE_STRICT_KNOWN_SCORE_BUNDLE.json"),
             *[store["manifest_path"] for store in evidence.stores.values()],
         ])
-        self._finalize_statistics(evidence, known_scores, known_correct, thresholds, recovery_path, strict_bundle_path)
-        self._finalize_publication(evidence, known_scores, recovery_path, strict_bundle_path)
-        self._finalize_ready(evidence, recovery_path, strict_bundle_path)
+        self.verify_immutable_snapshot(evidence.immutable_hashes)
 
     def _finalize_statistics(
         self,
@@ -467,10 +793,14 @@ class PostLockRecovery:
         recovery_path: Path,
         strict_bundle_path: Path,
     ) -> None:
-        rng = np.random.default_rng(3_500_001); rows: List[Dict[str, Any]] = []; known_pool = np.arange(len(known_scores)); known_size = min(len(known_pool), BOOTSTRAP_MAX_PER_GROUP)
+        rows: List[Dict[str, Any]] = []; seeds: List[Dict[str, Any]] = []
+        known_pool = np.arange(len(known_scores)); known_size = min(len(known_pool), BOOTSTRAP_MAX_PER_GROUP)
         for partition, store in evidence.stores.items():
             unknown = store["scores"]; unknown_pool = np.arange(len(unknown)); unknown_size = min(len(unknown_pool), BOOTSTRAP_MAX_PER_GROUP)
             for scorer_index, scorer in enumerate(SCORER_ORDER):
+                effective_seed = bootstrap_seed(partition, scorer)
+                rng = np.random.default_rng(effective_seed)
+                seeds.append({"base_seed": BOOTSTRAP_BASE_SEED, "effective_seed": effective_seed, "strict_partition": partition, "scorer": scorer})
                 samples: Dict[str, List[float]] = {name: [] for name in ("auroc", "auprc", "unknown_f1", "known_f1", "macro_f1", "fpr_at_95_tpr", "detection_error", "oscr", "known_acceptance_rate", "unknown_rejection_rate")}
                 for _ in range(BOOTSTRAP_REPLICATES):
                     known_index = rng.choice(known_pool, known_size, replace=True); unknown_index = rng.choice(unknown_pool, unknown_size, replace=True)
@@ -479,10 +809,15 @@ class PostLockRecovery:
                 for name, values in samples.items():
                     rows.append({"protocol": "ZD_STRICT", "strict_partition": partition, "scorer": scorer, "metric": name,
                                  "bootstrap_replicates": BOOTSTRAP_REPLICATES, "bootstrap_known_rows": known_size, "bootstrap_unknown_rows": unknown_size,
+                                 "bootstrap_base_seed": BOOTSTRAP_BASE_SEED, "bootstrap_effective_seed": effective_seed,
                                  "ci_low": float(np.quantile(values, 0.025)), "ci_high": float(np.quantile(values, 0.975)), "bootstrap_mean": float(np.mean(values)),
                                  "recovered_from_existing_locked_scores": True})
         output = self.path("statistics/strict_bootstrap_confidence_intervals.csv"); atomic_csv(output, pd.DataFrame(rows), self.output_root)
-        self._complete_recovery_stage(9, [output], [self.path("tables/strict_open_set_metrics.csv"), recovery_path, strict_bundle_path])
+        provenance = self.path("statistics/STRICT_BOOTSTRAP_PROVENANCE.json")
+        atomic_json(provenance, {"base_seed": BOOTSTRAP_BASE_SEED, "derivation": "SHA256(base_seed|strict_partition|scorer)[0:8] mod (2^63-1)",
+            "bootstrap_replicates": BOOTSTRAP_REPLICATES, "streams": seeds, "strict_signal_reinference": False}, self.output_root)
+        self._complete_recovery_stage(9, [output, provenance], [self.path("tables/strict_open_set_metrics.csv"), recovery_path, strict_bundle_path])
+        self.verify_immutable_snapshot(evidence.immutable_hashes)
 
     def _finalize_publication(self, evidence: RecoveryEvidence, known_scores: np.ndarray, recovery_path: Path, strict_bundle_path: Path) -> None:
         metrics = pd.read_csv(self.path("tables/strict_open_set_metrics.csv")); confidence = pd.read_csv(self.path("statistics/strict_bootstrap_confidence_intervals.csv"))
@@ -502,60 +837,82 @@ class PostLockRecovery:
             frame = main.sort_values("scorer"); fig, axis = plt.subplots(figsize=(9, 5)); axis.bar(frame.scorer, frame[metric]); axis.set_ylim(0, 1)
             axis.set_ylabel(metric.upper()); axis.set_title(f"ZD-STRICT overall {metric.upper()} — recovered locked scores"); axis.tick_params(axis="x", rotation=25); fig.tight_layout()
             for suffix in ("png", "pdf"):
-                path = self.path(f"figures/strict_{metric}.{suffix}"); fig.savefig(path, dpi=240 if suffix == "png" else None); figures.append(path)
+                path = self.path(f"figures/strict_{metric}.{suffix}"); temporary = generated_temporary(path, self.output_root)
+                fig.savefig(temporary, dpi=240 if suffix == "png" else None); commit_generated(temporary, path, self.output_root); figures.append(path)
             plt.close(fig)
         report = self.path("reports/STAGE3_5M_SCIENTIFIC_REPORT.md")
         atomic_text(report, "# Stage 3.5M zero-day/open-set report\n\n## Recovery disclosure\n\nThe strict signals were scored once under the original frozen lock. Finalization reused those immutable stores without signal re-read or score recomputation. The 3,000-row shifted partition is a nested sensitivity subset of the 216,000-row overall test; no combined population exists.\n\n" + metrics.to_markdown(index=False) + "\n", self.output_root)
         workbook = self.path("publication/Stage3_5M_tables.xlsx")
-        with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
+        workbook_temporary = generated_temporary(workbook, self.output_root)
+        with pd.ExcelWriter(workbook_temporary, engine="openpyxl") as writer:
             metrics.to_excel(writer, sheet_name="strict_metrics", index=False); confidence.to_excel(writer, sheet_name="bootstrap_ci", index=False); known.to_excel(writer, sheet_name="known_scores", index=False); closed.to_excel(writer, sheet_name="closed_set", index=False); separation.to_excel(writer, sheet_name="score_separation", index=False)
+        commit_generated(workbook_temporary, workbook, self.output_root)
         pdf = self.path("publication/Stage3_5M_report.pdf")
-        with PdfPages(pdf) as document:
+        pdf_temporary = generated_temporary(pdf, self.output_root)
+        with PdfPages(pdf_temporary) as document:
             fig = plt.figure(figsize=(8.27, 11.69)); fig.text(0.08, 0.95, "Stage 3.5M Post-Lock Recovery", fontsize=17, weight="bold")
             fig.text(0.08, 0.89, "Original locked scores reused\nStrict signal re-inference: NO\nShift is a nested sensitivity subset\nAll predeclared scorers reported", va="top"); plt.axis("off"); document.savefig(fig); plt.close(fig)
             for path in figures:
                 if path.suffix == ".png":
                     image = plt.imread(path); fig, axis = plt.subplots(figsize=(8.27, 11.69)); axis.imshow(image); axis.axis("off"); document.savefig(fig); plt.close(fig)
+        commit_generated(pdf_temporary, pdf, self.output_root)
         figure_manifest = self.path("publication/FIGURE_MANIFEST.json")
         atomic_json(figure_manifest, {"figures": [{"path": str(path), "sha256": sha256_file(path)} for path in figures], "recovered_from_existing_locked_scores": True}, self.output_root)
         self._complete_recovery_stage(10, [report, workbook, pdf, figure_manifest, separation_path, *figures], [self.path("tables/strict_open_set_metrics.csv"), self.path("statistics/strict_bootstrap_confidence_intervals.csv"), recovery_path, strict_bundle_path])
+        self.verify_immutable_snapshot(evidence.immutable_hashes)
 
     def _finalize_ready(self, evidence: RecoveryEvidence, recovery_path: Path, strict_bundle_path: Path) -> None:
         final_status = self.path("manifests/STAGE3_5M_FINAL_STATUS.json")
+        immutable = self.verify_immutable_snapshot(evidence.immutable_hashes)
         gates = {"original_lock_immutable": sha256_file(self.path("manifests/STRICT_ZERO_DAY_EVALUATION_LOCK.json")) == ORIGINAL_LOCK_SHA256,
                  "strict_scores_reused": True, "shift_subset_of_main": evidence.relationship["shift_subset_of_main"],
                  "overlap_scores_consistent": evidence.overlap["all_score_vectors_within_tolerance"], "strict_labels_not_loaded": True,
                  "no_scorer_or_threshold_refit": True, "no_post_hoc_selection": True, "publication_complete": self.path("publication/Stage3_5M_report.pdf").is_file()}
         if not all(gates.values()): raise RecoveryAbort(f"Post-lock READY gates failed: {gates}")
-        atomic_json(final_status, {"status": "MANYTX_STAGE3_5M_READY", "pipeline_version": PIPELINE_VERSION, "gates": gates,
+        final_payload = {"status": "MANYTX_STAGE3_5M_READY", "pipeline_version": PIPELINE_VERSION, "gates": gates,
             "post_lock_recovery": True, "post_lock_recovery_reason": RECOVERY_REASON,
             "original_strict_scoring_executable_sha256": ORIGINAL_EXECUTABLE_SHA256, "recovery_executable_sha256": self.recovery_sha,
             "strict_evaluation_lock_sha256": ORIGINAL_LOCK_SHA256, "strict_signal_reinference": False, "strict_scores_recomputed": False,
             "scorer_refit": False, "threshold_refit": False, "policy_changed": False, "strict_labels_loaded": False,
-            "strict_shift_subset_of_main": True, "strict_violation_counters": {key: 0 for key in STRICT_COUNTER_KEYS}, "generated_at": utc_now()}, self.output_root)
+            "strict_shift_subset_of_main": True, **immutable,
+            "strict_violation_counters": {key: 0 for key in STRICT_COUNTER_KEYS}, "generated_at": utc_now()}
+        atomic_json(final_status, final_payload, self.output_root)
+        if json.loads(final_status.read_text(encoding="utf-8")) != final_payload:
+            raise RecoveryAbort("Final status failed exact post-write verification")
         manifest = self.path("manifests/STAGE3_5M_HASH_MANIFEST.json")
         files = [path for path in sorted(self.output_root.rglob("*")) if path.is_file() and path.relative_to(self.output_root).as_posix() not in FINAL_HASH_EXCLUSIONS]
         atomic_json(manifest, {"algorithm": "SHA-256", "files": [{"relative_path": path.relative_to(self.output_root).as_posix(), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in files], "count": len(files), "exclusions": sorted(FINAL_HASH_EXCLUSIONS), "post_lock_recovery": True}, self.output_root)
+        if not verify_hash_manifest(self.output_root, manifest):
+            raise RecoveryAbort("Final hash manifest failed post-write verification")
         not_ready = self.path("MANYTX_STAGE3_5M_NOT_READY.txt"); ready = self.path("MANYTX_STAGE3_5M_READY.txt")
         if sha256_file(not_ready) != hashlib.sha256(evidence.not_ready_bytes).hexdigest(): raise RecoveryAbort("Original NOT_READY changed before READY transaction")
-        ready_text = "MANYTX_STAGE3_5M_READY\npost_lock_recovery=YES\npost_lock_recovery_reason=" + RECOVERY_REASON + "\n"
-        ready_text += f"original_strict_scoring_executable_sha256={ORIGINAL_EXECUTABLE_SHA256}\noriginal_evaluation_lock_sha256={ORIGINAL_LOCK_SHA256}\nrecovery_executable_sha256={self.recovery_sha}\n"
-        ready_text += "strict_signal_reinference=NO\nstrict_scores_recomputed=NO\nscorer_refit=NO\nthreshold_refit=NO\npolicy_changed=NO\nstrict_labels_loaded=NO\nstrict_shift_subset_of_main=YES\n"
-        ready_text += "".join(f"{key}=0\n" for key in STRICT_COUNTER_KEYS) + "teacher_retrained=NO\nsurrogate_training_performed=NO\nxai_performed=NO\nnext_stage=STAGE_4M\n"
-        atomic_text(ready, ready_text, self.output_root); not_ready.unlink()
+        ready_text = self.ready_content()
+        atomic_text(ready, ready_text, self.output_root)
+        if ready.read_bytes() != ready_text.encode("utf-8"):
+            raise RecoveryAbort("READY marker failed exact byte verification")
+        # Stage-11 checkpoint is the durable commit record and is written before NOT_READY removal.
         self._complete_recovery_stage(11, [final_status, manifest, ready], [self.path(f"manifests/STAGE_{stage:02d}_CHECKPOINT.json") for stage in range(1, 11)] + [recovery_path, strict_bundle_path])
+        if not self.stage11_current():
+            raise RecoveryAbort("Stage-11 durable transaction verification failed")
+        self.verify_immutable_snapshot(evidence.immutable_hashes)
+        not_ready.unlink()
+        if not ready.is_file() or not_ready.exists() or not self.stage11_current():
+            raise RecoveryAbort("Final READY-only status transaction failed")
         print("MANYTX_STAGE3_5M_READY")
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--branch-root", type=Path, required=True)
+    parser = argparse.ArgumentParser(description=__doc__); parser.add_argument("--branch-root", type=Path)
     parser.add_argument("--repository-root", type=Path, default=Path(__file__).resolve().parent)
-    action = parser.add_mutually_exclusive_group(required=True); action.add_argument("--preflight", action="store_true"); action.add_argument("--finalize", action="store_true")
+    parser.add_argument("--search-root", type=Path, default=Path("/content/drive/MyDrive"), help=argparse.SUPPRESS)
+    action = parser.add_mutually_exclusive_group(required=True); action.add_argument("--preflight", action="store_true"); action.add_argument("--drive-audit", action="store_true"); action.add_argument("--finalize", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv); recovery = PostLockRecovery(args.branch_root, args.repository_root)
+    args = parse_args(argv); recovery = PostLockRecovery(args.branch_root, args.repository_root, args.search_root)
+    if args.drive_audit:
+        recovery.drive_audit(); print("STAGE3_5M_DRIVE_AUDIT_PASS"); return 0
     if args.preflight:
         recovery.preflight(); print("STAGE3_5M_POSTLOCK_RECOVERY_PREFLIGHT_PASS"); return 0
     recovery.finalize(); return 0

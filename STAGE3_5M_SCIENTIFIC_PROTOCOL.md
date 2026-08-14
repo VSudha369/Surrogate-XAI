@@ -34,6 +34,10 @@ The frozen `strict_zero_day_shift_test` partition is a 3,000-row sensitivity sub
 
 The reviewed canonical run scored both strict stores once under its original lock before the earlier disjointness assertion aborted. `Stage3_5M_PostLock_Recovery_v1_0_0.py` therefore verifies and reuses those immutable stores. It cannot open strict signals, execute the teacher, fit scorers or thresholds, read strict labels, or replace the original lock. Recovery provenance and the original NOT_READY evidence are disclosed in the recovery manifest, final status, strict bundle, and READY marker.
 
+Google Drive is the source of truth for frozen runtime artifacts; GitHub is the source of truth for executable code. Root resolution honors an explicit `--branch-root`, then `WISIG_BRANCH_ROOT`, then recursively discovers exactly one valid Stage-3M-READY root below `/content/drive/MyDrive`. Zero or multiple valid roots abort without selecting, copying, or renaming artifacts. The read-only Drive audit hashes predecessor evidence and the post-lock stores without inference or scientific writes.
+
+Recovery statistics use an independent deterministic RNG stream derived from the fixed base seed, strict partition, and scorer. The effective seed for every stream is persisted. Stage 11 is a durable transaction: final status, final hash manifest, and exact READY bytes are verified; the Stage-11 checkpoint is then written and verified; only afterward is the historical NOT_READY marker removed. Interrupted states retain NOT_READY, while a verified Stage-11-plus-READY state with stale NOT_READY permits cleanup only. A second finalization of a complete transaction is a no-op.
+
 ## Metrics
 
 Every scorer reports AUROC, AUPRC, unknown F1, known F1, macro-F1, FPR@95TPR, minimum detection error, OSCR, threshold, known acceptance, and unknown rejection. Deterministic stratified bootstrap confidence intervals are produced for AUROC, AUPRC, macro-F1, and OSCR. Closed-set known correctness remains separate and Stage 3M metrics are never overwritten.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import gc
 import hashlib
 import importlib.util
 import io
@@ -375,6 +376,7 @@ def test_final_transaction_source(module: Any) -> None:
     source = MAIN.read_text(encoding="utf-8")
     stage11 = source[source.index("    def stage_11"):source.index("    def run", source.index("    def stage_11"))]
     assert stage11.index("atomic_json(final_status") < stage11.index("atomic_json(manifest") < stage11.index("atomic_text(ready") < stage11.index("self.complete_stage(11")
+    assert stage11.index("self.complete_stage(11") < stage11.index("not_ready.unlink()")
     assert "final_hash_manifest_current" in stage11 and "self.stage_current(11)" in stage11
     for stage_name in ("stage_09", "stage_10", "stage_11"):
         start = source.index(f"    def {stage_name}"); end = source.find("\n    def ", start + 8)
@@ -420,8 +422,10 @@ def test_overlap_consistency(recovery: Any) -> None:
 def make_recovery_fixture(recovery: Any, root: Path) -> tuple[Any, Dict[str, Path]]:
     branch = root / recovery.CANONICAL_BRANCH; output = branch / "05_zero_day_open_set"; manifests = output / "manifests"
     for directory in (manifests, output / "thresholds", output / "scores/fitted", output / "tables", output / "statistics",
-                      output / "figures", output / "reports", output / "publication", branch / "01_benchmark_engineering/splits"):
+                      output / "figures", output / "reports", output / "publication", branch / "01_benchmark_engineering/splits",
+                      branch / "02_benchmark_diagnostics", branch / "03_representation_ablation", branch / "04_canonical_teacher"):
         directory.mkdir(parents=True, exist_ok=True)
+    (branch / "04_canonical_teacher/MANYTX_STAGE3M_READY.txt").write_text("MANYTX_STAGE3M_READY\n", encoding="utf-8")
     (output / "MANYTX_STAGE3_5M_NOT_READY.txt").write_text("\n".join(recovery.EXPECTED_NOT_READY_LINES) + "\n", encoding="utf-8")
     fit = output / "scores/fitted/known_only_scorer_state.npz"; fit.write_bytes(b"fit")
     threshold = output / "thresholds/ZD_STRICT_THRESHOLDS.json"; threshold.write_text(json.dumps({
@@ -501,9 +505,12 @@ def make_recovery_fixture(recovery: Any, root: Path) -> tuple[Any, Dict[str, Pat
     recovery.STRICT_PARTITIONS = {"strict_zero_day_test": 6, "strict_zero_day_shift_test": 2}
     runner = recovery.PostLockRecovery(branch, ROOT)
     paths = {"lock": lock, "sidecar": sidecar, "stage_output": stage_output, "threshold": threshold, "fit": fit,
+             "policy": policy, "equivalence": equivalence, "declaration": declaration,
              "known_bundle": known_bundle, "main_scores": strict_paths["strict_zero_day_test"] / "scores.npy",
+             "shift_scores": strict_paths["strict_zero_day_shift_test"] / "scores.npy",
              "main_manifest": strict_paths["strict_zero_day_test"] / "store_manifest.json",
-             "main_store": strict_paths["strict_zero_day_test"]}
+             "shift_manifest": strict_paths["strict_zero_day_shift_test"] / "store_manifest.json",
+             "main_store": strict_paths["strict_zero_day_test"], "shift_store": strict_paths["strict_zero_day_shift_test"]}
     return runner, paths
 
 
@@ -514,7 +521,8 @@ def test_recovery_precondition_matrix(recovery: Any) -> None:
         assert recovery.main(["--branch-root", str(runner.branch_root), "--repository-root", str(ROOT), "--preflight"]) == 0
         inventory_after = {str(path): sha256_file(path) for path in runner.output_root.rglob("*") if path.is_file()}
         assert inventory_before == inventory_after and not (runner.output_root / "MANYTX_STAGE3_5M_READY.txt").exists()
-        for key in ("lock", "stage_output", "threshold", "fit", "known_bundle", "main_scores"):
+        for key in ("lock", "sidecar", "stage_output", "threshold", "fit", "policy", "equivalence", "declaration",
+                    "known_bundle", "main_scores", "shift_scores"):
             path = paths[key]; original = path.read_bytes(); path.write_bytes(original + b"mutation")
             try: runner.preflight()
             except recovery.RecoveryAbort: pass
@@ -529,6 +537,98 @@ def test_recovery_precondition_matrix(recovery: Any) -> None:
         try: runner.preflight()
         except recovery.RecoveryAbort: pass
         else: raise AssertionError("Recovery accepted a strict label file")
+
+
+def make_root_candidate(module: Any, parent: Path, name: str = "candidate") -> Path:
+    branch = parent / name / module.CANONICAL_BRANCH
+    for directory in module.REQUIRED_BRANCH_DIRECTORIES:
+        (branch / directory).mkdir(parents=True, exist_ok=True)
+    (branch / "04_canonical_teacher/MANYTX_STAGE3M_READY.txt").write_text("MANYTX_STAGE3M_READY\n", encoding="utf-8")
+    return branch
+
+
+def test_drive_root_discovery(recovery: Any, launcher: Any) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        base = Path(temporary); one = make_root_candidate(recovery, base, "one")
+        assert recovery.discover_branch_root(search_root=base, environment={}) == one.resolve()
+        assert recovery.discover_branch_root(explicit=one, search_root=base, environment={}) == one.resolve()
+        assert recovery.discover_branch_root(search_root=base / "unused", environment={"WISIG_BRANCH_ROOT": str(one)}) == one.resolve()
+        assert launcher.locate_branch_root(search_root=base, environment={}) == one.resolve()
+        make_root_candidate(recovery, base, "two")
+        for operation in (
+            lambda: recovery.discover_branch_root(search_root=base, environment={}),
+            lambda: launcher.locate_branch_root(search_root=base, environment={}),
+        ):
+            try: operation()
+            except (recovery.RecoveryAbort, RuntimeError): pass
+            else: raise AssertionError("Multiple canonical roots must fail")
+    with tempfile.TemporaryDirectory() as temporary:
+        for operation in (
+            lambda: recovery.discover_branch_root(search_root=Path(temporary), environment={}),
+            lambda: launcher.locate_branch_root(search_root=Path(temporary), environment={}),
+        ):
+            try: operation()
+            except (recovery.RecoveryAbort, RuntimeError): pass
+            else: raise AssertionError("Zero canonical roots must fail")
+
+
+def test_launcher_postlock_state_detection(recovery: Any, launcher: Any) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        runner, _ = make_recovery_fixture(recovery, Path(temporary))
+        original = launcher.ORIGINAL_LOCK_SHA256; launcher.ORIGINAL_LOCK_SHA256 = recovery.ORIGINAL_LOCK_SHA256
+        try:
+            assert launcher.detect_stage35_state(runner.branch_root) == "POST_LOCK_RECOVERY_REQUIRED"
+            (runner.output_root / "MANYTX_STAGE3_5M_NOT_READY.txt").write_text("unexpected\n", encoding="utf-8")
+            assert launcher.detect_stage35_state(runner.branch_root) == "UNRECOGNIZED_POST_LOCK"
+        finally:
+            launcher.ORIGINAL_LOCK_SHA256 = original
+
+
+def test_interruption_and_idempotency(recovery: Any, launcher: Any) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        runner, paths = make_recovery_fixture(recovery, Path(temporary))
+        recovery.BOOTSTRAP_REPLICATES = 2; recovery.BOOTSTRAP_MAX_PER_GROUP = 4
+        # Partial final status/hash/READY must retain NOT_READY and remain safely resumable.
+        (runner.output_root / "manifests/STAGE3_5M_FINAL_STATUS.json").write_text("{}", encoding="utf-8")
+        (runner.output_root / "manifests/STAGE3_5M_HASH_MANIFEST.json").write_text("{}", encoding="utf-8")
+        (runner.output_root / "MANYTX_STAGE3_5M_READY.txt").write_text(runner.ready_content(), encoding="utf-8")
+        assert runner.recovery_state() == "RESUMABLE_PARTIAL"
+        runner.finalize()
+        assert runner.recovery_state() == "COMPLETE" and runner.stage11_current()
+        immutable = {relative: sha256_file(runner.path(relative)) for relative in recovery.IMMUTABLE_STRICT_RELATIVE_PATHS}
+        complete_inventory = {str(path): sha256_file(path) for path in runner.output_root.rglob("*") if path.is_file()}
+        runner.finalize()
+        assert complete_inventory == {str(path): sha256_file(path) for path in runner.output_root.rglob("*") if path.is_file()}
+        # Simulate interruption after Stage11 commit but before stale NOT_READY deletion.
+        (runner.output_root / "MANYTX_STAGE3_5M_NOT_READY.txt").write_text("\n".join(recovery.EXPECTED_NOT_READY_LINES) + "\n", encoding="utf-8")
+        assert runner.recovery_state() == "CLEANUP_ONLY"
+        science_before_cleanup = {key: value for key, value in complete_inventory.items()}
+        runner.finalize()
+        assert runner.recovery_state() == "COMPLETE" and not (runner.output_root / "MANYTX_STAGE3_5M_NOT_READY.txt").exists()
+        assert all(sha256_file(runner.path(relative)) == digest for relative, digest in immutable.items())
+        original = launcher.ORIGINAL_LOCK_SHA256; launcher.ORIGINAL_LOCK_SHA256 = recovery.ORIGINAL_LOCK_SHA256
+        try: assert launcher.detect_stage35_state(runner.branch_root) == "ALREADY_READY"
+        finally: launcher.ORIGINAL_LOCK_SHA256 = original
+        assert paths["lock"].is_file() and science_before_cleanup
+
+
+def test_bootstrap_repeatability(recovery: Any) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        runner, _ = make_recovery_fixture(recovery, Path(temporary)); evidence = runner.preflight()
+        recovery.BOOTSTRAP_REPLICATES = 3; recovery.BOOTSTRAP_MAX_PER_GROUP = 4
+        runner._finalize_stage08(evidence)
+        known_scores, known_correct = runner._known_arrays()
+        thresholds = json.loads(runner.path("thresholds/ZD_STRICT_THRESHOLDS.json").read_text(encoding="utf-8"))["thresholds"]
+        recovery_path = runner.path("manifests/POST_LOCK_RECOVERY_MANIFEST.json")
+        strict_bundle = runner.path("manifests/FINAL_STRICT_SCORE_BUNDLE.json")
+        runner._finalize_statistics(evidence, known_scores, known_correct, thresholds, recovery_path, strict_bundle)
+        outputs = [runner.path("statistics/strict_bootstrap_confidence_intervals.csv"), runner.path("statistics/STRICT_BOOTSTRAP_PROVENANCE.json")]
+        first = [path.read_bytes() for path in outputs]
+        runner._finalize_statistics(evidence, known_scores, known_correct, thresholds, recovery_path, strict_bundle)
+        assert first == [path.read_bytes() for path in outputs]
+        seeds = [recovery.bootstrap_seed(partition, scorer) for partition in recovery.STRICT_PARTITIONS for scorer in recovery.SCORER_ORDER]
+        assert len(seeds) == len(set(seeds))
+        del evidence; gc.collect()
 
 
 def test_recovery_static_isolation(recovery: Any) -> None:
@@ -561,6 +661,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(); parser.add_argument("--source-only", action="store_true"); args = parser.parse_args()
     module = load_module(MAIN, "stage35_validator_target")
     recovery = load_module(RECOVERY, "stage35_recovery_validator_target")
+    launcher = load_module(LAUNCHER, "stage35_launcher_validator_target")
     tests: Mapping[str, Callable[[], None]] = {
         "static_and_package": lambda: test_static(module, not args.source_only),
         "scientific_contract": lambda: test_contract(module),
@@ -587,6 +688,10 @@ def main() -> int:
         "postlock_recovery_precondition_matrix": lambda: test_recovery_precondition_matrix(recovery),
         "postlock_recovery_static_isolation": lambda: test_recovery_static_isolation(recovery),
         "synthetic_postlock_recovery_finalization": lambda: test_synthetic_recovery_finalization(recovery),
+        "canonical_drive_root_discovery_matrix": lambda: test_drive_root_discovery(recovery, launcher),
+        "launcher_postlock_state_detection": lambda: test_launcher_postlock_state_detection(recovery, launcher),
+        "recovery_interruption_and_idempotency": lambda: test_interruption_and_idempotency(recovery, launcher),
+        "deterministic_independent_bootstrap_streams": lambda: test_bootstrap_repeatability(recovery),
     }
     for name, operation in tests.items(): operation(); print(f"[PASS] {name}")
     print(f"STAGE3_5M_VALIDATION_PASS ({len(tests)}/{len(tests)})")

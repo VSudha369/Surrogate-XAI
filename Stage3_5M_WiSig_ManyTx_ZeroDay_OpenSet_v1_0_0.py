@@ -175,6 +175,35 @@ def validate_strict_subset_relationship(
     return audit
 
 
+def validate_strict_overlap_scores(
+    main_indices: np.ndarray,
+    shift_indices: np.ndarray,
+    main_predictions: np.ndarray,
+    shift_predictions: np.ndarray,
+    main_scores: np.ndarray,
+    shift_scores: np.ndarray,
+    tolerance: float = 1e-5,
+) -> Dict[str, Any]:
+    order = np.argsort(np.asarray(main_indices, dtype=np.int64))
+    sorted_main = np.asarray(main_indices, dtype=np.int64)[order]
+    shift = np.asarray(shift_indices, dtype=np.int64)
+    locations = np.searchsorted(sorted_main, shift)
+    if np.any(locations >= len(sorted_main)) or not np.array_equal(sorted_main[locations], shift):
+        raise ScientificAbort("Shift indices are not fully represented in strict main")
+    main_positions = order[locations]
+    predictions_equal = np.array_equal(np.asarray(main_predictions)[main_positions], np.asarray(shift_predictions))
+    maxima = np.abs(np.asarray(main_scores, dtype=np.float64)[main_positions] - np.asarray(shift_scores, dtype=np.float64)).max(axis=0)
+    audit = {
+        "overlap_rows": int(len(shift)), "predictions_exactly_equal": bool(predictions_equal),
+        "score_tolerance": tolerance,
+        "maximum_absolute_difference_by_scorer": dict(zip(SCORER_ORDER, map(float, maxima))),
+        "all_score_vectors_within_tolerance": bool(np.all(maxima <= tolerance)),
+    }
+    if not predictions_equal or not audit["all_score_vectors_within_tolerance"]:
+        raise ScientificAbort(f"Strict overlap score consistency failed: {audit}")
+    return audit
+
+
 def parse_ready_marker(path: Path) -> Dict[str, str]:
     if not path.is_file():
         raise ScientificAbort(f"Required READY marker missing: {path}")
@@ -1626,8 +1655,19 @@ class Stage35Pipeline:
         relationship = validate_strict_subset_relationship(
             strict_indices["strict_zero_day_test"], strict_indices["strict_zero_day_shift_test"], authorized_non_strict,
         )
+        relationship_path = self.config.output_root / "manifests" / "STRICT_PARTITION_RELATIONSHIP_AUDIT.json"
+        atomic_json(relationship_path, {"status": "PASS", **relationship, "verified_before_strict_signal_inference": True,
+            "strict_labels_loaded": False, "generated_at": utc_now()}, self.config.output_root)
         for partition, values in strict_indices.items():
             self.extract_strict_scores(partition, values)
+        main_store = self.score_store("strict_zero_day_test"); shift_store = self.score_store("strict_zero_day_shift_test")
+        overlap = validate_strict_overlap_scores(
+            strict_indices["strict_zero_day_test"], strict_indices["strict_zero_day_shift_test"],
+            np.load(main_store / "predictions.npy", mmap_mode="r"), np.load(shift_store / "predictions.npy", mmap_mode="r"),
+            np.load(main_store / "scores.npy", mmap_mode="r"), np.load(shift_store / "scores.npy", mmap_mode="r"),
+        )
+        overlap_path = self.config.output_root / "manifests" / "STRICT_OVERLAP_SCORE_CONSISTENCY.json"
+        atomic_json(overlap_path, {"status": "PASS", **overlap, "strict_labels_loaded": False, "generated_at": utc_now()}, self.config.output_root)
         threshold_path = self.config.output_root / "thresholds" / "ZD_STRICT_THRESHOLDS.json"
         threshold_payload = json.loads(threshold_path.read_text(encoding="utf-8"))["thresholds"]
         known_scores = np.concatenate([np.load(self.score_store(partition) / "scores.npy", mmap_mode="r") for partition in KNOWN_VALIDATION], axis=0)
@@ -1651,7 +1691,7 @@ class Stage35Pipeline:
             "strict_violation_counters": self.guard.counters(), "generated_at": utc_now(),
         }, self.config.output_root)
         strict_bundle = self.write_strict_score_bundle(strict_indices, sealed_paths)
-        outputs = [table, audit, strict_bundle, *self.lock_paths()]
+        outputs = [table, audit, strict_bundle, relationship_path, overlap_path, *self.lock_paths()]
         for partition in STRICT_PARTITIONS:
             outputs.extend(self.score_store(partition) / name for name in ("scores.npy", "predictions.npy", "global_indices.npy", "store_manifest.json"))
         self.guard.assert_zero()
@@ -1805,7 +1845,6 @@ class Stage35Pipeline:
         }, self.config.output_root)
         if not final_hash_manifest_current(self.config.output_root):
             raise ScientificAbort("Stage 3.5M final hash manifest is inconsistent")
-        if not_ready.exists(): not_ready.unlink()
         ready_text = (
             "MANYTX_STAGE3_5M_READY\n"
             f"teacher_version={EXPECTED_TEACHER_VERSION}\nteacher_seed={EXPECTED_TEACHER_SEED}\nteacher_sha256={EXPECTED_TEACHER_SHA256}\n"
@@ -1823,6 +1862,10 @@ class Stage35Pipeline:
         self.complete_stage(11, "Final Scientific Audit and READY Gate", outputs, [self.stage_manifest_path(stage) for stage in range(1, 11)])
         if not self.stage_current(11):
             raise ScientificAbort("Stage-11 atomic completion verification failed")
+        if not_ready.exists():
+            not_ready.unlink()
+        if not ready.is_file() or not_ready.exists() or not self.stage_current(11):
+            raise ScientificAbort("Stage-11 READY-only status verification failed")
         print("\nMANYTX_STAGE3_5M_READY")
 
     def run(self) -> None:
