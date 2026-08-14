@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import py_compile
 import tempfile
@@ -106,9 +108,53 @@ def main() -> int:
     check("teacher embedding detached", teacher_embedding.grad is None)
     check("student receives gradient", any(parameter.grad is not None for parameter in student.parameters()))
     check("KL orientation source", "F.kl_div(student_log_probs, teacher_probs" in source)
+
+    class CountingAugmentation:
+        def __init__(self) -> None: self.calls = 0
+        def __call__(self, value: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+            del generator; self.calls += 1; return value + 0.125
+
+    class RecordingModel(torch.nn.Module):
+        def __init__(self, teacher: bool) -> None:
+            super().__init__(); self.teacher = teacher; self.scale = torch.nn.Parameter(torch.ones(()))
+            if teacher: self.requires_grad_(False)
+            self.input_ids: list[int] = []; self.calls = 0
+        def forward(self, value: torch.Tensor) -> dict[str, torch.Tensor]:
+            self.calls += 1; self.input_ids.append(id(value)); base = value.mean((1, 2))[:, None] * self.scale
+            dimension = 128 if self.teacher else 64
+            raw = base.expand(len(value), dimension)
+            return {"logits": base.expand(len(value), 98), "embedding_raw": raw,
+                    "embedding_normalized": torch.nn.functional.normalize(raw, dim=1)}
+
+    shared_results = {}
+    for arm in module.ARMS:
+        aug = CountingAugmentation(); candidate = RecordingModel(False); frozen = None if arm == "K0" else RecordingModel(True)
+        result, target, augmented = module.shared_augmented_training_forward(
+            arm, torch.randn(3, 2, 256), aug, torch.Generator().manual_seed(7), candidate, frozen, False
+        )
+        shared_results[arm] = (aug, candidate, frozen, result, target, augmented)
+    check("A shared augmented input K1", shared_results["K1"][1].input_ids == shared_results["K1"][2].input_ids)
+    check("A shared augmented input K2", shared_results["K2"][1].input_ids == shared_results["K2"][2].input_ids)
+    check("A shared augmented input K3", shared_results["K3"][1].input_ids == shared_results["K3"][2].input_ids)
+    check("A augmentation exactly once", all(row[0].calls == 1 for row in shared_results.values()))
+    check("C K0 no teacher forward", shared_results["K0"][2] is None and shared_results["K0"][4] is None)
+    check("D K1-K3 online teacher forward", all(shared_results[arm][2].calls == 1 for arm in ("K1", "K2", "K3")))
+    check("teacher online logits detached", all(not shared_results[arm][4]["logits"].requires_grad for arm in ("K1", "K2", "K3")))
+    check("teacher online embeddings detached", all(not shared_results[arm][4]["embedding_normalized"].requires_grad for arm in ("K1", "K2", "K3")))
+    k1 = shared_results["K1"]
+    shared_loss, _ = module.compute_kd_losses("K1", k1[3], k1[4]["logits"], k1[4]["embedding_normalized"], torch.tensor([0, 1, 2]), None, None)
+    shared_loss.backward()
+    check("teacher receives no backward update", all(parameter.grad is None for parameter in k1[2].parameters()))
+    train_body = source[source.index("    def train_arm_seed"):source.index("    def train_arm_stage")]
+    check("B clean cache rejected for sample KD", "teacher_logits[positions]" not in train_body and "teacher_embedding[positions]" not in train_body)
+    policy = module.training_target_policy()
+    check("training target policy online shared", policy["training_sample_kd_target_source"] == "ONLINE_TEACHER_FORWARD_ON_SHARED_AUGMENTED_INPUT")
+    check("Train Known clean cache not sample KD", policy["train_known_clean_cache_used_for_sample_kd"] is False)
+    check("K3 prototypes Train Known only", policy["teacher_prototype_source"] == "TRAIN_KNOWN_CLEAN_TEACHER_EMBEDDINGS" and policy["teacher_prototypes_used_by"] == ["K3"])
+    check("P0-P3 clean cache remains evaluation-only", policy["p0_p3_clean_cache_role"] == "SEMANTIC_EVALUATION_ONLY")
     check("seed set exact", module.SEEDS == (42,123,2026))
     check("four arms exact", module.ARMS == ("K0","K1","K2","K3"))
-    check("Train Known only canonical training", 'teacher_store = self.prepare_teacher_cache("train_known")' in source)
+    check("Train Known only canonical training", 'partitions["train_known"]' in source and 'build_loader("train_known"' in source)
     check("P0-only epoch selection", 'self.evaluate_student(model, "p0"' in source)
     check("P1 selection forbidden", 'selection_partition": "p0"' in source)
     check("P2 selection forbidden", 'p1_p3_used_for_selection": False' in source)
@@ -145,16 +191,135 @@ def main() -> int:
     check("objective mutation rejection", '"objective_policy_sha256"' in source)
     check("predecessor mutation rejection", '"predecessor_lock_sha256"' in source)
     check("selection mutation rejection", '"selection_lock_sha256"' in source)
+    check("training checkpoint target-policy binding", '"training_target_policy_sha256"' in source)
+    with tempfile.TemporaryDirectory() as directory:
+        branch = Path(directory) / "branch"; output_root = branch / "06_surrogate_kd"; manifests = output_root / "manifests"
+        manifests.mkdir(parents=True)
+        files = {
+            "STAGE4M_PREDECESSOR_LOCK.json": "predecessor\n",
+            "STUDENT_ARCHITECTURE_FREEZE.json": "architecture\n",
+            "KD_OBJECTIVE_POLICY.json": "objective\n",
+            "TRAINING_TARGET_POLICY.json": "targets\n",
+            "CANONICAL_SURROGATE_SELECTION_LOCK.json": "selection\n",
+        }
+        for name, value in files.items(): (manifests / name).write_text(value, encoding="utf-8")
+        bound_input = output_root / "bound_input.bin"; bound_output = output_root / "bound_output.bin"
+        bound_input.write_bytes(b"input"); bound_output.write_bytes(b"output")
+        fixture = object.__new__(module.Stage4Pipeline)
+        fixture.output = output_root; fixture.script_sha = "current-script"
+        fixture.config = module.Stage4Config(branch_root=str(branch), output_dir=str(output_root))
+        fixture.predecessor_lock_sha = fixture.architecture_freeze_sha = fixture.objective_policy_sha = None
+        fixture.training_target_policy_sha = fixture.selection_lock_hash = None
+        fixture.hydrate_provenance()
+
+        def checkpoint_payload(stage: int) -> dict[str, Any]:
+            return {
+                "stage": stage, "stage_name": "fixture", "status": "PASS", "pipeline_version": module.PIPELINE_VERSION,
+                "executable_sha256": fixture.script_sha, "configuration_sha256": fixture.config.configuration_sha256(),
+                "teacher_sha256": module.EXPECTED_TEACHER_SHA256, "benchmark_sha256": module.EXPECTED_BENCHMARK_SHA256,
+                "predecessor_lock_sha256": fixture.predecessor_lock_sha,
+                "architecture_freeze_sha256": fixture.architecture_freeze_sha if stage >= 2 else None,
+                "objective_policy_sha256": fixture.objective_policy_sha if stage >= 2 else None,
+                "training_target_policy_sha256": fixture.training_target_policy_sha if stage >= 2 else None,
+                "selection_lock_sha256": fixture.selection_lock_hash if stage >= 9 else None,
+                "inputs": [{"path": str(bound_input), "sha256": sha256(bound_input), "bytes": bound_input.stat().st_size}],
+                "outputs": [{"path": str(bound_output), "sha256": sha256(bound_output), "bytes": bound_output.stat().st_size}],
+            }
+
+        for prerequisite in range(1, 9):
+            (manifests / f"STAGE_{prerequisite:02d}_CHECKPOINT.json").write_text(json.dumps(checkpoint_payload(prerequisite)), encoding="utf-8")
+        check("hash-complete stage baseline current", fixture.stage_current(4))
+        bound_input.write_bytes(b"mutated-input"); check("E input-hash mutation invalidation", not fixture.stage_current(4))
+        check("E dependent-stage graph invalidation", not fixture.stage_current(8)); bound_input.write_bytes(b"input")
+        (manifests / "STAGE4M_PREDECESSOR_LOCK.json").write_text("changed\n"); check("F predecessor-lock mutation invalidation", not fixture.stage_current(4)); (manifests / "STAGE4M_PREDECESSOR_LOCK.json").write_text(files["STAGE4M_PREDECESSOR_LOCK.json"])
+        (manifests / "STUDENT_ARCHITECTURE_FREEZE.json").write_text("changed\n"); check("G architecture mutation invalidation", not fixture.stage_current(4)); (manifests / "STUDENT_ARCHITECTURE_FREEZE.json").write_text(files["STUDENT_ARCHITECTURE_FREEZE.json"])
+        (manifests / "KD_OBJECTIVE_POLICY.json").write_text("changed\n"); check("H objective mutation invalidation", not fixture.stage_current(4)); (manifests / "KD_OBJECTIVE_POLICY.json").write_text(files["KD_OBJECTIVE_POLICY.json"])
+        (manifests / "TRAINING_TARGET_POLICY.json").write_text("changed\n"); check("training-target-policy mutation invalidation", not fixture.stage_current(4)); (manifests / "TRAINING_TARGET_POLICY.json").write_text(files["TRAINING_TARGET_POLICY.json"])
+        wrong_size = checkpoint_payload(4); wrong_size["outputs"][0]["bytes"] += 1
+        (manifests / "STAGE_04_CHECKPOINT.json").write_text(json.dumps(wrong_size), encoding="utf-8")
+        check("J recorded output byte-size mutation", not fixture.stage_current(4))
+        (manifests / "STAGE_04_CHECKPOINT.json").write_text(json.dumps(checkpoint_payload(4)), encoding="utf-8")
+        fixture.predecessor_lock_sha = fixture.architecture_freeze_sha = fixture.objective_policy_sha = None
+        fixture.training_target_policy_sha = fixture.selection_lock_hash = None
+        check("K fresh-process provenance hydration", fixture.stage_current(4) and all((fixture.predecessor_lock_sha, fixture.architecture_freeze_sha, fixture.objective_policy_sha, fixture.training_target_policy_sha, fixture.selection_lock_hash)))
+        stage9 = checkpoint_payload(9); (manifests / "STAGE_09_CHECKPOINT.json").write_text(json.dumps(stage9), encoding="utf-8")
+        check("selection-bound stage baseline current", fixture.stage_current(9))
+        (manifests / "CANONICAL_SURROGATE_SELECTION_LOCK.json").write_text("changed\n")
+        check("I selection-lock mutation invalidation", not fixture.stage_current(9))
     check("calibration blocked before lock", "Calibration diagnostic requires an immutable canonical selection lock" in source)
     check("calibration cannot mutate surrogate", "Calibration Unknown mutated the canonical surrogate" in source)
     check("READY fidelity gate", '"p0_fidelity_gate_pass"' in source)
     check("READY compression gate", '"compression_gate_pass"' in source)
     check("READY leakage gate", '"all_stage35_strict_violation_counters_zero"' in source)
     check("READY declares no strict eval", 'strict_zero_day_evaluation_performed=NO' in source)
-    order = [source.index(fragment) for fragment in ("atomic_json(final", "manifest = self.create_final_hash_manifest()", "atomic_text(ready", "self.complete_stage(12", "if not_ready.exists(): not_ready.unlink()")]
+    order = [source.index(fragment) for fragment in ("atomic_json(final", "manifest = self.create_final_hash_manifest()", "atomic_text(ready", "12, \"Final audit", "if not_ready.exists(): not_ready.unlink()")]
     check("Stage12 transaction order", order == sorted(order))
     check("Stage12 resume READY gate", "if stage == 12" in source and "final_hash_manifest_current" in source)
-    check("idempotent finalization", "if ready.exists(): ready.unlink()" in source)
+    check("idempotent finalization guard", "MANYTX_STAGE4M_ALREADY_READY" in source and "completed_state_current" in source)
+    with tempfile.TemporaryDirectory() as directory:
+        branch = Path(directory) / module.CANONICAL_BRANCH; completed = branch / "06_surrogate_kd"; manifests = completed / "manifests"
+        manifests.mkdir(parents=True)
+        for name in ("01_benchmark_engineering", "02_benchmark_diagnostics", "03_representation_ablation", "04_canonical_teacher", "05_zero_day_open_set"):
+            (branch / name).mkdir(parents=True, exist_ok=True)
+        (branch / "04_canonical_teacher" / "MANYTX_STAGE3M_READY.txt").write_text("x")
+        (branch / "05_zero_day_open_set" / "MANYTX_STAGE3_5M_READY.txt").write_text("x")
+        lock = {"status": "LOCKED", "canonical_surrogate_sha256": "deploy-sha", "canonical_surrogate_state_sha256": "state-sha"}
+        lock_path = manifests / "CANONICAL_SURROGATE_SELECTION_LOCK.json"; lock_path.write_text(json.dumps(lock))
+        provenance = {}
+        for name in ("STAGE4M_PREDECESSOR_LOCK.json", "STUDENT_ARCHITECTURE_FREEZE.json", "KD_OBJECTIVE_POLICY.json", "TRAINING_TARGET_POLICY.json"):
+            path = manifests / name; path.write_text(name); provenance[name] = path
+        prior_checkpoints = []
+        for stage in range(1, 12):
+            row = {"path": str(lock_path), "sha256": sha256(lock_path), "bytes": lock_path.stat().st_size}
+            path = manifests / f"STAGE_{stage:02d}_CHECKPOINT.json"
+            path.write_text(json.dumps({"stage": stage, "status": "PASS", "inputs": [row], "outputs": [row]})); prior_checkpoints.append(path)
+        final_path = manifests / "STAGE4M_FINAL_STATUS.json"
+        final_path.write_text(json.dumps({"status": "MANYTX_STAGE4M_READY", "selected_arm": "K2", "selected_seed": 123}))
+        ready_path = completed / "MANYTX_STAGE4M_READY.txt"
+        ready_path.write_text("\n".join(("MANYTX_STAGE4M_READY", f"teacher_sha256={module.EXPECTED_TEACHER_SHA256}",
+                                         f"benchmark_sha256={module.EXPECTED_BENCHMARK_SHA256}", "selected_kd_arm=K2", "selected_seed=123",
+                                         "canonical_surrogate_sha256=deploy-sha", "canonical_surrogate_state_sha256=state-sha", "")))
+        manifest_path = manifests / "STAGE4M_HASH_MANIFEST.json"
+        manifest_rows = [{"relative_path": path.relative_to(completed).as_posix(), "sha256": sha256(path), "bytes": path.stat().st_size}
+                         for path in (lock_path, final_path)]
+        manifest_path.write_text(json.dumps({"algorithm": "SHA-256", "count": len(manifest_rows), "files": manifest_rows}))
+        stage12_path = manifests / "STAGE_12_CHECKPOINT.json"
+        stage12_path.write_text(json.dumps({
+            "stage": 12, "status": "PASS", "pipeline_version": module.PIPELINE_VERSION,
+            "teacher_sha256": module.EXPECTED_TEACHER_SHA256, "benchmark_sha256": module.EXPECTED_BENCHMARK_SHA256,
+            "predecessor_lock_sha256": sha256(provenance["STAGE4M_PREDECESSOR_LOCK.json"]),
+            "architecture_freeze_sha256": sha256(provenance["STUDENT_ARCHITECTURE_FREEZE.json"]),
+            "objective_policy_sha256": sha256(provenance["KD_OBJECTIVE_POLICY.json"]),
+            "training_target_policy_sha256": sha256(provenance["TRAINING_TARGET_POLICY.json"]),
+            "selection_lock_sha256": sha256(lock_path),
+            "inputs": [{"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size} for path in (*prior_checkpoints, lock_path)],
+            "outputs": [{"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size}
+                        for path in (final_path, manifest_path, ready_path)],
+        }))
+        check("completed-state fixture current", module.completed_state_current(completed))
+        before = {path.relative_to(completed).as_posix(): (sha256(path), path.stat().st_size) for path in completed.rglob("*") if path.is_file()}
+        completed_config = module.Stage4Config(branch_root=str(branch), output_dir=str(completed))
+        check("L valid READY refuses NOT_READY conversion", module.write_not_ready(completed_config, RuntimeError("later failure")) is False and ready_path.is_file() and not (completed / "MANYTX_STAGE4M_NOT_READY.txt").exists())
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture): second_code = module.main(["--branch-root", str(branch)])
+        after = {path.relative_to(completed).as_posix(): (sha256(path), path.stat().st_size) for path in completed.rglob("*") if path.is_file()}
+        check("M idempotent second invocation marker", second_code == 0 and "MANYTX_STAGE4M_ALREADY_READY" in capture.getvalue())
+        check("M idempotent second invocation no writes", before == after)
+        bad_config = Path(directory) / "bad.json"; bad_config.write_text('{"unknown_scientific_key": true}')
+        with contextlib.redirect_stdout(io.StringIO()): bad_code = module.main(["--branch-root", str(branch), "--config", str(bad_config)])
+        check("L unrelated config error preserves READY", bad_code == 1 and ready_path.is_file() and module.completed_state_current(completed))
+        original_manifest = manifest_path.read_text(); manifest_path.write_text("{}")
+        check("N stale final hash manifest rejected", not module.completed_state_current(completed))
+        manifest_path.write_text(original_manifest); original_stage12 = stage12_path.read_text(); stage12_path.write_text("{}")
+        check("N stale Stage12 checkpoint rejected", not module.completed_state_current(completed))
+        stage12_path.write_text(original_stage12)
+    with tempfile.TemporaryDirectory() as directory:
+        branch = Path(directory) / "branch"; output_root = branch / "06_surrogate_kd"
+        failed_config = module.Stage4Config(branch_root=str(branch), output_dir=str(output_root))
+        check("READY matrix no READY creates NOT_READY", module.write_not_ready(failed_config, RuntimeError("failure")) is True and (output_root / "MANYTX_STAGE4M_NOT_READY.txt").is_file())
+        partial_ready = output_root / "MANYTX_STAGE4M_READY.txt"; partial_ready.write_text("MANYTX_STAGE4M_READY\n")
+        module.write_not_ready(failed_config, RuntimeError("partial"))
+        check("READY matrix partial transaction recovered", not partial_ready.exists() and (output_root / "MANYTX_STAGE4M_NOT_READY.txt").is_file())
     with tempfile.TemporaryDirectory() as directory:
         search = Path(directory); root = search / module.CANONICAL_BRANCH
         zero_failed = False
@@ -176,8 +341,13 @@ def main() -> int:
     preflight_body = source[source.index("    def preflight(self)"):source.index("    def run(self)")]
     check("preflight cannot train", "train_arm_seed" not in preflight_body)
     check("preflight cannot cache teacher targets", "prepare_teacher_cache" not in preflight_body)
+    check("O preflight cannot create training checkpoints", "save_training_checkpoint" not in preflight_body and "train_arm_stage" not in preflight_body)
+    check("O preflight cannot freeze architecture/objectives", "STUDENT_ARCHITECTURE_FREEZE" not in preflight_body and "KD_OBJECTIVE_POLICY" not in preflight_body)
+    check("O preflight cannot create selection artifacts", "CANONICAL_SURROGATE_SELECTION" not in preflight_body)
     check("preflight cannot access calibration", "student_outputs" not in preflight_body and '"calibration_unknown_accessed": False' in preflight_body)
     check("preflight cannot create READY", "atomic_text(ready" not in preflight_body and '"ready_created": False' in preflight_body)
+    check("O preflight write probe deleted", "probe.unlink()" in preflight_body)
+    check("O preflight strict counters zero", "self.guard.assert_zero()" in preflight_body)
     check("preflight marker", "STAGE4M_PREFLIGHT_PASS" in preflight_body)
     with zipfile.ZipFile(ZIP) as archive:
         check("ZIP CRC", archive.testzip() is None)

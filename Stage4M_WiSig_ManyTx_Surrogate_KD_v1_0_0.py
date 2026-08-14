@@ -230,6 +230,105 @@ def parse_ready(path: Path) -> Dict[str, str]:
     return rows
 
 
+def bound_file_rows_current(rows: Sequence[Mapping[str, Any]], require_size: bool) -> bool:
+    """Verify every provenance-bound file, including recorded output sizes."""
+    for row in rows:
+        path = Path(str(row["path"]))
+        if not path.is_file() or sha256_file(path) != row.get("sha256"):
+            return False
+        if require_size and path.stat().st_size != int(row.get("bytes", -1)):
+            return False
+    return True
+
+
+def final_hash_manifest_current(output: Path) -> bool:
+    path = output / "manifests" / "STAGE4M_HASH_MANIFEST.json"
+    if not path.is_file():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return (
+            payload.get("algorithm") == "SHA-256"
+            and int(payload.get("count", -1)) == len(payload["files"])
+            and all(
+                (output / row["relative_path"]).is_file()
+                and sha256_file(output / row["relative_path"]) == row["sha256"]
+                and (output / row["relative_path"]).stat().st_size == int(row["bytes"])
+                for row in payload["files"]
+            )
+        )
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def completed_state_current(output: Path) -> bool:
+    """Validate a completed Stage-12 transaction without mutating its directory."""
+    ready = output / "MANYTX_STAGE4M_READY.txt"
+    final = output / "manifests" / "STAGE4M_FINAL_STATUS.json"
+    checkpoint = output / "manifests" / "STAGE_12_CHECKPOINT.json"
+    lock_path = output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json"
+    if not all(path.is_file() for path in (ready, final, checkpoint, lock_path)):
+        return False
+    try:
+        ready_values = parse_ready(ready)
+        final_values = json.loads(final.read_text(encoding="utf-8"))
+        stage_values = json.loads(checkpoint.read_text(encoding="utf-8"))
+        lock = json.loads(lock_path.read_text(encoding="utf-8"))
+        if ready_values.get("marker") != "MANYTX_STAGE4M_READY":
+            return False
+        if final_values.get("status") != "MANYTX_STAGE4M_READY":
+            return False
+        if stage_values.get("stage") != 12 or stage_values.get("status") != "PASS":
+            return False
+        provenance_paths = {
+            "predecessor_lock_sha256": output / "manifests" / "STAGE4M_PREDECESSOR_LOCK.json",
+            "architecture_freeze_sha256": output / "manifests" / "STUDENT_ARCHITECTURE_FREEZE.json",
+            "objective_policy_sha256": output / "manifests" / "KD_OBJECTIVE_POLICY.json",
+            "training_target_policy_sha256": output / "manifests" / "TRAINING_TARGET_POLICY.json",
+            "selection_lock_sha256": lock_path,
+        }
+        if stage_values.get("pipeline_version") != PIPELINE_VERSION:
+            return False
+        if stage_values.get("teacher_sha256") != EXPECTED_TEACHER_SHA256 or stage_values.get("benchmark_sha256") != EXPECTED_BENCHMARK_SHA256:
+            return False
+        if any(not path.is_file() or stage_values.get(field) != sha256_file(path) for field, path in provenance_paths.items()):
+            return False
+        required_inputs = {str(output / "manifests" / f"STAGE_{stage:02d}_CHECKPOINT.json") for stage in range(1, 12)}
+        required_inputs.add(str(lock_path))
+        required_outputs = {str(final), str(output / "manifests" / "STAGE4M_HASH_MANIFEST.json"), str(ready)}
+        if not required_inputs.issubset({str(row.get("path")) for row in stage_values.get("inputs", [])}):
+            return False
+        if not required_outputs.issubset({str(row.get("path")) for row in stage_values.get("outputs", [])}):
+            return False
+        if not bound_file_rows_current(stage_values.get("inputs", []), require_size=False):
+            return False
+        if not bound_file_rows_current(stage_values.get("outputs", []), require_size=True):
+            return False
+        for stage in range(1, 12):
+            prior = json.loads((output / "manifests" / f"STAGE_{stage:02d}_CHECKPOINT.json").read_text(encoding="utf-8"))
+            if prior.get("stage") != stage or prior.get("status") != "PASS":
+                return False
+            if not prior.get("inputs") or not prior.get("outputs"):
+                return False
+            if not bound_file_rows_current(prior.get("inputs", []), require_size=False):
+                return False
+            if not bound_file_rows_current(prior.get("outputs", []), require_size=True):
+                return False
+        if not final_hash_manifest_current(output):
+            return False
+        required = {
+            "teacher_sha256": EXPECTED_TEACHER_SHA256,
+            "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+            "selected_kd_arm": str(final_values.get("selected_arm")),
+            "selected_seed": str(final_values.get("selected_seed")),
+            "canonical_surrogate_sha256": str(lock.get("canonical_surrogate_sha256")),
+            "canonical_surrogate_state_sha256": str(lock.get("canonical_surrogate_state_sha256")),
+        }
+        return lock.get("status") == "LOCKED" and all(ready_values.get(key) == value for key, value in required.items())
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
 def discover_branch_root(explicit: Optional[str] = None, search_root: Path = Path("/content/drive/MyDrive")) -> Path:
     candidates: List[Path] = []
     requested = explicit or os.environ.get("WISIG_BRANCH_ROOT")
@@ -518,23 +617,67 @@ def kd_objective_policy() -> Dict[str, Any]:
     }
 
 
+def training_target_policy() -> Dict[str, Any]:
+    return {
+        "version": PIPELINE_VERSION,
+        "training_partition": "train_known",
+        "augmentation_application_count_per_batch": 1,
+        "training_sample_kd_target_source": "ONLINE_TEACHER_FORWARD_ON_SHARED_AUGMENTED_INPUT",
+        "teacher_student_input_identity": "EXACT_SAME_AUGMENTED_TENSOR",
+        "k0_teacher_forward": "DISABLED",
+        "k1_k3_teacher_forward": "FROZEN_INFERENCE_MODE_ON_SHARED_AUGMENTED_INPUT",
+        "train_known_clean_cache_used_for_sample_kd": False,
+        "teacher_prototype_source": "TRAIN_KNOWN_CLEAN_TEACHER_EMBEDDINGS",
+        "teacher_prototypes_used_by": ["K3"],
+        "p0_p3_clean_cache_role": "SEMANTIC_EVALUATION_ONLY",
+        "teacher_targets_detached": True,
+    }
+
+
+def shared_augmented_training_forward(
+    arm: str, raw_input: torch.Tensor, augmentation: Any, augmentation_generator: torch.Generator,
+    student: nn.Module, teacher: Optional[nn.Module], use_amp: bool,
+) -> Tuple[Mapping[str, torch.Tensor], Optional[Mapping[str, torch.Tensor]], torch.Tensor]:
+    """Augment once and present the exact same tensor to required model forwards."""
+    if arm not in ARM_OBJECTIVES:
+        raise ScientificAbort(f"Unknown KD arm: {arm}")
+    augmented = augmentation(raw_input, augmentation_generator)
+    teacher_output: Optional[Mapping[str, torch.Tensor]] = None
+    if arm != "K0":
+        if teacher is None:
+            raise ScientificAbort(f"{arm} requires the frozen teacher forward")
+        with torch.inference_mode(), torch.autocast(
+            device_type=raw_input.device.type, dtype=torch.float16, enabled=use_amp
+        ):
+            teacher_output = teacher(augmented)
+        teacher_output = {name: value.detach().clone() for name, value in teacher_output.items()}
+    with torch.autocast(device_type=raw_input.device.type, dtype=torch.float16, enabled=use_amp):
+        student_output = student(augmented)
+    return student_output, teacher_output, augmented
+
+
 def compute_kd_losses(
-    arm: str, student: Mapping[str, torch.Tensor], teacher_logits: torch.Tensor,
-    teacher_embedding: torch.Tensor, labels: torch.Tensor, auxiliary: Optional[nn.Module],
+    arm: str, student: Mapping[str, torch.Tensor], teacher_logits: Optional[torch.Tensor],
+    teacher_embedding: Optional[torch.Tensor], labels: torch.Tensor, auxiliary: Optional[nn.Module],
     teacher_prototypes: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     if arm not in ARM_OBJECTIVES:
         raise ScientificAbort(f"Unknown KD arm: {arm}")
     logits, weights = student["logits"], ARM_OBJECTIVES[arm]
-    teacher_logits = teacher_logits.detach().to(logits.device, dtype=torch.float32)
-    teacher_embedding = teacher_embedding.detach().to(logits.device, dtype=torch.float32)
     labels = labels.to(logits.device, dtype=torch.long)
     ce = F.cross_entropy(logits.float(), labels)
-    teacher_probs = F.softmax(teacher_logits / KD_TEMPERATURE, dim=1)
-    student_log_probs = F.log_softmax(logits.float() / KD_TEMPERATURE, dim=1)
-    kd = KD_TEMPERATURE ** 2 * F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
+    kd = logits.new_zeros(())
     repr_loss = logits.new_zeros(())
     proto_loss = logits.new_zeros(())
+    if weights["kd"] or weights["repr"]:
+        if teacher_logits is None or teacher_embedding is None:
+            raise ScientificAbort(f"{arm} requires online teacher targets")
+        teacher_logits = teacher_logits.detach().to(logits.device, dtype=torch.float32)
+        teacher_embedding = teacher_embedding.detach().to(logits.device, dtype=torch.float32)
+    if weights["kd"]:
+        teacher_probs = F.softmax(teacher_logits / KD_TEMPERATURE, dim=1)
+        student_log_probs = F.log_softmax(logits.float() / KD_TEMPERATURE, dim=1)
+        kd = KD_TEMPERATURE ** 2 * F.kl_div(student_log_probs, teacher_probs, reduction="batchmean")
     if weights["repr"] or weights["proto"]:
         if auxiliary is None:
             raise ScientificAbort(f"{arm} requires the training-only 64->128 projection")
@@ -656,6 +799,8 @@ class Stage4Pipeline:
         self.predecessor_lock_sha: Optional[str] = None
         self.architecture_freeze_sha: Optional[str] = None
         self.objective_policy_sha: Optional[str] = None
+        self.training_target_policy_sha: Optional[str] = None
+        self.selection_lock_hash: Optional[str] = None
         self._setup()
 
     def _setup(self) -> None:
@@ -688,19 +833,34 @@ class Stage4Pipeline:
     def stage_checkpoint(self, stage: int) -> Path:
         return self.output / "manifests" / f"STAGE_{stage:02d}_CHECKPOINT.json"
 
+    def core_provenance_inputs(self) -> List[Path]:
+        return [
+            self.output / "manifests" / "STAGE4M_PREDECESSOR_LOCK.json",
+            self.output / "manifests" / "STUDENT_ARCHITECTURE_FREEZE.json",
+            self.output / "manifests" / "KD_OBJECTIVE_POLICY.json",
+            self.output / "manifests" / "TRAINING_TARGET_POLICY.json",
+            self.teacher_path,
+            self.root / "01_benchmark_engineering" / "benchmark" / f"{CANONICAL_BENCHMARK}.h5",
+        ]
+
     def complete_stage(self, stage: int, name: str, outputs: Sequence[Path], inputs: Sequence[Path] = ()) -> None:
         missing = [str(path) for path in outputs if not path.is_file()]
         if missing:
             raise ScientificAbort(f"Stage {stage:02d} missing outputs: {missing}")
+        missing_inputs = [str(path) for path in inputs if not path.is_file()]
+        if missing_inputs:
+            raise ScientificAbort(f"Stage {stage:02d} missing bound inputs: {missing_inputs}")
+        self.hydrate_provenance()
         payload = {
             "stage": stage, "stage_name": name, "pipeline_version": PIPELINE_VERSION,
             "executable_sha256": self.script_sha, "configuration_sha256": self.config.configuration_sha256(),
             "predecessor_lock_sha256": self.predecessor_lock_sha,
             "teacher_sha256": EXPECTED_TEACHER_SHA256, "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
-            "architecture_freeze_sha256": self.architecture_freeze_sha,
-            "objective_policy_sha256": self.objective_policy_sha,
-            "selection_lock_sha256": self.selection_lock_sha() if stage >= 9 else None,
-            "inputs": [{"path": str(path), "sha256": sha256_file(path)} for path in inputs if path.is_file()],
+            "architecture_freeze_sha256": self.architecture_freeze_sha if stage >= 2 else None,
+            "objective_policy_sha256": self.objective_policy_sha if stage >= 2 else None,
+            "training_target_policy_sha256": self.training_target_policy_sha if stage >= 2 else None,
+            "selection_lock_sha256": self.selection_lock_hash if stage >= 9 else None,
+            "inputs": [{"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in inputs],
             "outputs": [{"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in outputs],
             "completed_at": utc_now(), "status": "PASS",
         }
@@ -711,16 +871,37 @@ class Stage4Pipeline:
         if not checkpoint.is_file():
             return False
         try:
+            self.hydrate_provenance()
             payload = json.loads(checkpoint.read_text(encoding="utf-8"))
-            if payload.get("pipeline_version") != PIPELINE_VERSION or payload.get("configuration_sha256") != self.config.configuration_sha256() or payload.get("executable_sha256") != self.script_sha:
+            expected = {
+                "stage": stage,
+                "status": "PASS",
+                "pipeline_version": PIPELINE_VERSION,
+                "configuration_sha256": self.config.configuration_sha256(),
+                "executable_sha256": self.script_sha,
+                "teacher_sha256": EXPECTED_TEACHER_SHA256,
+                "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+                "predecessor_lock_sha256": self.predecessor_lock_sha,
+                "architecture_freeze_sha256": self.architecture_freeze_sha if stage >= 2 else None,
+                "objective_policy_sha256": self.objective_policy_sha if stage >= 2 else None,
+                "training_target_policy_sha256": self.training_target_policy_sha if stage >= 2 else None,
+                "selection_lock_sha256": self.selection_lock_hash if stage >= 9 else None,
+            }
+            if any(payload.get(key) != value for key, value in expected.items()):
                 return False
-            if payload.get("teacher_sha256") != EXPECTED_TEACHER_SHA256 or payload.get("benchmark_sha256") != EXPECTED_BENCHMARK_SHA256:
-                return False
-            current = all(Path(row["path"]).is_file() and sha256_file(Path(row["path"])) == row["sha256"] for row in payload["outputs"])
+            current = bound_file_rows_current(payload["inputs"], require_size=False)
+            current = current and bound_file_rows_current(payload["outputs"], require_size=True)
+            dependency_stages = {
+                1: (), 2: (1,), 3: (1, 2),
+                4: (1, 2, 3), 5: (1, 2, 3), 6: (1, 2, 3), 7: (1, 2, 3),
+                8: (4, 5, 6, 7), 9: (8,), 10: (8, 9), 11: (8, 9, 10),
+                12: tuple(range(1, 12)),
+            }
+            current = current and all(self.stage_current(required) for required in dependency_stages[stage])
             if stage == 12:
-                current = current and (self.output / "MANYTX_STAGE4M_READY.txt").is_file() and self.final_hash_manifest_current()
+                current = current and completed_state_current(self.output)
             return current
-        except (OSError, KeyError, ValueError, json.JSONDecodeError):
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return False
 
     def selection_lock_sha(self) -> Optional[str]:
@@ -850,16 +1031,23 @@ class Stage4Pipeline:
             "state_unchanged": teacher_state_value_sha(teacher) == state_before,
         }
         if not all(teacher_checks.values()): raise ScientificAbort(f"Teacher equivalence failed: {teacher_checks}")
-        freeze, objective = architecture_freeze_payload(), kd_objective_policy()
+        freeze, objective, targets = architecture_freeze_payload(), kd_objective_policy(), training_target_policy()
         if freeze["status"] != "PASS": raise ScientificAbort("Deterministic student violates the 40% compression gate")
         equivalence_path = self.output / "manifests" / "STAGE3M_STAGE4M_TEACHER_EQUIVALENCE.json"
         architecture_path = self.output / "manifests" / "STUDENT_ARCHITECTURE_FREEZE.json"
         objective_path = self.output / "manifests" / "KD_OBJECTIVE_POLICY.json"
+        target_policy_path = self.output / "manifests" / "TRAINING_TARGET_POLICY.json"
         atomic_json(equivalence_path, {"status": "PASS", "checks": teacher_checks, "teacher_state_value_sha256": state_before,
                                       "frozen_stage3m_primitives": "verified during Stage 03 for P0-P3"}, self.output)
         atomic_json(architecture_path, freeze, self.output); atomic_json(objective_path, objective, self.output)
+        atomic_json(target_policy_path, targets, self.output)
         self.architecture_freeze_sha, self.objective_policy_sha = sha256_file(architecture_path), sha256_file(objective_path)
-        self.complete_stage(2, "Teacher equivalence, architecture freeze, leakage audit", [equivalence_path, architecture_path, objective_path], [self.teacher_path])
+        self.training_target_policy_sha = sha256_file(target_policy_path)
+        self.complete_stage(
+            2, "Teacher equivalence, architecture freeze, leakage audit",
+            [equivalence_path, architecture_path, objective_path, target_policy_path],
+            [self.output / "manifests" / "STAGE4M_PREDECESSOR_LOCK.json", self.teacher_path],
+        )
 
     def ensure_context(self) -> Any:
         if self.benchmark is not None: return self.benchmark
@@ -879,7 +1067,15 @@ class Stage4Pipeline:
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             if payload.get("complete") is not True or payload.get("teacher_sha256") != EXPECTED_TEACHER_SHA256 or payload.get("benchmark_sha256") != EXPECTED_BENCHMARK_SHA256:
                 return False
-            return all((store / name).is_file() and tuple(np.load(store / name, mmap_mode="r").shape) == shape for name, shape in required.items())
+            if payload.get("training_sample_kd_target_source") != "ONLINE_TEACHER_FORWARD_ON_SHARED_AUGMENTED_INPUT" or payload.get("train_known_clean_cache_used_for_sample_kd") is not False:
+                return False
+            return all(
+                (store / name).is_file()
+                and tuple(np.load(store / name, mmap_mode="r").shape) == shape
+                and sha256_file(store / name) == payload["files"][name]["sha256"]
+                and (store / name).stat().st_size == int(payload["files"][name]["bytes"])
+                for name, shape in required.items()
+            )
         except (OSError, ValueError, KeyError, json.JSONDecodeError): return False
 
     def build_loader(self, partition: str, batches: Optional[Sequence[Sequence[int]]] = None, seed: int = 0) -> Tuple[Any, DataLoader]:
@@ -913,11 +1109,20 @@ class Stage4Pipeline:
         os.replace(store / "logits.partial.npy", store / "logits.npy"); os.replace(store / "embedding.partial.npy", store / "embedding.npy")
         np.save(store / "labels.npy", metadata.labels.astype(np.int16), allow_pickle=False)
         np.save(store / "global_indices.npy", metadata.indices.astype(np.int64), allow_pickle=False)
+        cache_files = {
+            name: {"sha256": sha256_file(store / name), "bytes": (store / name).stat().st_size}
+            for name in ("logits.npy", "embedding.npy", "labels.npy", "global_indices.npy")
+        }
         manifest = {
             "complete": True, "partition": partition, "rows": cursor, "teacher_sha256": EXPECTED_TEACHER_SHA256,
             "teacher_state_sha256": EXPECTED_TEACHER_STATE_SHA256, "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
             "global_index_value_sha256": sha256_array_values(metadata.indices.astype(np.int64)),
             "logit_shape": [cursor, 98], "embedding_shape": [cursor, 128], "dtype": "float16",
+            "cache_role": "TRAIN_KNOWN_CLEAN_PROTOTYPE_SOURCE" if partition == "train_known" else "SEMANTIC_EVALUATION_CACHE",
+            "training_sample_kd_target_source": "ONLINE_TEACHER_FORWARD_ON_SHARED_AUGMENTED_INPUT",
+            "train_known_clean_cache_used_for_sample_kd": False,
+            "teacher_prototype_source": "TRAIN_KNOWN_CLEAN_TEACHER_EMBEDDINGS",
+            "files": cache_files,
             "strict_rows": False, "generated_at": utc_now(),
         }
         atomic_json(store / "store_manifest.json", manifest, store); (store / "INCOMPLETE").unlink()
@@ -955,7 +1160,10 @@ class Stage4Pipeline:
                 equivalence_rows.append(row)
         equivalence_path = self.output / "manifests" / "STAGE3M_STAGE4M_TEACHER_EQUIVALENCE.json"
         atomic_json(equivalence_path, {"status": "PASS", "partitions": equivalence_rows, "teacher_sha256": EXPECTED_TEACHER_SHA256}, self.output); outputs.append(equivalence_path)
-        self.complete_stage(3, "Non-strict teacher target preparation", outputs, [self.teacher_path])
+        self.complete_stage(
+            3, "Non-strict teacher target preparation", outputs,
+            [*self.core_provenance_inputs(), self.output / "manifests" / "STAGE_02_CHECKPOINT.json"],
+        )
 
     def compatibility_config(self) -> Any:
         return self.stage26.Stage26Config(
@@ -1015,6 +1223,7 @@ class Stage4Pipeline:
             "pipeline_version": PIPELINE_VERSION, "executable_sha256": self.script_sha,
             "configuration_sha256": self.config.configuration_sha256(),
             "objective_policy_sha256": self.objective_policy_sha,
+            "training_target_policy_sha256": self.training_target_policy_sha,
             "architecture_freeze_sha256": self.architecture_freeze_sha,
             "predecessor_lock_sha256": self.predecessor_lock_sha,
             "teacher_sha256": EXPECTED_TEACHER_SHA256, "teacher_state_sha256": EXPECTED_TEACHER_STATE_SHA256,
@@ -1075,10 +1284,8 @@ class Stage4Pipeline:
             stale_epochs = int(payload.get("early_stop_state", {}).get("stale_epochs", 0))
             self.logger.info("Resuming %s seed %d after epoch %d", arm, seed, start_epoch)
         train_meta = self.ensure_context().partitions["train_known"]
-        teacher_store = self.prepare_teacher_cache("train_known")
-        teacher_logits = np.load(teacher_store / "logits.npy", mmap_mode="r")
-        teacher_embedding = np.load(teacher_store / "embedding.npy", mmap_mode="r")
-        prototypes = self.teacher_prototypes().to(self.device)
+        teacher = None if arm == "K0" else self.load_teacher()
+        prototypes = self.teacher_prototypes().to(self.device) if arm == "K3" else None
         augmentation = self.stage26.RFAugmentation(self.compatibility_config())
         history: List[Dict[str, Any]] = []
         teacher_value_before = teacher_state_value_sha(self.load_teacher())
@@ -1094,21 +1301,22 @@ class Stage4Pipeline:
             augmentation_generator = torch.Generator(device=self.device.type); augmentation_generator.manual_seed(seed * 1_000_003 + epoch)
             sums = {name: 0.0 for name in ("total", "ce", "kd", "repr", "proto")}; samples = 0
             for batch in loader:
-                x = batch["x"].to(self.device, non_blocking=True); labels = batch["y"].to(self.device, non_blocking=True)
-                positions = batch["position"].numpy().astype(np.int64)
-                target_logits = torch.from_numpy(np.asarray(teacher_logits[positions], dtype=np.float32)).to(self.device)
-                target_embedding = torch.from_numpy(np.asarray(teacher_embedding[positions], dtype=np.float32)).to(self.device)
-                optimizer.zero_grad(set_to_none=True); x = augmentation(x, augmentation_generator)
+                raw_input = batch["x"].to(self.device, non_blocking=True); labels = batch["y"].to(self.device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
                 use_amp = self.config.amp_enabled and self.device.type == "cuda"
+                output, teacher_output, augmented = shared_augmented_training_forward(
+                    arm, raw_input, augmentation, augmentation_generator, model, teacher, use_amp
+                )
+                target_logits = teacher_output["logits"] if teacher_output is not None else None
+                target_embedding = teacher_output["embedding_normalized"] if teacher_output is not None else None
                 with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_amp):
-                    output = model(x)
                     loss, parts = compute_kd_losses(arm, output, target_logits, target_embedding, labels, auxiliary, prototypes)
                 if not torch.isfinite(loss): raise ScientificAbort(f"Non-finite loss for {arm}/seed={seed}/epoch={epoch}")
                 scaler.scale(loss).backward(); scaler.unscale_(optimizer)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(list(model.parameters()) + (list(auxiliary.parameters()) if auxiliary else []), self.config.gradient_clip_norm)
                 if not torch.isfinite(gradient_norm): raise ScientificAbort(f"Non-finite gradients for {arm}/seed={seed}")
                 scaler.step(optimizer); scaler.update()
-                count = len(x); samples += count; sums["total"] += float(loss.detach().cpu()) * count
+                count = len(augmented); samples += count; sums["total"] += float(loss.detach().cpu()) * count
                 for name, value in parts.items(): sums[name] += float(value.detach().cpu()) * count
             dataset.close(); scheduler.step()
             p0 = self.evaluate_student(model, "p0", auxiliary); p0.update({"arm": arm, "seed": seed, "epoch": epoch})
@@ -1138,7 +1346,12 @@ class Stage4Pipeline:
         outputs = [result_path]
         for seed in SEEDS:
             base = self.training_checkpoint_dir(arm, seed); outputs.extend((base / "latest.pt", base / "best.pt", base / "history.csv"))
-        self.complete_stage(stage, f"Train {arm}", outputs, [self.output / "manifests" / "KD_OBJECTIVE_POLICY.json"])
+        dependencies = [
+            *self.core_provenance_inputs(), self.output / "manifests" / "STAGE_03_CHECKPOINT.json",
+        ]
+        if arm == "K3":
+            dependencies.append(self.output / "teacher_cache_manifests" / "train_known.json")
+        self.complete_stage(stage, f"Train {arm}", outputs, dependencies)
 
     def stage_04(self) -> None: self.train_arm_stage(4, "K0")
     def stage_05(self) -> None: self.train_arm_stage(5, "K1")
@@ -1198,6 +1411,7 @@ class Stage4Pipeline:
             "architecture_signature": freeze["architecture_signature_sha256"], "teacher_sha256": EXPECTED_TEACHER_SHA256,
             "teacher_state_sha256": EXPECTED_TEACHER_STATE_SHA256, "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
             "configuration_sha256": self.config.configuration_sha256(), "objective_policy_sha256": self.objective_policy_sha,
+            "training_target_policy_sha256": self.training_target_policy_sha,
             "architecture_freeze_sha256": self.architecture_freeze_sha, "predecessor_lock_sha256": self.predecessor_lock_sha,
             "training_only_auxiliary_excluded": True,
         }
@@ -1219,13 +1433,18 @@ class Stage4Pipeline:
             "canonical_surrogate_state_sha256": sha256_file(state_path), "selected_arm": selected_arm, "selected_seed": selected_seed,
             "selection_manifest_sha256": sha256_file(selection_path), "architecture_sha256": self.architecture_freeze_sha,
             "objective_policy_sha256": self.objective_policy_sha, "configuration_sha256": self.config.configuration_sha256(),
+            "training_target_policy_sha256": self.training_target_policy_sha,
             "teacher_sha256": EXPECTED_TEACHER_SHA256, "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
             "predecessor_lock_sha256": self.predecessor_lock_sha, "post_selection_model_changes_permitted": False,
             "calibration_unknown_used_for_selection": False, "stage35_strict_used_for_selection": False,
         }
         atomic_json(lock_path, lock, self.output)
         outputs = [selection_path, lock_path, training_path, deploy_path, state_path]
-        self.complete_stage(8, "P0-only canonical surrogate selection and freeze", outputs, [source_path])
+        inputs = [*self.core_provenance_inputs()]
+        for completed_stage, completed_arm in zip(range(4, 8), ARMS):
+            inputs.extend((self.stage_checkpoint(completed_stage), self.output / "tables" / f"{completed_arm}_P0_RESULTS.csv"))
+            inputs.extend(self.training_checkpoint_dir(completed_arm, seed) / "best.pt" for seed in SEEDS)
+        self.complete_stage(8, "P0-only canonical surrogate selection and freeze", outputs, inputs)
 
     def canonical_model(self) -> Tuple[nn.Module, Optional[nn.Module], Dict[str, Any]]:
         deploy_path = self.output / "checkpoints" / "canonical" / "canonical_surrogate_deploy.pt"
@@ -1279,7 +1498,12 @@ class Stage4Pipeline:
         fidelity_path = self.output / "tables" / "KNOWN_DOMAIN_FIDELITY.csv"
         representation_path = self.output / "tables" / "REPRESENTATION_FIDELITY.csv"
         atomic_csv(fidelity_path, pd.DataFrame(rows), self.output); atomic_csv(representation_path, pd.DataFrame(representation), self.output)
-        self.complete_stage(9, "P1-P3 external known-domain diagnostics", [fidelity_path, representation_path], [self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json"])
+        self.complete_stage(
+            9, "P1-P3 external known-domain diagnostics", [fidelity_path, representation_path],
+            [*self.core_provenance_inputs(), self.stage_checkpoint(8),
+             self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json",
+             self.output / "checkpoints" / "canonical" / "canonical_surrogate_deploy.pt"],
+        )
 
     @staticmethod
     def fitted_scores(logits: np.ndarray, embedding: np.ndarray, prototypes: np.ndarray, precision: np.ndarray, variances: np.ndarray) -> np.ndarray:
@@ -1326,7 +1550,11 @@ class Stage4Pipeline:
         diagnostic = self.output / "tables" / "ZD_CALIBRATED_DIAGNOSTIC.csv"; atomic_csv(diagnostic, pd.DataFrame(rows), self.output)
         after = sha256_file(self.output / "checkpoints" / "canonical" / "canonical_surrogate_deploy.pt")
         if before != after: raise ScientificAbort("Calibration Unknown mutated the canonical surrogate")
-        self.complete_stage(10, "Optional ZD_CALIBRATED_DIAGNOSTIC", [diagnostic], [lock])
+        self.complete_stage(
+            10, "Optional ZD_CALIBRATED_DIAGNOSTIC", [diagnostic],
+            [*self.core_provenance_inputs(), self.stage_checkpoint(8), self.stage_checkpoint(9), lock,
+             self.output / "checkpoints" / "canonical" / "canonical_surrogate_deploy.pt"],
+        )
 
     def latency_rows(self, name: str, model: nn.Module) -> List[Dict[str, Any]]:
         rows = []
@@ -1409,7 +1637,14 @@ class Stage4Pipeline:
                 if path.suffix == ".png":
                     image = plt.imread(path); fig, ax = plt.subplots(figsize=(8.27, 11.69)); ax.imshow(image); ax.axis("off"); pages.savefig(fig, bbox_inches="tight"); plt.close(fig)
         outputs = [compression_path, latency_path, seed_path, summary_path, report, workbook, pdf, *figures]
-        self.complete_stage(11, "Compression, preliminary latency, publication", outputs, [deploy_path])
+        self.complete_stage(
+            11, "Compression, preliminary latency, publication", outputs,
+            [*self.core_provenance_inputs(), self.stage_checkpoint(8), self.stage_checkpoint(9), self.stage_checkpoint(10),
+             self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json", deploy_path,
+             self.output / "tables" / "KNOWN_DOMAIN_FIDELITY.csv",
+             self.output / "tables" / "REPRESENTATION_FIDELITY.csv",
+             self.output / "tables" / "ZD_CALIBRATED_DIAGNOSTIC.csv"],
+        )
 
     def create_final_hash_manifest(self) -> Path:
         manifest = self.output / "manifests" / "STAGE4M_HASH_MANIFEST.json"
@@ -1424,14 +1659,7 @@ class Stage4Pipeline:
         return manifest
 
     def final_hash_manifest_current(self) -> bool:
-        path = self.output / "manifests" / "STAGE4M_HASH_MANIFEST.json"
-        if not path.is_file(): return False
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            return payload.get("algorithm") == "SHA-256" and int(payload.get("count", -1)) == len(payload["files"]) and all(
-                (self.output / row["relative_path"]).is_file() and sha256_file(self.output / row["relative_path"]) == row["sha256"] for row in payload["files"]
-            )
-        except (OSError, KeyError, ValueError, json.JSONDecodeError): return False
+        return final_hash_manifest_current(self.output)
 
     def stage_12(self) -> None:
         ready, not_ready = self.output / "MANYTX_STAGE4M_READY.txt", self.output / "MANYTX_STAGE4M_NOT_READY.txt"
@@ -1475,7 +1703,11 @@ class Stage4Pipeline:
         ])
         atomic_text(ready, ready_text, self.output)
         if parse_ready(ready).get("marker") != "MANYTX_STAGE4M_READY" or not self.final_hash_manifest_current(): raise ScientificAbort("READY/hash verification failed")
-        self.complete_stage(12, "Final audit, hash manifest, READY transaction", [final, manifest, ready], [self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json"])
+        stage_dependencies = [self.stage_checkpoint(stage) for stage in range(1, 12)]
+        self.complete_stage(
+            12, "Final audit, hash manifest, READY transaction", [final, manifest, ready],
+            [*stage_dependencies, self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json"],
+        )
         if not self.stage_current(12): raise ScientificAbort("Stage 12 durable checkpoint verification failed")
         if not_ready.exists(): not_ready.unlink()
         if not ready.is_file() or not_ready.exists(): raise ScientificAbort("READY-only final state verification failed")
@@ -1485,9 +1717,13 @@ class Stage4Pipeline:
         predecessor = self.output / "manifests" / "STAGE4M_PREDECESSOR_LOCK.json"
         architecture = self.output / "manifests" / "STUDENT_ARCHITECTURE_FREEZE.json"
         objective = self.output / "manifests" / "KD_OBJECTIVE_POLICY.json"
+        targets = self.output / "manifests" / "TRAINING_TARGET_POLICY.json"
+        selection = self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json"
         self.predecessor_lock_sha = sha256_file(predecessor) if predecessor.is_file() else None
         self.architecture_freeze_sha = sha256_file(architecture) if architecture.is_file() else None
         self.objective_policy_sha = sha256_file(objective) if objective.is_file() else None
+        self.training_target_policy_sha = sha256_file(targets) if targets.is_file() else None
+        self.selection_lock_hash = sha256_file(selection) if selection.is_file() else None
 
     def preflight(self) -> None:
         benchmark = self.root / "01_benchmark_engineering" / "benchmark" / f"{CANONICAL_BENCHMARK}.h5"
@@ -1548,7 +1784,8 @@ def synthetic_validation() -> None:
     output = student(torch.randn(8, 2, 256)); teacher_logits = torch.randn(8, 98); teacher_embedding = F.normalize(torch.randn(8, 128), dim=1)
     labels = torch.arange(8) % 4; prototypes = F.normalize(torch.randn(98, 128), dim=1)
     for arm in ARMS:
-        loss, parts = compute_kd_losses(arm, output, teacher_logits, teacher_embedding, labels, auxiliary if arm in {"K2", "K3"} else None, prototypes)
+        targets = (None, None) if arm == "K0" else (teacher_logits, teacher_embedding)
+        loss, parts = compute_kd_losses(arm, output, targets[0], targets[1], labels, auxiliary if arm in {"K2", "K3"} else None, prototypes)
         if not torch.isfinite(loss) or set(parts) != {"ce", "kd", "repr", "proto"}: raise ScientificAbort(f"Synthetic objective failed: {arm}")
     print("STAGE4M_SYNTHETIC_VALIDATION_PASS")
 
@@ -1580,14 +1817,29 @@ def config_from_args(args: argparse.Namespace) -> Stage4Config:
     return Stage4Config(**values)
 
 
-def write_not_ready(config: Stage4Config, exc: BaseException) -> None:
-    output = config.output_root; output.mkdir(parents=True, exist_ok=True)
+def write_not_ready(config: Stage4Config, exc: BaseException) -> bool:
+    output = config.output_root
+    if completed_state_current(output):
+        print("STAGE4M_COMPLETED_STATE_PROTECTED")
+        return False
+    output.mkdir(parents=True, exist_ok=True)
     ready = output / "MANYTX_STAGE4M_READY.txt"
     if ready.exists(): ready.unlink()
     atomic_text(output / "MANYTX_STAGE4M_NOT_READY.txt", f"MANYTX_STAGE4M_NOT_READY\n{type(exc).__name__}: {exc}\n", output)
     manifests = output / "manifests"; manifests.mkdir(parents=True, exist_ok=True)
     atomic_json(manifests / "STAGE4M_FAILURE.json", {"status": "MANYTX_STAGE4M_NOT_READY", "error_type": type(exc).__name__,
                                                        "error": str(exc), "traceback": traceback.format_exc(), "generated_at": utc_now()}, output)
+    return True
+
+
+def invocation_output(args: argparse.Namespace, config: Optional[Stage4Config]) -> Optional[Path]:
+    if config is not None:
+        return config.output_root
+    if args.output_dir:
+        return Path(args.output_dir).expanduser().resolve()
+    if args.branch_root:
+        return Path(args.branch_root).expanduser().resolve() / "06_surrogate_kd"
+    return None
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -1596,13 +1848,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     config: Optional[Stage4Config] = None
     try:
         config = config_from_args(args)
+        if completed_state_current(config.output_root):
+            print("MANYTX_STAGE4M_ALREADY_READY" if not args.preflight else "STAGE4M_COMPLETED_STATE_PROTECTED")
+            return 0
         print("=" * 100 + "\nSTAGE 4M — WISIG MANYTX SURROGATE KNOWLEDGE DISTILLATION\n" + "=" * 100)
         pipeline = Stage4Pipeline(config)
         if args.preflight: pipeline.preflight()
         else: pipeline.run()
         return 0
     except BaseException as exc:
-        if config is not None: write_not_ready(config, exc)
+        output = invocation_output(args, config)
+        if output is not None and completed_state_current(output):
+            print("STAGE4M_COMPLETED_STATE_PROTECTED")
+            print(f"{type(exc).__name__}: {exc}")
+            return 1
+        if config is not None:
+            write_not_ready(config, exc)
         print(f"MANYTX_STAGE4M_NOT_READY\n{type(exc).__name__}: {exc}")
         traceback.print_exc()
         return 1

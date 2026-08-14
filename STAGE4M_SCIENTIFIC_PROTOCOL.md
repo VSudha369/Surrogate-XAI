@@ -14,6 +14,8 @@ The student preserves the teacher’s operation order, kernels, strides, GroupNo
 
 At temperature `T=4`, K0 is CE; K1 is `0.5 CE + 0.5 KD`; K2 is `0.4 CE + 0.4 KD + 0.2 representation`; K3 is `0.35 CE + 0.35 KD + 0.15 representation + 0.15 prototype`. No coefficient, temperature, architecture, optimizer, or seed search is permitted.
 
+For every training batch, RF augmentation is applied exactly once. K1-K3 pass that exact augmented tensor to both the frozen teacher and student; the online teacher logits/embedding are detached sample-matched targets. K0 performs no teacher training forward. Clean Train Known teacher embeddings are used only to construct K3 class prototypes, while clean P0-P3 caches remain evaluation-only.
+
 ## Data and selection
 
 All 12 canonical trainings use Train Known only for seeds 42, 123, and 2026. P0 alone controls early stopping, best epoch, arm selection, and seed selection. P1-P3 are evaluated only after freeze. Calibration Unknown is opened only after the immutable selection lock and is labelled `ZD_CALIBRATED_DIAGNOSTIC`; it cannot alter model weights or selection.
@@ -26,4 +28,6 @@ The fixed schedule inherits Stage 2.6M’s AdamW (`lr=0.001`, `weight_decay=0.00
 
 ## Finality
 
-Stage 12 writes final status, verifies the final hash manifest, writes READY, writes the durable Stage-12 checkpoint last, verifies it, and only then removes NOT_READY. A canonical READY is impossible with a failed fidelity/compression/leakage gate.
+Every reusable stage revalidates its full recorded input graph, provenance hashes, output hashes, and output sizes. Training checkpoints additionally bind `TRAINING_TARGET_POLICY.json`, preventing any pre-hotfix clean-target checkpoint from resuming.
+
+Stage 12 writes final status, verifies the final hash manifest, writes READY, writes the durable Stage-12 checkpoint last, verifies it, and only then removes NOT_READY. A verified completed transaction is immutable: later failures cannot replace READY, and a normal second invocation returns `MANYTX_STAGE4M_ALREADY_READY` without scientific writes.

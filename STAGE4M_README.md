@@ -16,6 +16,8 @@ subprocess.check_call([
 ])
 ```
 
-Preflight verifies Drive/root uniqueness, predecessor identities, benchmark schema, teacher identity/forward contract, strict guards, GPU, and output containment. It performs no training, cache generation, selection, Calibration Unknown access, strict access, or READY creation.
+Preflight verifies Drive/root uniqueness, predecessor identities, benchmark schema, teacher identity/forward contract, strict guards, GPU, and output containment. It performs no training, cache generation, architecture/objective freeze, selection, Calibration Unknown access, strict access, or READY creation.
+
+Canonical K1-K3 training uses online frozen-teacher targets from the exact once-augmented tensor also given to the student. K0 does not execute a teacher training forward. Resume checkpoints bind this policy and the complete upstream dependency graph. Once Stage 12 is valid, later invocations preserve READY; a second normal invocation exits with `MANYTX_STAGE4M_ALREADY_READY` without writes.
 
 Canonical training remains gated on review of this code and the Drive-backed preflight result.

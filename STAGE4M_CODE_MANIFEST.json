@@ -2,16 +2,16 @@
   "algorithm": "SHA-256",
   "pipeline_version": "1.0.0",
   "files": [
-    {"path": "Stage4M_WiSig_ManyTx_Surrogate_KD_v1_0_0.py", "bytes": 103649, "sha256": "a7a0134a13b40a03d7ac9ec88a511bc783faf3034f178fbfdcc15254076e6c1c"},
+    {"path": "Stage4M_WiSig_ManyTx_Surrogate_KD_v1_0_0.py", "bytes": 117338, "sha256": "a770fe52a83a408eedd7e8affaff120dd1d56eb5f243da52f05501252e4b4de3"},
     {"path": "Stage4M_Colab_Launcher_v1_0_0.py", "bytes": 4001, "sha256": "8c81690c29920ea08441fe3b4aff1f58cf7857d5718807acd6d5e01888ed460d"},
     {"path": "Stage4M_WiSig_ManyTx_Surrogate_KD_v1_0_0.ipynb", "bytes": 1538, "sha256": "526d57bf6b44dfd7849ebc96bee0700623eacbc25e3bd9c811dac4529f4c56dd"},
-    {"path": "validate_stage4m_v1_0_0.py", "bytes": 15535, "sha256": "63877c7ef36601d1c669c63325ecd44e86fbda374045c517a0f6e87bac90711d"},
+    {"path": "validate_stage4m_v1_0_0.py", "bytes": 31366, "sha256": "61209b5dd27f7a8db6b66915168e37db7d83558d2b8327fb60a224564ecacf15"},
     {"path": "stage4m_config_v1_0_0.example.json", "bytes": 416, "sha256": "2d2af0d4e1b4a7ac0e1d621af0d5a98dae76605dae16b3c46aac712591c51eba"},
     {"path": "requirements_stage4m.txt", "bytes": 146, "sha256": "7fa51a2eb698f39dba4e7b0ad43ba64fedc3250f28932d118ff0d9c322ba85f2"},
-    {"path": "STAGE4M_SCIENTIFIC_PROTOCOL.md", "bytes": 2665, "sha256": "6a5a1c7da9e2c2219ccf9599a15858693a3f9fbe146be912fb09d519137fcbcd"},
-    {"path": "STAGE4M_OUTPUT_SCHEMA.md", "bytes": 1638, "sha256": "946bf3617593945e5e941589a467390683ceb88d46cb8b667216a237b1d7cc34"},
-    {"path": "STAGE4M_VALIDATION_CHECKLIST.md", "bytes": 1249, "sha256": "f38d16b9bab274a6cfa9d502895ed480d3b8f5b5e945c6712b7d82f1deb72404"},
-    {"path": "STAGE4M_README.md", "bytes": 953, "sha256": "674db3c442e9dfafd65f4eda6600b82d79a02d4afabce65ab7cc571e7d145100"},
+    {"path": "STAGE4M_SCIENTIFIC_PROTOCOL.md", "bytes": 3412, "sha256": "7a2ded16db4930fbcb90c38beaa71daa50cd82fc70e3bc1e4186296d9bd7bac3"},
+    {"path": "STAGE4M_OUTPUT_SCHEMA.md", "bytes": 2187, "sha256": "4a72304c5602dfb9308d84270b5c628c2a39f6c19a98c6a7f1e306e219d237f9"},
+    {"path": "STAGE4M_VALIDATION_CHECKLIST.md", "bytes": 1640, "sha256": "0d5ac38f3cb7a057aaa5884da7721aa7485fb5b4bb688c77634ffbfe1dde3188"},
+    {"path": "STAGE4M_README.md", "bytes": 1380, "sha256": "f003c27b0da2c46960a25b67e7c845f8fbee3838e1252a30168e3c3dfe47b7f2"},
     {"path": "STAGE4M_PREDECESSOR_DRIVE_AUDIT.json", "bytes": 8910, "sha256": "354b1731b87009fbd07c8f6857810ede070e2511f69f68267ebd630ef3c88443"},
     {"path": "STAGE4M_PREDECESSOR_DRIVE_AUDIT.md", "bytes": 3827, "sha256": "3ef116a34c25b0fc52d0c880d1cdc76b0f7c3063ab0b0d9f3416ad3e1b686b3e"}
   ]
