@@ -8,6 +8,7 @@ All canonical output is contained by `<canonical-root>/06_surrogate_kd`.
 - `manifests/STUDENT_ARCHITECTURE_FREEZE.json`: complete layer table and compression gate.
 - `manifests/KD_OBJECTIVE_POLICY.json`: exact T=4 objective formulas and coefficients.
 - `manifests/TRAINING_TARGET_POLICY.json`: shared single-augmentation, online sample-matched KD, K0 no-teacher-forward, and clean prototype-source contract.
+- `manifests/AMP_RUNTIME_SAFETY_POLICY.json`: fixed CUDA-AMP overflow backoff/skip policy, 32-consecutive-overflow ceiling, epoch scheduler scope, norm-5 clipping, and explicit pre-hotfix checkpoint restart policy.
 - `checkpoints/K0..K3/seed_<seed>/`: exact-resume `latest.pt`, P0-selected `best.pt`, and history.
 - `manifests/CANONICAL_SURROGATE_SELECTION.json`: P0-only evidence and deterministic ranking.
 - `manifests/CANONICAL_SURROGATE_SELECTION_LOCK.json`: immutable canonical model identity.
@@ -21,4 +22,4 @@ All canonical output is contained by `<canonical-root>/06_surrogate_kd`.
 
 Local teacher caches live under `/content/wisig_stage4m_cache`, never contain strict rows, and are scientifically disposable. Clean Train Known cache data are prototype-only and never sample-level KD targets; P0-P3 caches are unaugmented evaluation/fidelity evidence.
 
-Each `STAGE_<NN>_CHECKPOINT.json` binds current pipeline/configuration, predecessor, architecture, objective, training-target policy, teacher, benchmark, stage-specific selection lock, every required input SHA-256, and every output SHA-256 plus byte size.
+Each `STAGE_<NN>_CHECKPOINT.json` binds current pipeline/configuration, predecessor, architecture, objective, training-target policy, AMP runtime-safety policy, teacher, benchmark, stage-specific selection lock, every required input SHA-256, and every output SHA-256 plus byte size. Training checkpoints also persist `batches_seen`, `optimizer_steps_completed`, `amp_overflow_skipped_steps`, `consecutive_amp_overflow_peak`, cumulative `total_amp_overflows`, and the full AMP runtime state.

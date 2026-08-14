@@ -77,6 +77,8 @@ REFERENCE_TEACHER_METRICS = {
     "p3": {"accuracy": 0.382673487544484, "fixed98_macro_f1": 0.3400004270779978},
 }
 KD_TEMPERATURE = 4.0
+MAX_CONSECUTIVE_AMP_OVERFLOWS = 32
+PRE_AMP_HOTFIX_EXECUTABLE_SHA256 = "a770fe52a83a408eedd7e8affaff120dd1d56eb5f243da52f05501252e4b4de3"
 ARM_OBJECTIVES: Dict[str, Dict[str, float]] = {
     "K0": {"ce": 1.00, "kd": 0.00, "repr": 0.00, "proto": 0.00},
     "K1": {"ce": 0.50, "kd": 0.50, "repr": 0.00, "proto": 0.00},
@@ -285,6 +287,7 @@ def completed_state_current(output: Path) -> bool:
             "architecture_freeze_sha256": output / "manifests" / "STUDENT_ARCHITECTURE_FREEZE.json",
             "objective_policy_sha256": output / "manifests" / "KD_OBJECTIVE_POLICY.json",
             "training_target_policy_sha256": output / "manifests" / "TRAINING_TARGET_POLICY.json",
+            "amp_runtime_safety_policy_sha256": output / "manifests" / "AMP_RUNTIME_SAFETY_POLICY.json",
             "selection_lock_sha256": lock_path,
         }
         if stage_values.get("pipeline_version") != PIPELINE_VERSION:
@@ -323,6 +326,7 @@ def completed_state_current(output: Path) -> bool:
             "selected_seed": str(final_values.get("selected_seed")),
             "canonical_surrogate_sha256": str(lock.get("canonical_surrogate_sha256")),
             "canonical_surrogate_state_sha256": str(lock.get("canonical_surrogate_state_sha256")),
+            "amp_runtime_safety_policy_sha256": str(final_values.get("amp_runtime_safety_policy_sha256")),
         }
         return lock.get("status") == "LOCKED" and all(ready_values.get(key) == value for key, value in required.items())
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -634,6 +638,115 @@ def training_target_policy() -> Dict[str, Any]:
     }
 
 
+def amp_runtime_safety_policy() -> Dict[str, Any]:
+    return {
+        "version": PIPELINE_VERSION,
+        "runtime_safety_only": True,
+        "scientific_independent_variable": False,
+        "amp_enabled_on_cuda": True,
+        "overflow_policy": "SKIP_STEP_BACKOFF_AND_RETRY_NEXT_BATCH",
+        "max_consecutive_amp_overflows": MAX_CONSECUTIVE_AMP_OVERFLOWS,
+        "non_amp_nonfinite_gradient": "ABORT",
+        "optimizer_step_on_overflow": False,
+        "scheduler_scope": "EPOCH",
+        "gradient_clip_norm": 5.0,
+        "legacy_checkpoint_policy": {
+            "previous_executable_sha256": PRE_AMP_HOTFIX_EXECUTABLE_SHA256,
+            "action": "REJECT_AND_RESTART_FROM_SCRATCH",
+            "scope": {"arm": "K0", "seed": 42, "maximum_completed_epoch": 1},
+            "reason": "new executable and predecessor/preflight provenance invalidate the pre-hotfix checkpoint",
+        },
+    }
+
+
+def new_amp_runtime_state() -> Dict[str, int]:
+    return {
+        "consecutive_amp_overflows": 0,
+        "total_amp_overflows": 0,
+        "consecutive_amp_overflow_peak": 0,
+        "total_batches_seen": 0,
+        "total_optimizer_steps_completed": 0,
+        "total_amp_overflow_skipped_steps": 0,
+    }
+
+
+def new_epoch_amp_accounting() -> Dict[str, int]:
+    return {
+        "batches_seen": 0,
+        "optimizer_steps_completed": 0,
+        "amp_overflow_skipped_steps": 0,
+        "consecutive_amp_overflow_peak": 0,
+        "total_amp_overflows": 0,
+    }
+
+
+def gradients_finite(parameters: Sequence[torch.nn.Parameter], gradient_norm: torch.Tensor) -> bool:
+    if not bool(torch.isfinite(gradient_norm).item()):
+        return False
+    for parameter in parameters:
+        if parameter.grad is not None and not bool(torch.isfinite(parameter.grad).all().item()):
+            return False
+    return True
+
+
+def apply_optimizer_step_with_amp_policy(
+    optimizer: torch.optim.Optimizer, scaler: Any, use_amp: bool, finite_gradients: bool,
+    runtime_state: Dict[str, int], epoch_state: Dict[str, int], context: str,
+    logger: Optional[logging.Logger] = None,
+) -> bool:
+    """Apply one optimizer decision under the frozen AMP runtime-safety policy."""
+    runtime_state["total_batches_seen"] += 1
+    epoch_state["batches_seen"] += 1
+    if not finite_gradients:
+        if not use_amp:
+            raise ScientificAbort(f"Non-finite gradients with AMP disabled for {context}")
+        old_scale = float(scaler.get_scale())
+        backoff = float(scaler.get_backoff_factor()) if hasattr(scaler, "get_backoff_factor") else 0.5
+        new_scale = old_scale * backoff
+        # Use GradScaler's public manual-scale update path so an overflowed batch can
+        # never reach optimizer.step, even if the non-finite condition was detected
+        # from the clipped total norm rather than GradScaler's found_inf bookkeeping.
+        scaler.update(new_scale=new_scale)
+        optimizer.zero_grad(set_to_none=True)
+        runtime_state["consecutive_amp_overflows"] += 1
+        runtime_state["total_amp_overflows"] += 1
+        runtime_state["total_amp_overflow_skipped_steps"] += 1
+        runtime_state["consecutive_amp_overflow_peak"] = max(
+            runtime_state["consecutive_amp_overflow_peak"], runtime_state["consecutive_amp_overflows"]
+        )
+        epoch_state["amp_overflow_skipped_steps"] += 1
+        epoch_state["consecutive_amp_overflow_peak"] = max(
+            epoch_state["consecutive_amp_overflow_peak"], runtime_state["consecutive_amp_overflows"]
+        )
+        epoch_state["total_amp_overflows"] = runtime_state["total_amp_overflows"]
+        if logger is not None:
+            logger.warning(
+                "AMP overflow skipped | %s | old_scale=%.1f new_scale=%.1f consecutive=%d total=%d",
+                context, old_scale, new_scale, runtime_state["consecutive_amp_overflows"], runtime_state["total_amp_overflows"],
+            )
+        if runtime_state["consecutive_amp_overflows"] > MAX_CONSECUTIVE_AMP_OVERFLOWS:
+            raise ScientificAbort(
+                f"Exceeded {MAX_CONSECUTIVE_AMP_OVERFLOWS} consecutive AMP overflows for {context}"
+            )
+        return False
+    if use_amp:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    runtime_state["consecutive_amp_overflows"] = 0
+    runtime_state["total_optimizer_steps_completed"] += 1
+    epoch_state["optimizer_steps_completed"] += 1
+    epoch_state["total_amp_overflows"] = runtime_state["total_amp_overflows"]
+    return True
+
+
+def assert_epoch_has_optimizer_step(epoch_state: Mapping[str, int], context: str) -> None:
+    if int(epoch_state.get("optimizer_steps_completed", 0)) <= 0:
+        raise ScientificAbort(f"Epoch completed with zero optimizer steps for {context}")
+
+
 def shared_augmented_training_forward(
     arm: str, raw_input: torch.Tensor, augmentation: Any, augmentation_generator: torch.Generator,
     student: nn.Module, teacher: Optional[nn.Module], use_amp: bool,
@@ -800,6 +913,7 @@ class Stage4Pipeline:
         self.architecture_freeze_sha: Optional[str] = None
         self.objective_policy_sha: Optional[str] = None
         self.training_target_policy_sha: Optional[str] = None
+        self.amp_runtime_safety_policy_sha: Optional[str] = None
         self.selection_lock_hash: Optional[str] = None
         self._setup()
 
@@ -839,6 +953,7 @@ class Stage4Pipeline:
             self.output / "manifests" / "STUDENT_ARCHITECTURE_FREEZE.json",
             self.output / "manifests" / "KD_OBJECTIVE_POLICY.json",
             self.output / "manifests" / "TRAINING_TARGET_POLICY.json",
+            self.output / "manifests" / "AMP_RUNTIME_SAFETY_POLICY.json",
             self.teacher_path,
             self.root / "01_benchmark_engineering" / "benchmark" / f"{CANONICAL_BENCHMARK}.h5",
         ]
@@ -859,6 +974,7 @@ class Stage4Pipeline:
             "architecture_freeze_sha256": self.architecture_freeze_sha if stage >= 2 else None,
             "objective_policy_sha256": self.objective_policy_sha if stage >= 2 else None,
             "training_target_policy_sha256": self.training_target_policy_sha if stage >= 2 else None,
+            "amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha if stage >= 2 else None,
             "selection_lock_sha256": self.selection_lock_hash if stage >= 9 else None,
             "inputs": [{"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in inputs],
             "outputs": [{"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in outputs],
@@ -885,6 +1001,7 @@ class Stage4Pipeline:
                 "architecture_freeze_sha256": self.architecture_freeze_sha if stage >= 2 else None,
                 "objective_policy_sha256": self.objective_policy_sha if stage >= 2 else None,
                 "training_target_policy_sha256": self.training_target_policy_sha if stage >= 2 else None,
+            "amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha if stage >= 2 else None,
                 "selection_lock_sha256": self.selection_lock_hash if stage >= 9 else None,
             }
             if any(payload.get(key) != value for key, value in expected.items()):
@@ -1032,20 +1149,23 @@ class Stage4Pipeline:
         }
         if not all(teacher_checks.values()): raise ScientificAbort(f"Teacher equivalence failed: {teacher_checks}")
         freeze, objective, targets = architecture_freeze_payload(), kd_objective_policy(), training_target_policy()
+        amp_policy = amp_runtime_safety_policy()
         if freeze["status"] != "PASS": raise ScientificAbort("Deterministic student violates the 40% compression gate")
         equivalence_path = self.output / "manifests" / "STAGE3M_STAGE4M_TEACHER_EQUIVALENCE.json"
         architecture_path = self.output / "manifests" / "STUDENT_ARCHITECTURE_FREEZE.json"
         objective_path = self.output / "manifests" / "KD_OBJECTIVE_POLICY.json"
         target_policy_path = self.output / "manifests" / "TRAINING_TARGET_POLICY.json"
+        amp_policy_path = self.output / "manifests" / "AMP_RUNTIME_SAFETY_POLICY.json"
         atomic_json(equivalence_path, {"status": "PASS", "checks": teacher_checks, "teacher_state_value_sha256": state_before,
                                       "frozen_stage3m_primitives": "verified during Stage 03 for P0-P3"}, self.output)
         atomic_json(architecture_path, freeze, self.output); atomic_json(objective_path, objective, self.output)
-        atomic_json(target_policy_path, targets, self.output)
+        atomic_json(target_policy_path, targets, self.output); atomic_json(amp_policy_path, amp_policy, self.output)
         self.architecture_freeze_sha, self.objective_policy_sha = sha256_file(architecture_path), sha256_file(objective_path)
         self.training_target_policy_sha = sha256_file(target_policy_path)
+        self.amp_runtime_safety_policy_sha = sha256_file(amp_policy_path)
         self.complete_stage(
             2, "Teacher equivalence, architecture freeze, leakage audit",
-            [equivalence_path, architecture_path, objective_path, target_policy_path],
+            [equivalence_path, architecture_path, objective_path, target_policy_path, amp_policy_path],
             [self.output / "manifests" / "STAGE4M_PREDECESSOR_LOCK.json", self.teacher_path],
         )
 
@@ -1224,6 +1344,7 @@ class Stage4Pipeline:
             "configuration_sha256": self.config.configuration_sha256(),
             "objective_policy_sha256": self.objective_policy_sha,
             "training_target_policy_sha256": self.training_target_policy_sha,
+            "amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha,
             "architecture_freeze_sha256": self.architecture_freeze_sha,
             "predecessor_lock_sha256": self.predecessor_lock_sha,
             "teacher_sha256": EXPECTED_TEACHER_SHA256, "teacher_state_sha256": EXPECTED_TEACHER_STATE_SHA256,
@@ -1239,11 +1360,44 @@ class Stage4Pipeline:
         mismatches = [key for key, value in expected.items() if payload.get(key) != value]
         if mismatches: raise ScientificAbort(f"STALE_STAGE4M_CHECKPOINT {arm}/seed={seed}: {mismatches}")
 
+    @staticmethod
+    def known_pre_amp_checkpoint_requires_restart(payload: Mapping[str, Any], arm: str, seed: int) -> bool:
+        return (
+            payload.get("executable_sha256") == PRE_AMP_HOTFIX_EXECUTABLE_SHA256
+            and payload.get("arm") == arm == "K0"
+            and int(payload.get("seed", -1)) == seed == 42
+            and int(payload.get("epoch", -1)) <= 1
+            and payload.get("amp_runtime_safety_policy_sha256") in (None, "")
+        )
+
+    def discard_known_pre_amp_checkpoint(self, base: Path, payload: Mapping[str, Any], arm: str, seed: int) -> None:
+        if not self.known_pre_amp_checkpoint_requires_restart(payload, arm, seed):
+            raise ScientificAbort(f"STALE_STAGE4M_CHECKPOINT {arm}/seed={seed}: unknown incompatible checkpoint")
+        latest, best_path = base / "latest.pt", base / "best.pt"
+        audit = {
+            "status": "REJECTED_AND_RESTARTED",
+            "reason": "AMP overflow hotfix changed executable/runtime provenance; clean restart required",
+            "previous_executable_sha256": payload.get("executable_sha256"),
+            "previous_epoch": int(payload.get("epoch", -1)),
+            "arm": arm, "seed": seed,
+            "previous_latest_sha256": sha256_file(latest) if latest.is_file() else None,
+            "previous_best_sha256": sha256_file(best_path) if best_path.is_file() else None,
+            "new_amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha,
+            "recorded_at": utc_now(),
+        }
+        audit_path = self.output / "manifests" / f"PRE_AMP_HOTFIX_RESTART_{arm}_SEED_{seed}.json"
+        atomic_json(audit_path, audit, self.output)
+        for path in (latest, best_path):
+            if path.is_file():
+                path.unlink()
+        self.logger.warning("Rejected pre-AMP-hotfix checkpoint for %s seed %d; restarting from epoch 1", arm, seed)
+
     def save_training_checkpoint(
         self, path: Path, arm: str, seed: int, epoch: int, model: nn.Module,
         auxiliary: Optional[nn.Module], optimizer: torch.optim.Optimizer, scheduler: Any,
         scaler: Any, best_metrics: Optional[Mapping[str, float]], stale_epochs: int,
         loader_generator_state: Optional[torch.Tensor], exposure_sha: str,
+        amp_runtime_state: Mapping[str, int], epoch_amp_accounting: Mapping[str, int],
     ) -> None:
         payload = {
             **self.checkpoint_validation_fields(arm, seed), "epoch": epoch,
@@ -1252,6 +1406,12 @@ class Stage4Pipeline:
             "scaler_state": scaler.state_dict(), "best_p0_metrics": dict(best_metrics or {}),
             "early_stop_state": {"stale_epochs": stale_epochs}, "rng_state": capture_rng(),
             "dataloader_generator_state": loader_generator_state, "sampler_exposure_sha256": exposure_sha,
+            "amp_runtime_state": dict(amp_runtime_state), "epoch_amp_accounting": dict(epoch_amp_accounting),
+            "batches_seen": int(epoch_amp_accounting["batches_seen"]),
+            "optimizer_steps_completed": int(epoch_amp_accounting["optimizer_steps_completed"]),
+            "amp_overflow_skipped_steps": int(epoch_amp_accounting["amp_overflow_skipped_steps"]),
+            "consecutive_amp_overflow_peak": int(epoch_amp_accounting["consecutive_amp_overflow_peak"]),
+            "total_amp_overflows": int(amp_runtime_state["total_amp_overflows"]),
             "teacher_optimizer_owned": False, "teacher_targets_detached": True, "saved_at": utc_now(),
         }
         atomic_torch_save(path, payload, self.output)
@@ -1274,15 +1434,26 @@ class Stage4Pipeline:
         latest, best_path = base / "latest.pt", base / "best.pt"
         model, auxiliary, optimizer, scheduler, scaler = self.create_training_objects(arm, seed)
         start_epoch, best_metrics, stale_epochs = 0, None, 0
+        amp_runtime_state = new_amp_runtime_state()
         if self.config.resume and latest.is_file():
-            payload = safe_torch_load(latest, self.device); self.validate_training_checkpoint(payload, arm, seed)
-            model.load_state_dict(payload["student_state"], strict=True)
-            if auxiliary is not None: auxiliary.load_state_dict(payload["auxiliary_state"], strict=True)
-            optimizer.load_state_dict(payload["optimizer_state"]); scheduler.load_state_dict(payload["scheduler_state"])
-            scaler.load_state_dict(payload["scaler_state"]); restore_rng(payload["rng_state"])
-            start_epoch, best_metrics = int(payload["epoch"]), dict(payload.get("best_p0_metrics") or {}) or None
-            stale_epochs = int(payload.get("early_stop_state", {}).get("stale_epochs", 0))
-            self.logger.info("Resuming %s seed %d after epoch %d", arm, seed, start_epoch)
+            payload = safe_torch_load(latest, self.device)
+            try:
+                self.validate_training_checkpoint(payload, arm, seed)
+            except ScientificAbort:
+                if self.known_pre_amp_checkpoint_requires_restart(payload, arm, seed):
+                    self.discard_known_pre_amp_checkpoint(base, payload, arm, seed)
+                else:
+                    raise
+            else:
+                model.load_state_dict(payload["student_state"], strict=True)
+                if auxiliary is not None: auxiliary.load_state_dict(payload["auxiliary_state"], strict=True)
+                optimizer.load_state_dict(payload["optimizer_state"]); scheduler.load_state_dict(payload["scheduler_state"])
+                scaler.load_state_dict(payload["scaler_state"]); restore_rng(payload["rng_state"])
+                start_epoch, best_metrics = int(payload["epoch"]), dict(payload.get("best_p0_metrics") or {}) or None
+                stale_epochs = int(payload.get("early_stop_state", {}).get("stale_epochs", 0))
+                loaded_runtime = payload.get("amp_runtime_state") or {}
+                amp_runtime_state.update({key: int(loaded_runtime.get(key, value)) for key, value in amp_runtime_state.items()})
+                self.logger.info("Resuming %s seed %d after epoch %d", arm, seed, start_epoch)
         train_meta = self.ensure_context().partitions["train_known"]
         teacher = None if arm == "K0" else self.load_teacher()
         prototypes = self.teacher_prototypes().to(self.device) if arm == "K3" else None
@@ -1300,7 +1471,9 @@ class Stage4Pipeline:
             if auxiliary is not None: auxiliary.train()
             augmentation_generator = torch.Generator(device=self.device.type); augmentation_generator.manual_seed(seed * 1_000_003 + epoch)
             sums = {name: 0.0 for name in ("total", "ce", "kd", "repr", "proto")}; samples = 0
-            for batch in loader:
+            epoch_amp_accounting = new_epoch_amp_accounting()
+            trainable_parameters = list(model.parameters()) + (list(auxiliary.parameters()) if auxiliary is not None else [])
+            for batch_index, batch in enumerate(loader, start=1):
                 raw_input = batch["x"].to(self.device, non_blocking=True); labels = batch["y"].to(self.device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 use_amp = self.config.amp_enabled and self.device.type == "cuda"
@@ -1313,20 +1486,34 @@ class Stage4Pipeline:
                     loss, parts = compute_kd_losses(arm, output, target_logits, target_embedding, labels, auxiliary, prototypes)
                 if not torch.isfinite(loss): raise ScientificAbort(f"Non-finite loss for {arm}/seed={seed}/epoch={epoch}")
                 scaler.scale(loss).backward(); scaler.unscale_(optimizer)
-                gradient_norm = torch.nn.utils.clip_grad_norm_(list(model.parameters()) + (list(auxiliary.parameters()) if auxiliary else []), self.config.gradient_clip_norm)
-                if not torch.isfinite(gradient_norm): raise ScientificAbort(f"Non-finite gradients for {arm}/seed={seed}")
-                scaler.step(optimizer); scaler.update()
+                gradient_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, self.config.gradient_clip_norm)
+                finite = gradients_finite(trainable_parameters, gradient_norm)
+                updated = apply_optimizer_step_with_amp_policy(
+                    optimizer, scaler, use_amp, finite, amp_runtime_state, epoch_amp_accounting,
+                    f"arm={arm} seed={seed} epoch={epoch} batch={batch_index}", self.logger,
+                )
+                if not updated:
+                    continue
                 count = len(augmented); samples += count; sums["total"] += float(loss.detach().cpu()) * count
                 for name, value in parts.items(): sums[name] += float(value.detach().cpu()) * count
-            dataset.close(); scheduler.step()
+            dataset.close()
+            assert_epoch_has_optimizer_step(epoch_amp_accounting, f"{arm}/seed={seed}/epoch={epoch}")
+            scheduler.step()
             p0 = self.evaluate_student(model, "p0", auxiliary); p0.update({"arm": arm, "seed": seed, "epoch": epoch})
             improved = p0_epoch_better(p0, best_metrics)
             stale_epochs = 0 if improved else stale_epochs + 1
             if improved: best_metrics = dict(p0)
-            row = {**p0, **{f"train_{name}": value / samples for name, value in sums.items()}, "exposure_sha256": exposure_sha}
+            row = {
+                **p0, **{f"train_{name}": value / samples for name, value in sums.items()},
+                "exposure_sha256": exposure_sha,
+                **epoch_amp_accounting,
+            }
             history.append(row)
             loader_state = loader.generator.get_state() if getattr(loader, "generator", None) is not None else None
-            self.save_training_checkpoint(latest, arm, seed, epoch, model, auxiliary, optimizer, scheduler, scaler, best_metrics, stale_epochs, loader_state, exposure_sha)
+            self.save_training_checkpoint(
+                latest, arm, seed, epoch, model, auxiliary, optimizer, scheduler, scaler, best_metrics,
+                stale_epochs, loader_state, exposure_sha, amp_runtime_state, epoch_amp_accounting,
+            )
             if improved: shutil.copy2(latest, best_path)
             self.logger.info("%s seed %d epoch %d | agreement %.5f | KL %.5f | F1 %.5f", arm, seed, epoch,
                              p0["teacher_student_top1_agreement"], p0["teacher_student_kl"], p0["student_fixed98_macro_f1"])
@@ -1336,7 +1523,10 @@ class Stage4Pipeline:
             raise ScientificAbort("Teacher mutated during student training")
         best_payload = safe_torch_load(best_path, "cpu"); self.validate_training_checkpoint(best_payload, arm, seed)
         history_path = base / "history.csv"; atomic_csv(history_path, pd.DataFrame(history), self.output)
-        result = dict(best_payload["best_p0_metrics"]); result.update({"arm": arm, "seed": seed, "best_checkpoint_sha256": sha256_file(best_path), "teacher_immutable": True})
+        result = dict(best_payload["best_p0_metrics"]); result.update({
+            "arm": arm, "seed": seed, "best_checkpoint_sha256": sha256_file(best_path), "teacher_immutable": True,
+            "total_amp_overflows": int(best_payload.get("amp_runtime_state", {}).get("total_amp_overflows", 0)),
+        })
         return result
 
     def train_arm_stage(self, stage: int, arm: str) -> None:
@@ -1412,6 +1602,7 @@ class Stage4Pipeline:
             "teacher_state_sha256": EXPECTED_TEACHER_STATE_SHA256, "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
             "configuration_sha256": self.config.configuration_sha256(), "objective_policy_sha256": self.objective_policy_sha,
             "training_target_policy_sha256": self.training_target_policy_sha,
+            "amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha,
             "architecture_freeze_sha256": self.architecture_freeze_sha, "predecessor_lock_sha256": self.predecessor_lock_sha,
             "training_only_auxiliary_excluded": True,
         }
@@ -1434,6 +1625,7 @@ class Stage4Pipeline:
             "selection_manifest_sha256": sha256_file(selection_path), "architecture_sha256": self.architecture_freeze_sha,
             "objective_policy_sha256": self.objective_policy_sha, "configuration_sha256": self.config.configuration_sha256(),
             "training_target_policy_sha256": self.training_target_policy_sha,
+            "amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha,
             "teacher_sha256": EXPECTED_TEACHER_SHA256, "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
             "predecessor_lock_sha256": self.predecessor_lock_sha, "post_selection_model_changes_permitted": False,
             "calibration_unknown_used_for_selection": False, "stage35_strict_used_for_selection": False,
@@ -1688,6 +1880,7 @@ class Stage4Pipeline:
         final = self.output / "manifests" / "STAGE4M_FINAL_STATUS.json"
         atomic_json(final, {"status": "MANYTX_STAGE4M_READY", "pipeline_version": PIPELINE_VERSION, "selected_arm": selection["selected_arm"],
                             "selected_seed": selection["selected_seed"], "gates": gates, "stage35_strict_violation_counters": self.guard.counters(),
+                            "amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha,
                             "generated_at": utc_now()}, self.output)
         manifest = self.create_final_hash_manifest()
         ready_text = "\n".join([
@@ -1695,6 +1888,7 @@ class Stage4Pipeline:
             f"teacher_sha256={EXPECTED_TEACHER_SHA256}", f"benchmark_sha256={EXPECTED_BENCHMARK_SHA256}",
             f"selected_kd_arm={selection['selected_arm']}", f"selected_seed={selection['selected_seed']}",
             f"canonical_surrogate_sha256={lock['canonical_surrogate_sha256']}", f"canonical_surrogate_state_sha256={lock['canonical_surrogate_state_sha256']}",
+            f"amp_runtime_safety_policy_sha256={self.amp_runtime_safety_policy_sha}",
             f"student_deployed_parameter_count={compression['student_deployed_parameter_count']}", f"teacher_parameter_count={EXPECTED_TEACHER_PARAMETERS}",
             f"parameter_compression_ratio={compression['parameter_compression_ratio']}", "student_native_embedding_dim=64", "teacher_embedding_dim=128",
             "calibration_unknown_used_for_training=NO", "calibration_unknown_used_for_selection=NO", "strict_zero_day_evaluation_performed=NO",
@@ -1718,11 +1912,13 @@ class Stage4Pipeline:
         architecture = self.output / "manifests" / "STUDENT_ARCHITECTURE_FREEZE.json"
         objective = self.output / "manifests" / "KD_OBJECTIVE_POLICY.json"
         targets = self.output / "manifests" / "TRAINING_TARGET_POLICY.json"
+        amp_policy = self.output / "manifests" / "AMP_RUNTIME_SAFETY_POLICY.json"
         selection = self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json"
         self.predecessor_lock_sha = sha256_file(predecessor) if predecessor.is_file() else None
         self.architecture_freeze_sha = sha256_file(architecture) if architecture.is_file() else None
         self.objective_policy_sha = sha256_file(objective) if objective.is_file() else None
         self.training_target_policy_sha = sha256_file(targets) if targets.is_file() else None
+        self.amp_runtime_safety_policy_sha = sha256_file(amp_policy) if amp_policy.is_file() else None
         self.selection_lock_hash = sha256_file(selection) if selection.is_file() else None
 
     def preflight(self) -> None:

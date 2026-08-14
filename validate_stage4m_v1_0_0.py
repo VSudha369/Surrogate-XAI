@@ -145,6 +145,89 @@ def main() -> int:
     shared_loss, _ = module.compute_kd_losses("K1", k1[3], k1[4]["logits"], k1[4]["embedding_normalized"], torch.tensor([0, 1, 2]), None, None)
     shared_loss.backward()
     check("teacher receives no backward update", all(parameter.grad is None for parameter in k1[2].parameters()))
+
+    check("AMP max consecutive overflow constant", module.MAX_CONSECUTIVE_AMP_OVERFLOWS == 32)
+    amp_policy = module.amp_runtime_safety_policy()
+    check("AMP policy runtime safety only", amp_policy["runtime_safety_only"] is True and amp_policy["scientific_independent_variable"] is False)
+    check("AMP policy exact overflow action", amp_policy["overflow_policy"] == "SKIP_STEP_BACKOFF_AND_RETRY_NEXT_BATCH")
+    check("AMP policy no optimizer step on overflow", amp_policy["optimizer_step_on_overflow"] is False)
+    check("AMP policy scheduler epoch scope", amp_policy["scheduler_scope"] == "EPOCH")
+    check("AMP policy gradient clip frozen", amp_policy["gradient_clip_norm"] == 5.0)
+    check("AMP policy legacy restart exact executable", amp_policy["legacy_checkpoint_policy"]["previous_executable_sha256"] == "a770fe52a83a408eedd7e8affaff120dd1d56eb5f243da52f05501252e4b4de3")
+
+    class FakeScaler:
+        def __init__(self, overflow: bool, scale: float = 1024.0) -> None:
+            self.overflow = overflow; self.scale_value = scale; self.step_calls = 0; self.update_calls = 0
+        def get_scale(self) -> float: return self.scale_value
+        def get_backoff_factor(self) -> float: return 0.5
+        def step(self, optimizer) -> None:
+            self.step_calls += 1
+            if not self.overflow: optimizer.step()
+        def update(self, new_scale=None) -> None:
+            self.update_calls += 1
+            if new_scale is not None: self.scale_value = float(new_scale)
+            elif self.overflow: self.scale_value *= 0.5
+
+    parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    optimizer = torch.optim.SGD([parameter], lr=0.1)
+    parameter.grad = torch.ones_like(parameter)
+    runtime_state = module.new_amp_runtime_state(); epoch_state = module.new_epoch_amp_accounting()
+    finite_scaler = FakeScaler(False)
+    updated = module.apply_optimizer_step_with_amp_policy(optimizer, finite_scaler, True, True, runtime_state, epoch_state, "finite")
+    check("AMP A finite step performs optimizer update", updated and torch.allclose(parameter.detach(), torch.tensor([0.9])))
+    check("AMP finite accounting", epoch_state["optimizer_steps_completed"] == 1 and runtime_state["total_optimizer_steps_completed"] == 1)
+
+    overflow_parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    overflow_optimizer = torch.optim.SGD([overflow_parameter], lr=0.1)
+    overflow_parameter.grad = torch.ones_like(overflow_parameter)
+    overflow_runtime = module.new_amp_runtime_state(); overflow_epoch = module.new_epoch_amp_accounting()
+    overflow_scaler = FakeScaler(True)
+    overflow_updated = module.apply_optimizer_step_with_amp_policy(overflow_optimizer, overflow_scaler, True, False, overflow_runtime, overflow_epoch, "overflow-1")
+    check("AMP B first overflow does not abort", overflow_updated is False and overflow_runtime["consecutive_amp_overflows"] == 1)
+    check("AMP C overflowed batch does not update parameters", torch.equal(overflow_parameter.detach(), torch.tensor([1.0])))
+    check("AMP D overflow backs off scaler", overflow_scaler.get_scale() == 512.0)
+    overflow_scaler.overflow = False; overflow_parameter.grad = torch.ones_like(overflow_parameter)
+    next_updated = module.apply_optimizer_step_with_amp_policy(overflow_optimizer, overflow_scaler, True, True, overflow_runtime, overflow_epoch, "finite-after-overflow")
+    check("AMP E next finite batch succeeds", next_updated and overflow_parameter.item() < 1.0)
+    check("AMP F consecutive counter resets after finite", overflow_runtime["consecutive_amp_overflows"] == 0)
+
+    boundary_parameter = torch.nn.Parameter(torch.tensor([1.0])); boundary_optimizer = torch.optim.SGD([boundary_parameter], lr=0.1)
+    boundary_scaler = FakeScaler(True, scale=2.0 ** 40); boundary_runtime = module.new_amp_runtime_state(); boundary_epoch = module.new_epoch_amp_accounting()
+    tolerated = True
+    for index in range(32):
+        boundary_parameter.grad = torch.ones_like(boundary_parameter)
+        try: module.apply_optimizer_step_with_amp_policy(boundary_optimizer, boundary_scaler, True, False, boundary_runtime, boundary_epoch, f"overflow-{index+1}")
+        except module.ScientificAbort: tolerated = False; break
+    check("AMP G 32 consecutive overflows tolerated", tolerated and boundary_runtime["consecutive_amp_overflows"] == 32)
+    thirty_third_aborted = False
+    boundary_parameter.grad = torch.ones_like(boundary_parameter)
+    try: module.apply_optimizer_step_with_amp_policy(boundary_optimizer, boundary_scaler, True, False, boundary_runtime, boundary_epoch, "overflow-33")
+    except module.ScientificAbort: thirty_third_aborted = True
+    check("AMP H 33rd consecutive overflow aborts", thirty_third_aborted)
+
+    non_amp_parameter = torch.nn.Parameter(torch.tensor([1.0])); non_amp_optimizer = torch.optim.SGD([non_amp_parameter], lr=0.1)
+    non_amp_abort = False
+    try: module.apply_optimizer_step_with_amp_policy(non_amp_optimizer, FakeScaler(False), False, False, module.new_amp_runtime_state(), module.new_epoch_amp_accounting(), "non-amp")
+    except module.ScientificAbort: non_amp_abort = True
+    check("AMP I disabled nonfinite gradient aborts immediately", non_amp_abort)
+    zero_epoch_abort = False
+    try: module.assert_epoch_has_optimizer_step(module.new_epoch_amp_accounting(), "fixture")
+    except module.ScientificAbort: zero_epoch_abort = True
+    check("AMP J zero-successful-step epoch aborts", zero_epoch_abort)
+    check("AMP checkpoint counters persisted", all(token in source for token in ('"amp_runtime_state": dict(amp_runtime_state)', '"batches_seen": int(epoch_amp_accounting["batches_seen"])', '"optimizer_steps_completed": int(epoch_amp_accounting["optimizer_steps_completed"])', '"amp_overflow_skipped_steps": int(epoch_amp_accounting["amp_overflow_skipped_steps"])', '"consecutive_amp_overflow_peak": int(epoch_amp_accounting["consecutive_amp_overflow_peak"])', '"total_amp_overflows": int(amp_runtime_state["total_amp_overflows"])')))
+    check("AMP L runtime counters resume", 'loaded_runtime = payload.get("amp_runtime_state") or {}' in source and 'amp_runtime_state.update' in source)
+    legacy_payload = {"executable_sha256": module.PRE_AMP_HOTFIX_EXECUTABLE_SHA256, "arm": "K0", "seed": 42, "epoch": 1}
+    check("AMP M previous checkpoint explicitly restart-only", module.Stage4Pipeline.known_pre_amp_checkpoint_requires_restart(legacy_payload, "K0", 42))
+    unknown_legacy = dict(legacy_payload); unknown_legacy["executable_sha256"] = "0" * 64
+    check("AMP N unknown executable not restart-allowlisted", not module.Stage4Pipeline.known_pre_amp_checkpoint_requires_restart(unknown_legacy, "K0", 42))
+    scientific_payload = module.Stage4Config(branch_root=str(Path.cwd()), output_dir=str(Path.cwd()/"06_surrogate_kd")).scientific_payload()
+    check("AMP O scientific configuration unchanged", "max_consecutive_amp_overflows" not in scientific_payload and scientific_payload["learning_rate"] == 0.001 and scientific_payload["gradient_clip_norm"] == 5.0)
+    check("AMP P K0 no teacher forward preserved", shared_results["K0"][2] is None and shared_results["K0"][4] is None)
+    check("AMP Q K1-K3 shared augmented tensor preserved", all(shared_results[arm][1].input_ids == shared_results[arm][2].input_ids for arm in ("K1", "K2", "K3")))
+    check("AMP R strict counters policy preserved", len(module.STAGE35_COUNTER_KEYS) == 6 and not any(module.Stage35StrictGuard(Path.cwd(), Path.cwd()).counters().values()))
+    check("AMP S preflight remains training-free", "apply_optimizer_step_with_amp_policy" not in source[source.index("    def preflight(self)"):source.index("    def run(self)")])
+    check("AMP T READY protection preserved", "MANYTX_STAGE4M_ALREADY_READY" in source and "completed_state_current" in source)
+
     train_body = source[source.index("    def train_arm_seed"):source.index("    def train_arm_stage")]
     check("B clean cache rejected for sample KD", "teacher_logits[positions]" not in train_body and "teacher_embedding[positions]" not in train_body)
     policy = module.training_target_policy()
@@ -200,6 +283,7 @@ def main() -> int:
             "STUDENT_ARCHITECTURE_FREEZE.json": "architecture\n",
             "KD_OBJECTIVE_POLICY.json": "objective\n",
             "TRAINING_TARGET_POLICY.json": "targets\n",
+            "AMP_RUNTIME_SAFETY_POLICY.json": "amp-runtime\n",
             "CANONICAL_SURROGATE_SELECTION_LOCK.json": "selection\n",
         }
         for name, value in files.items(): (manifests / name).write_text(value, encoding="utf-8")
@@ -209,7 +293,7 @@ def main() -> int:
         fixture.output = output_root; fixture.script_sha = "current-script"
         fixture.config = module.Stage4Config(branch_root=str(branch), output_dir=str(output_root))
         fixture.predecessor_lock_sha = fixture.architecture_freeze_sha = fixture.objective_policy_sha = None
-        fixture.training_target_policy_sha = fixture.selection_lock_hash = None
+        fixture.training_target_policy_sha = fixture.amp_runtime_safety_policy_sha = fixture.selection_lock_hash = None
         fixture.hydrate_provenance()
 
         def checkpoint_payload(stage: int) -> dict[str, Any]:
@@ -221,6 +305,7 @@ def main() -> int:
                 "architecture_freeze_sha256": fixture.architecture_freeze_sha if stage >= 2 else None,
                 "objective_policy_sha256": fixture.objective_policy_sha if stage >= 2 else None,
                 "training_target_policy_sha256": fixture.training_target_policy_sha if stage >= 2 else None,
+                "amp_runtime_safety_policy_sha256": fixture.amp_runtime_safety_policy_sha if stage >= 2 else None,
                 "selection_lock_sha256": fixture.selection_lock_hash if stage >= 9 else None,
                 "inputs": [{"path": str(bound_input), "sha256": sha256(bound_input), "bytes": bound_input.stat().st_size}],
                 "outputs": [{"path": str(bound_output), "sha256": sha256(bound_output), "bytes": bound_output.stat().st_size}],
@@ -235,13 +320,14 @@ def main() -> int:
         (manifests / "STUDENT_ARCHITECTURE_FREEZE.json").write_text("changed\n"); check("G architecture mutation invalidation", not fixture.stage_current(4)); (manifests / "STUDENT_ARCHITECTURE_FREEZE.json").write_text(files["STUDENT_ARCHITECTURE_FREEZE.json"])
         (manifests / "KD_OBJECTIVE_POLICY.json").write_text("changed\n"); check("H objective mutation invalidation", not fixture.stage_current(4)); (manifests / "KD_OBJECTIVE_POLICY.json").write_text(files["KD_OBJECTIVE_POLICY.json"])
         (manifests / "TRAINING_TARGET_POLICY.json").write_text("changed\n"); check("training-target-policy mutation invalidation", not fixture.stage_current(4)); (manifests / "TRAINING_TARGET_POLICY.json").write_text(files["TRAINING_TARGET_POLICY.json"])
+        (manifests / "AMP_RUNTIME_SAFETY_POLICY.json").write_text("changed\n"); check("AMP runtime policy mutation invalidation", not fixture.stage_current(4)); (manifests / "AMP_RUNTIME_SAFETY_POLICY.json").write_text(files["AMP_RUNTIME_SAFETY_POLICY.json"])
         wrong_size = checkpoint_payload(4); wrong_size["outputs"][0]["bytes"] += 1
         (manifests / "STAGE_04_CHECKPOINT.json").write_text(json.dumps(wrong_size), encoding="utf-8")
         check("J recorded output byte-size mutation", not fixture.stage_current(4))
         (manifests / "STAGE_04_CHECKPOINT.json").write_text(json.dumps(checkpoint_payload(4)), encoding="utf-8")
         fixture.predecessor_lock_sha = fixture.architecture_freeze_sha = fixture.objective_policy_sha = None
-        fixture.training_target_policy_sha = fixture.selection_lock_hash = None
-        check("K fresh-process provenance hydration", fixture.stage_current(4) and all((fixture.predecessor_lock_sha, fixture.architecture_freeze_sha, fixture.objective_policy_sha, fixture.training_target_policy_sha, fixture.selection_lock_hash)))
+        fixture.training_target_policy_sha = fixture.amp_runtime_safety_policy_sha = fixture.selection_lock_hash = None
+        check("K fresh-process provenance hydration", fixture.stage_current(4) and all((fixture.predecessor_lock_sha, fixture.architecture_freeze_sha, fixture.objective_policy_sha, fixture.training_target_policy_sha, fixture.amp_runtime_safety_policy_sha, fixture.selection_lock_hash)))
         stage9 = checkpoint_payload(9); (manifests / "STAGE_09_CHECKPOINT.json").write_text(json.dumps(stage9), encoding="utf-8")
         check("selection-bound stage baseline current", fixture.stage_current(9))
         (manifests / "CANONICAL_SURROGATE_SELECTION_LOCK.json").write_text("changed\n")
@@ -266,7 +352,7 @@ def main() -> int:
         lock = {"status": "LOCKED", "canonical_surrogate_sha256": "deploy-sha", "canonical_surrogate_state_sha256": "state-sha"}
         lock_path = manifests / "CANONICAL_SURROGATE_SELECTION_LOCK.json"; lock_path.write_text(json.dumps(lock))
         provenance = {}
-        for name in ("STAGE4M_PREDECESSOR_LOCK.json", "STUDENT_ARCHITECTURE_FREEZE.json", "KD_OBJECTIVE_POLICY.json", "TRAINING_TARGET_POLICY.json"):
+        for name in ("STAGE4M_PREDECESSOR_LOCK.json", "STUDENT_ARCHITECTURE_FREEZE.json", "KD_OBJECTIVE_POLICY.json", "TRAINING_TARGET_POLICY.json", "AMP_RUNTIME_SAFETY_POLICY.json"):
             path = manifests / name; path.write_text(name); provenance[name] = path
         prior_checkpoints = []
         for stage in range(1, 12):
@@ -274,11 +360,12 @@ def main() -> int:
             path = manifests / f"STAGE_{stage:02d}_CHECKPOINT.json"
             path.write_text(json.dumps({"stage": stage, "status": "PASS", "inputs": [row], "outputs": [row]})); prior_checkpoints.append(path)
         final_path = manifests / "STAGE4M_FINAL_STATUS.json"
-        final_path.write_text(json.dumps({"status": "MANYTX_STAGE4M_READY", "selected_arm": "K2", "selected_seed": 123}))
+        final_path.write_text(json.dumps({"status": "MANYTX_STAGE4M_READY", "selected_arm": "K2", "selected_seed": 123, "amp_runtime_safety_policy_sha256": sha256(provenance["AMP_RUNTIME_SAFETY_POLICY.json"])}))
         ready_path = completed / "MANYTX_STAGE4M_READY.txt"
         ready_path.write_text("\n".join(("MANYTX_STAGE4M_READY", f"teacher_sha256={module.EXPECTED_TEACHER_SHA256}",
                                          f"benchmark_sha256={module.EXPECTED_BENCHMARK_SHA256}", "selected_kd_arm=K2", "selected_seed=123",
-                                         "canonical_surrogate_sha256=deploy-sha", "canonical_surrogate_state_sha256=state-sha", "")))
+                                         "canonical_surrogate_sha256=deploy-sha", "canonical_surrogate_state_sha256=state-sha",
+                                         f"amp_runtime_safety_policy_sha256={sha256(provenance['AMP_RUNTIME_SAFETY_POLICY.json'])}", "")))
         manifest_path = manifests / "STAGE4M_HASH_MANIFEST.json"
         manifest_rows = [{"relative_path": path.relative_to(completed).as_posix(), "sha256": sha256(path), "bytes": path.stat().st_size}
                          for path in (lock_path, final_path)]
@@ -291,6 +378,7 @@ def main() -> int:
             "architecture_freeze_sha256": sha256(provenance["STUDENT_ARCHITECTURE_FREEZE.json"]),
             "objective_policy_sha256": sha256(provenance["KD_OBJECTIVE_POLICY.json"]),
             "training_target_policy_sha256": sha256(provenance["TRAINING_TARGET_POLICY.json"]),
+            "amp_runtime_safety_policy_sha256": sha256(provenance["AMP_RUNTIME_SAFETY_POLICY.json"]),
             "selection_lock_sha256": sha256(lock_path),
             "inputs": [{"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size} for path in (*prior_checkpoints, lock_path)],
             "outputs": [{"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size}
@@ -359,7 +447,7 @@ def main() -> int:
     check("no canonical READY in repository", not (ROOT/"MANYTX_STAGE4M_READY.txt").exists())
     validator_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
     check("no canonical training in validator", not any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Stage4Pipeline" for node in ast.walk(validator_tree)))
-    if passed < 62: raise AssertionError(f"validator coverage too small: {passed}")
+    if passed <= 139: raise AssertionError(f"validator coverage too small: {passed}")
     print(f"\nSTAGE4M_VALIDATION_PASS ({passed}/{passed})")
     return 0
 

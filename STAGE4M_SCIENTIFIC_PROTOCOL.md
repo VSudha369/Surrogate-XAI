@@ -26,6 +26,12 @@ Best epoch maximizes P0 teacher/student agreement with absolute tolerance 0.002,
 
 The fixed schedule inherits Stage 2.6M’s AdamW (`lr=0.001`, `weight_decay=0.0001`), CosineAnnealingLR (`eta_min=1e-5`), batch 256, deterministic domain-balanced exposure, RF augmentation, CUDA AMP, and gradient clipping at norm 5. Stage 4M fixes maximum/minimum epochs to 40/5 and patience to 8.
 
+## AMP numerical-safety policy
+
+CUDA AMP remains frozen and enabled. Numerical overflow handling is runtime safety, not a scientific independent variable: after unscale and norm-5 clipping, a detected non-finite AMP gradient causes `GradScaler.step` to skip the underlying optimizer update, the scaler to back off, gradients to be cleared, and training to continue with the next batch. The run aborts only after more than 32 consecutive AMP overflows. With AMP disabled, any non-finite gradient remains an immediate scientific abort. The scheduler remains epoch-scoped, and a completed epoch must contain at least one successful optimizer update. Per-epoch and cumulative overflow accounting is persisted in checkpoints and history.
+
+The pre-hotfix K0/seed-42 epoch-1 checkpoint from executable `a770fe52a83a408eedd7e8affaff120dd1d56eb5f243da52f05501252e4b4de3` is **not resume-compatible** because the new executable and regenerated preflight/predecessor provenance change the dependency graph. It is explicitly rejected, audit-recorded, removed, and K0/seed-42 restarts from epoch 1. Unknown stale checkpoints remain hard failures.
+
 ## Finality
 
 Every reusable stage revalidates its full recorded input graph, provenance hashes, output hashes, and output sizes. Training checkpoints additionally bind `TRAINING_TARGET_POLICY.json`, preventing any pre-hotfix clean-target checkpoint from resuming.
