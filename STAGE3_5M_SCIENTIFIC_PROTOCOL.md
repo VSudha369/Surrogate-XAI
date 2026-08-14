@@ -1,0 +1,33 @@
+# Stage 3.5M scientific protocol
+
+Stage 3.5M compares deterministic post-hoc open-set scores under the frozen Stage 3M A3 seed-123 teacher. The teacher has 849,634 parameters, 98 classifier outputs, and a normalized 128-dimensional embedding. Its canonical SHA-256 is `ed8698ca9ac6ba813e6d74734ac16987129b0e3079b865f9502974119414aaf4`. Teacher retraining, architecture search, an unknown training class, surrogate training, and XAI are forbidden.
+
+## Scorers and direction
+
+All scores increase with unknownness:
+
+| ID | Score | Fit source |
+|---|---|---|
+| S0 | `1 - max softmax probability` | none |
+| S1 | `-T logsumexp(logits/T)` energy | none |
+| S2 | `1 - max cosine` to normalized class prototypes | Train Known |
+| S3 | minimum regularized tied-covariance Mahalanobis distance | Train Known |
+| S4 | minimum class-conditional diagonal-Gaussian NLL | Train Known |
+
+S2-S4 are fit only from frozen-teacher Train Known embeddings. No gradient, optimizer, classifier update, or unknown-labelled training occurs.
+
+## Protocol separation
+
+`ZD-STRICT` is primary. P0-P3 Known Validation alone freezes one 95% known-acceptance threshold per scorer; 99% known-score quantiles are retained as declared sensitivity analyses. Strict emitters cannot fit scorers, thresholds, hyperparameters, or a winner. Because unknown-free diagnostics do not identify a defensible detector winner, the canonical scorer policy is `ALL_PREDECLARED`; every strict result is reported without post-hoc selection.
+
+`ZD-CALIBRATED` is optional and separately labelled. Calibration Unknown may inform only its own table. The hash of the strict threshold manifest is checked before and after that analysis.
+
+## Final strict transaction
+
+Stages 01-07 cannot open strict index arrays or signals. Immediately before Stage 08, the pipeline writes and verifies `STRICT_ZERO_DAY_EVALUATION_LOCK.json`, binding the teacher, scorer state, threshold manifest, policy, executable, configuration, benchmark, and predecessor hashes. The guard then permanently disables fitting and calibration. Stage 08 verifies sealed strict-index hashes and reads strict signals exactly for the final evaluation. Frozen partition membership supplies the binary unknown semantic; transmitter labels are not loaded.
+
+Violation counters independently cover signal, label, embedding, metric, threshold, and fit access. All are violation counters and must remain zero. Stage 11 writes READY only after every stage and final hash manifest are current.
+
+## Metrics
+
+Every scorer reports AUROC, AUPRC, unknown F1, known F1, macro-F1, FPR@95TPR, minimum detection error, OSCR, threshold, known acceptance, and unknown rejection. Deterministic stratified bootstrap confidence intervals are produced for AUROC, AUPRC, macro-F1, and OSCR. Closed-set known correctness remains separate and Stage 3M metrics are never overwritten.

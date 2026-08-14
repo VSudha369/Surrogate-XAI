@@ -1,0 +1,21 @@
+# Stage 3.5M — WiSig ManyTx zero-day/open-set detection
+
+This package implements post-hoc open-set scoring under the scientifically frozen Stage 3M A3 seed-123 teacher. It does not retrain or modify the teacher and does not add an unknown training class.
+
+Five deterministic scorers are compared: MSP, energy, normalized-prototype cosine distance, regularized Mahalanobis distance, and diagonal-Gaussian embedding NLL. Train Known fits embedding statistics; P0-P3 Known Validation freezes strict thresholds. Calibration Unknown is optional and isolated as `ZD-CALIBRATED`. Strict data is inaccessible until the Stage-08 evaluation lock is written and verified.
+
+## Colab sequence
+
+Run preflight first. It executes only Stages 01-02 and performs no signal inference:
+
+```bash
+python -u Stage3_5M_Colab_Launcher_v1_0_0.py --preflight
+```
+
+After GitHub code/diff review, run the resumable canonical pipeline:
+
+```bash
+python -u Stage3_5M_Colab_Launcher_v1_0_0.py --resume
+```
+
+Do not claim Stage 3.5M complete until the full run produces `MANYTX_STAGE3_5M_READY.txt` and Drive outputs are independently audited.
