@@ -1,0 +1,18 @@
+{
+  "max_epochs": 40,
+  "minimum_epochs": 5,
+  "patience": 8,
+  "batch_size": 256,
+  "eval_batch_size": 1024,
+  "samples_per_tx": 4,
+  "learning_rate": 0.001,
+  "weight_decay": 0.0001,
+  "gradient_clip_norm": 5.0,
+  "amp_enabled": true,
+  "num_workers": 2,
+  "prefetch_factor": 2,
+  "pin_memory": true,
+  "persistent_workers": true,
+  "local_cache_root": "/content/wisig_stage4m_cache",
+  "seeds": [42, 123, 2026]
+}
