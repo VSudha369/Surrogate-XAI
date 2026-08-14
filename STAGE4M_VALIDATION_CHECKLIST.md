@@ -21,3 +21,12 @@
 - [x] Preflight cannot train, cache targets, access Calibration Unknown/strict data, or create READY.
 - [x] Validator includes KD matching, dependency-mutation, provenance hydration, READY protection, preflight-scope, and A-T AMP overflow/restart matrices.
 - [x] Frozen Stage 3.5M, Stage 3M, and Stage 2.6M validators rerun after packaging.
+- [x] Drive remains canonical input/output while Stage 04+ signal reads are forced through the verified local SSD cache.
+- [x] Exactly Train Known/P0/P1/P2/P3 are staged into deterministic 1,024-row uncompressed HDF5 shards with canonical global-index and metadata preservation.
+- [x] Persistent/local cache manifests match byte-for-byte and per-shard file/logical hashes, counts, ordering, and metadata are revalidated.
+- [x] Missing/corrupt local caches rebuild without deleting Drive checkpoints or local teacher-target caches.
+- [x] Calibration Unknown is isolated and locked to post-selection diagnostics; strict/final partitions remain forbidden before source open.
+- [x] Local capacity, staging state, live progress, I/O counters, and 25-batch heartbeat are persisted atomically.
+- [x] Every completed epoch persists latest/history/status and atomically verified best; resume replays only an interrupted incomplete epoch.
+- [x] `KeyboardInterrupt`, scientific aborts, and runtime failures are separately classified.
+- [x] Validator coverage includes local I/O, cache provenance, checkpoint compatibility, heartbeat/persistence, interruption, strict/final guards, and all prior AMP/scientific checks.

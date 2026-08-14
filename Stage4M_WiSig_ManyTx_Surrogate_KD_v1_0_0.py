@@ -45,6 +45,7 @@ from torch.utils.data import DataLoader
 
 
 PIPELINE_VERSION = "1.0.0"
+LOCAL_IO_POLICY_VERSION = "1.0.0"
 CANONICAL_BRANCH = "MANYTX_ZERO_DAY_BRANCH_v1.0.3"
 CANONICAL_BENCHMARK = "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3"
 EXPECTED_BENCHMARK_SHA256 = "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9"
@@ -78,7 +79,26 @@ REFERENCE_TEACHER_METRICS = {
 }
 KD_TEMPERATURE = 4.0
 MAX_CONSECUTIVE_AMP_OVERFLOWS = 32
+HEARTBEAT_EVERY_BATCHES = 25
+LOCAL_SHARD_ROWS = 1024
+LOCAL_CACHE_DIRECTORY_NAME = "wisig_stage4m_local_v1_0_0"
+LOCAL_CACHE_FORMAT = "uncompressed_hdf5_shards_v1"
+AUTHORIZED_LOCAL_PARTITIONS = ("train_known", "p0", "p1", "p2", "p3")
+FORBIDDEN_LOCAL_PARTITIONS = (
+    "strict_zero_day_test", "strict_zero_day_shift_test", "strict_test", "final_zero_day",
+)
+REQUIRED_LIVE_PROGRESS_EVENTS = (
+    "DATA_STAGING_STARTED", "DATA_SHARD_WRITTEN", "DATA_PARTITION_STAGED", "DATA_STAGING_VERIFYING", "DATA_STAGING_READY",
+    "STAGE_01_STARTED", "STAGE_01_PASS", "STAGE_02_STARTED", "STAGE_02_PASS", "STAGE_03_STARTED", "STAGE_03_PASS",
+    "ARM_SEED_STARTED", "EPOCH_STARTED", "TRAINING_HEARTBEAT", "AMP_OVERFLOW_EVENT", "EPOCH_COMPLETED",
+    "BEST_EPOCH_UPDATED", "EARLY_STOP_TRIGGERED", "ARM_SEED_COMPLETED", "ARM_COMPLETED", "CANONICAL_SELECTION_LOCKED",
+    "P1_DIAGNOSTIC_STARTED", "P1_DIAGNOSTIC_COMPLETED", "P2_DIAGNOSTIC_STARTED", "P2_DIAGNOSTIC_COMPLETED",
+    "P3_DIAGNOSTIC_STARTED", "P3_DIAGNOSTIC_COMPLETED", "CALIBRATED_DIAGNOSTIC_STARTED",
+    "CALIBRATED_DIAGNOSTIC_COMPLETED", "PERFORMANCE_STARTED", "PERFORMANCE_COMPLETED", "STAGE_12_STARTED",
+    "STAGE4M_READY", "INTERRUPTED", "SCIENTIFIC_ABORT", "RUNTIME_ERROR",
+)
 PRE_AMP_HOTFIX_EXECUTABLE_SHA256 = "a770fe52a83a408eedd7e8affaff120dd1d56eb5f243da52f05501252e4b4de3"
+LOCAL_IO_COMPATIBLE_PREDECESSOR_SHA256 = "de660a0a280de59ceacfff77e723c62ae8b39767704a8a89fa85c7967d234855"
 ARM_OBJECTIVES: Dict[str, Dict[str, float]] = {
     "K0": {"ce": 1.00, "kd": 0.00, "repr": 0.00, "proto": 0.00},
     "K1": {"ce": 0.50, "kd": 0.50, "repr": 0.00, "proto": 0.00},
@@ -118,7 +138,88 @@ FINAL_HASH_EXCLUSIONS = {
     "manifests/STAGE_12_CHECKPOINT.json": "written after READY transaction",
     "MANYTX_STAGE4M_READY.txt": "transaction marker",
     "MANYTX_STAGE4M_NOT_READY.txt": "transaction marker",
+    "manifests/STAGE4M_LIVE_PROGRESS.json": "mutable runtime heartbeat",
+    "manifests/STAGE4M_HEARTBEAT.json": "mutable batch heartbeat",
+    "manifests/STAGE4M_IO_COUNTERS.json": "mutable runtime counter snapshot",
+    "manifests/STAGE4M_DATA_STAGING_STATUS.json": "mutable local-cache staging status",
+    "manifests/STAGE4M_INTERRUPTED.json": "mutable interruption recovery record",
+    "manifests/STAGE4M_FAILURE.json": "mutable failure diagnostic",
 }
+
+
+def local_io_policy() -> Dict[str, Any]:
+    return {
+        "policy_version": LOCAL_IO_POLICY_VERSION,
+        "pipeline_version": PIPELINE_VERSION,
+        "canonical_data_source": "GOOGLE_DRIVE",
+        "runtime_training_source": "COLAB_LOCAL_SSD",
+        "canonical_results_destination": "GOOGLE_DRIVE",
+        "local_cache_disposable": True,
+        "large_hdf5_local_sharding": True,
+        "local_cache_format": LOCAL_CACHE_FORMAT,
+        "shard_size_policy": {"rows_per_shard": LOCAL_SHARD_ROWS, "deterministic_partition_order": True},
+        "allowed_partitions": list(AUTHORIZED_LOCAL_PARTITIONS),
+        "calibration_unknown_namespace_isolated": True,
+        "strict_cache_allowed": False,
+        "forbidden_partitions": list(FORBIDDEN_LOCAL_PARTITIONS),
+        "ordinary_training_drive_signal_reads_allowed": False,
+        "checkpoint_frequency": "EVERY_COMPLETED_EPOCH",
+        "heartbeat_every_batches": HEARTBEAT_EVERY_BATCHES,
+        "progress_manifest_atomic": True,
+        "interrupted_epoch_policy": "REPLAY_FROM_LAST_COMPLETED_EPOCH",
+        "scientific_independent_variable": False,
+    }
+
+
+def string_array_sha256(values: np.ndarray) -> str:
+    digest = hashlib.sha256()
+    array = np.asarray(values).reshape(-1)
+    digest.update(np.asarray([len(array)], dtype=np.int64).tobytes())
+    for value in array:
+        encoded = str(value).encode("utf-8")
+        digest.update(np.asarray([len(encoded)], dtype=np.int64).tobytes())
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def logical_shard_sha256(arrays: Mapping[str, np.ndarray]) -> str:
+    digest = hashlib.sha256()
+    for name in ("signals", "global_indices", "labels", "receiver", "day", "equalized", "transmitter"):
+        values = np.asarray(arrays[name])
+        digest.update(name.encode("ascii"))
+        if values.dtype.kind in {"O", "S", "U"}:
+            digest.update(string_array_sha256(values).encode("ascii"))
+        else:
+            contiguous = np.ascontiguousarray(values)
+            digest.update(str(contiguous.dtype).encode("ascii"))
+            digest.update(np.asarray(contiguous.shape, dtype=np.int64).tobytes())
+            digest.update(contiguous.tobytes())
+    return digest.hexdigest()
+
+
+def read_h5_rows_with_duplicates(dataset: h5py.Dataset, indices: np.ndarray) -> np.ndarray:
+    requested = np.asarray(indices, dtype=np.int64).reshape(-1)
+    if not len(requested):
+        return np.empty((0, *dataset.shape[1:]), dtype=dataset.dtype)
+    unique, inverse = np.unique(requested, return_inverse=True)
+    return np.asarray(dataset[unique])[inverse]
+
+
+def local_capacity_evidence(cache_parent: Path, total_rows: int, available_bytes: Optional[int] = None) -> Dict[str, Any]:
+    estimated = int(total_rows * (2 * 256 * np.dtype(np.float32).itemsize + 256))
+    headroom = max(1 * 2**30, estimated // 5)
+    free = int(available_bytes if available_bytes is not None else shutil.disk_usage(cache_parent).free)
+    evidence = {
+        "local_free_bytes_before": free,
+        "estimated_cache_bytes": estimated,
+        "required_headroom_bytes": headroom,
+        "capacity_check_passed": free >= estimated + headroom,
+    }
+    if not evidence["capacity_check_passed"]:
+        raise ScientificAbort(
+            f"Insufficient local SSD capacity: free={free}, estimated={estimated}, headroom={headroom}"
+        )
+    return evidence
 
 
 class ScientificAbort(RuntimeError):
@@ -182,7 +283,19 @@ def atomic_torch_save(path: Path, value: Any, root: Path) -> None:
     torch.save(value, temporary)
     with temporary.open("rb") as handle:
         os.fsync(handle.fileno())
+    safe_torch_load(temporary, "cpu")
     os.replace(temporary, path)
+
+
+def atomic_verified_copy(source: Path, destination: Path, root: Path) -> None:
+    destination = assert_within(destination, root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    shutil.copyfile(source, temporary)
+    with temporary.open("rb") as handle:
+        os.fsync(handle.fileno())
+    safe_torch_load(temporary, "cpu")
+    os.replace(temporary, destination)
 
 
 def safe_torch_load(path: Path, map_location: Any = "cpu") -> Any:
@@ -288,6 +401,7 @@ def completed_state_current(output: Path) -> bool:
             "objective_policy_sha256": output / "manifests" / "KD_OBJECTIVE_POLICY.json",
             "training_target_policy_sha256": output / "manifests" / "TRAINING_TARGET_POLICY.json",
             "amp_runtime_safety_policy_sha256": output / "manifests" / "AMP_RUNTIME_SAFETY_POLICY.json",
+            "local_cache_identity_sha256": output / "manifests" / "STAGE4M_LOCAL_DATA_IDENTITY.json",
             "selection_lock_sha256": lock_path,
         }
         if stage_values.get("pipeline_version") != PIPELINE_VERSION:
@@ -295,6 +409,18 @@ def completed_state_current(output: Path) -> bool:
         if stage_values.get("teacher_sha256") != EXPECTED_TEACHER_SHA256 or stage_values.get("benchmark_sha256") != EXPECTED_BENCHMARK_SHA256:
             return False
         if any(not path.is_file() or stage_values.get(field) != sha256_file(path) for field, path in provenance_paths.items()):
+            return False
+        runtime_policy = json.loads((output / "manifests" / "STAGE4M_LOCAL_IO_POLICY.json").read_text(encoding="utf-8"))
+        cache_identity = json.loads((output / "manifests" / "STAGE4M_LOCAL_DATA_IDENTITY.json").read_text(encoding="utf-8"))
+        if stage_values.get("runtime_io_policy_sha256") != runtime_policy.get("runtime_io_policy_sha256"):
+            return False
+        if stage_values.get("local_cache_aggregate_sha256") != cache_identity.get("cache_aggregate_sha256"):
+            return False
+        if (
+            final_values.get("runtime_io_policy_sha256") != runtime_policy.get("runtime_io_policy_sha256")
+            or final_values.get("local_cache_identity_sha256") != sha256_file(output / "manifests" / "STAGE4M_LOCAL_DATA_IDENTITY.json")
+            or final_values.get("local_cache_aggregate_sha256") != cache_identity.get("cache_aggregate_sha256")
+        ):
             return False
         required_inputs = {str(output / "manifests" / f"STAGE_{stage:02d}_CHECKPOINT.json") for stage in range(1, 12)}
         required_inputs.add(str(lock_path))
@@ -327,6 +453,9 @@ def completed_state_current(output: Path) -> bool:
             "canonical_surrogate_sha256": str(lock.get("canonical_surrogate_sha256")),
             "canonical_surrogate_state_sha256": str(lock.get("canonical_surrogate_state_sha256")),
             "amp_runtime_safety_policy_sha256": str(final_values.get("amp_runtime_safety_policy_sha256")),
+            "runtime_io_policy_sha256": str(final_values.get("runtime_io_policy_sha256")),
+            "local_cache_identity_sha256": str(final_values.get("local_cache_identity_sha256")),
+            "local_cache_aggregate_sha256": str(final_values.get("local_cache_aggregate_sha256")),
         }
         return lock.get("status") == "LOCKED" and all(ready_values.get(key) == value for key, value in required.items())
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -392,7 +521,7 @@ class Stage4Config:
     prefetch_factor: int = 2
     pin_memory: bool = True
     persistent_workers: bool = True
-    local_cache_root: str = "/content/wisig_stage4m_cache"
+    local_cache_root: str = "/content/wisig_stage4m_local_v1_0_0"
     resume: bool = True
     device: str = "auto"
     stage_start: int = 1
@@ -421,6 +550,9 @@ class Stage4Config:
             raise ValueError("stage range must be within 1..12")
         if self.batch_size != 256 or self.samples_per_tx != 4:
             raise ScientificAbort("Frozen Stage 4M batch/samples-per-Tx policy changed")
+        local_root = Path(self.local_cache_root).expanduser().resolve()
+        if "drive" in {part.lower() for part in local_root.parts} or local_root.name != LOCAL_CACHE_DIRECTORY_NAME:
+            raise ScientificAbort(f"Stage 4M local cache must be disposable {LOCAL_CACHE_DIRECTORY_NAME}, not Drive")
         if self.profile == "pilot":
             self.max_epochs = min(self.max_epochs, 2)
             self.minimum_epochs = 1
@@ -441,6 +573,9 @@ class Stage4Config:
 
     def configuration_sha256(self) -> str:
         return sha256_object(self.scientific_payload())
+
+    def runtime_io_payload(self) -> Dict[str, Any]:
+        return {**local_io_policy(), "local_cache_root": str(Path(self.local_cache_root).expanduser().resolve())}
 
 
 class Stage35StrictGuard:
@@ -915,6 +1050,19 @@ class Stage4Pipeline:
         self.training_target_policy_sha: Optional[str] = None
         self.amp_runtime_safety_policy_sha: Optional[str] = None
         self.selection_lock_hash: Optional[str] = None
+        self.runtime_io_policy_sha = sha256_object(self.config.runtime_io_payload())
+        self.local_cache_manifest_sha: Optional[str] = None
+        self.local_cache_identity_sha: Optional[str] = None
+        self.local_cache_aggregate_sha: Optional[str] = None
+        self.local_cache_active = False
+        self.io_counters = {
+            "training_signal_reads_local": 0,
+            "training_signal_reads_drive": 0,
+            "evaluation_signal_reads_local": 0,
+            "staging_signal_reads_drive": 0,
+        }
+        self.execution_context: Dict[str, Any] = {"stage": None, "arm": None, "seed": None, "epoch": None}
+        self.started_at = time.perf_counter()
         self._setup()
 
     def _setup(self) -> None:
@@ -947,6 +1095,26 @@ class Stage4Pipeline:
     def stage_checkpoint(self, stage: int) -> Path:
         return self.output / "manifests" / f"STAGE_{stage:02d}_CHECKPOINT.json"
 
+    @property
+    def local_cache_root(self) -> Path:
+        return Path(self.config.local_cache_root).expanduser().resolve()
+
+    @property
+    def local_cache_manifest_path(self) -> Path:
+        return self.output / "manifests" / "STAGE4M_LOCAL_DATA_CACHE_MANIFEST.json"
+
+    @property
+    def local_cache_identity_path(self) -> Path:
+        return self.output / "manifests" / "STAGE4M_LOCAL_DATA_IDENTITY.json"
+
+    @property
+    def local_io_policy_path(self) -> Path:
+        return self.output / "manifests" / "STAGE4M_LOCAL_IO_POLICY.json"
+
+    @property
+    def live_progress_path(self) -> Path:
+        return self.output / "manifests" / "STAGE4M_LIVE_PROGRESS.json"
+
     def core_provenance_inputs(self) -> List[Path]:
         return [
             self.output / "manifests" / "STAGE4M_PREDECESSOR_LOCK.json",
@@ -957,6 +1125,438 @@ class Stage4Pipeline:
             self.teacher_path,
             self.root / "01_benchmark_engineering" / "benchmark" / f"{CANONICAL_BENCHMARK}.h5",
         ]
+
+    def runtime_data_inputs(self) -> List[Path]:
+        return [self.local_io_policy_path, self.local_cache_identity_path]
+
+    def write_live_progress(self, event: str, **fields: Any) -> None:
+        payload = {
+            "pipeline_version": PIPELINE_VERSION,
+            "event": event,
+            **self.execution_context,
+            "completed_arm_seed_jobs": self.completed_arm_seed_jobs(),
+            "total_arm_seed_jobs": 12,
+            "executable_sha256": self.script_sha,
+            "configuration_sha256": self.config.configuration_sha256(),
+            "local_cache_manifest_sha256": self.local_cache_manifest_sha,
+            "runtime_io_policy_sha256": self.runtime_io_policy_sha,
+            "teacher_sha256": EXPECTED_TEACHER_SHA256,
+            "strict_counters": self.guard.counters(),
+            "io_counters": dict(self.io_counters),
+            "elapsed_seconds": time.perf_counter() - self.started_at,
+            "timestamp": utc_now(),
+            **fields,
+        }
+        atomic_json(self.live_progress_path, payload, self.output)
+
+    def write_heartbeat(
+        self, batch: int, total_batches: int, last_finite_loss: Optional[float],
+        epoch_amp_accounting: Mapping[str, int], amp_runtime_state: Mapping[str, int], scaler: Any,
+    ) -> None:
+        payload = {
+            "pipeline_version": PIPELINE_VERSION, "event": "TRAINING_HEARTBEAT", **self.execution_context,
+            "max_epochs": self.config.max_epochs, "batch": batch, "total_batches": total_batches,
+            "percentage": 100.0 * batch / max(total_batches, 1),
+            "elapsed_seconds": time.perf_counter() - self.started_at,
+            "optimizer_steps_completed": int(epoch_amp_accounting["optimizer_steps_completed"]),
+            "amp_overflow_skipped_steps": int(epoch_amp_accounting["amp_overflow_skipped_steps"]),
+            "consecutive_amp_overflows": int(amp_runtime_state["consecutive_amp_overflows"]),
+            "total_amp_overflows": int(amp_runtime_state["total_amp_overflows"]),
+            "grad_scaler_scale": float(scaler.get_scale()), "last_finite_loss": last_finite_loss,
+            "latest_completed_epoch": int(self.execution_context.get("epoch") or 1) - 1,
+            "timestamp": utc_now(),
+        }
+        atomic_json(self.output / "manifests" / "STAGE4M_HEARTBEAT.json", payload, self.output)
+        self.write_live_progress("TRAINING_HEARTBEAT", **{key: value for key, value in payload.items() if key not in {"pipeline_version", "event", "stage", "arm", "seed", "epoch", "timestamp", "elapsed_seconds"}})
+        print(
+            f"[{self.execution_context['arm']} seed={self.execution_context['seed']} epoch={self.execution_context['epoch']}] "
+            f"batch {batch}/{total_batches} | {payload['percentage']:.1f}% | loss={last_finite_loss} | "
+            f"AMP-skipped={payload['amp_overflow_skipped_steps']}"
+        )
+
+    def completed_arm_seed_jobs(self) -> int:
+        return sum(
+            (self.training_checkpoint_dir(arm, seed) / "best.pt").is_file()
+            for arm in ARMS for seed in SEEDS
+        )
+
+    def write_staging_status(self, state: str, **fields: Any) -> None:
+        payload = {
+            "state": state,
+            "pipeline_version": PIPELINE_VERSION,
+            "strict_counters": self.guard.counters(),
+            "last_update": utc_now(),
+            **fields,
+        }
+        atomic_json(self.output / "manifests" / "STAGE4M_DATA_STAGING_STATUS.json", payload, self.output)
+
+    def persist_io_counters(self) -> Path:
+        path = self.output / "manifests" / "STAGE4M_IO_COUNTERS.json"
+        atomic_json(path, {
+            "status": "PASS" if self.io_counters["training_signal_reads_drive"] == 0 else "FAIL",
+            "pipeline_version": PIPELINE_VERSION, "counters": dict(self.io_counters),
+            "ordinary_training_drive_signal_reads_allowed": False,
+            "strict_counters": self.guard.counters(), "updated_at": utc_now(),
+        }, self.output)
+        return path
+
+    def partition_metadata_hashes(self, metadata: Any) -> Dict[str, str]:
+        return {
+            "global_indices_sha256": sha256_array_values(np.asarray(metadata.indices, dtype=np.int64)),
+            "labels_sha256": sha256_array_values(np.asarray(metadata.labels, dtype=np.int16)),
+            "receiver_sha256": string_array_sha256(np.asarray(metadata.receiver)),
+            "day_sha256": string_array_sha256(np.asarray(metadata.day)),
+            "equalized_sha256": sha256_array_values(np.asarray(metadata.equalized, dtype=np.int8)),
+            "transmitter_sha256": string_array_sha256(np.asarray(metadata.transmitter_raw)),
+        }
+
+    def _assert_local_cache_boundary(self) -> None:
+        root = self.local_cache_root
+        if root.name != LOCAL_CACHE_DIRECTORY_NAME or "drive" in {part.lower() for part in root.parts}:
+            raise ScientificAbort(f"Unsafe local cache boundary: {root}")
+
+    def remove_disposable_local_cache(self) -> None:
+        self._assert_local_cache_boundary()
+        root = self.local_cache_root
+        if root.exists():
+            for name in (*AUTHORIZED_LOCAL_PARTITIONS, "calibration_unknown"):
+                target = root / name
+                if target.exists():
+                    shutil.rmtree(target)
+                building = root / f".{name}.building"
+                if building.exists():
+                    shutil.rmtree(building)
+            for name in ("cache_manifest.json", "runtime_policy.json"):
+                path = root / name
+                if path.is_file():
+                    path.unlink()
+        self.local_cache_active = False
+
+    def _write_partition_shards(
+        self, partition: str, metadata: Any, total_shards_expected: int, completed_rows_before: int,
+        completed_shards_before: int, bytes_before: int, total_expected: int, started: float,
+    ) -> Dict[str, Any]:
+        calibration_allowed = partition == "calibration_unknown" and self.selection_lock_sha() is not None
+        if partition not in AUTHORIZED_LOCAL_PARTITIONS and not calibration_allowed:
+            self.guard.reject("signal", f"forbidden local staging request: {partition}")
+        self._assert_local_cache_boundary()
+        root = self.local_cache_root
+        building = root / f".{partition}.building"
+        partition_root = root / partition
+        if building.exists():
+            shutil.rmtree(building)
+        building.mkdir(parents=True, exist_ok=False)
+        atomic_text(building / "INCOMPLETE", "INCOMPLETE\n", building)
+        indices = np.asarray(metadata.indices, dtype=np.int64)
+        if len(np.unique(indices)) != len(indices):
+            raise ScientificAbort(f"Duplicate canonical global index in authorized partition {partition}")
+        position_groups = [
+            np.arange(start, min(start + LOCAL_SHARD_ROWS, len(indices)), dtype=np.int64)
+            for start in range(0, len(indices), LOCAL_SHARD_ROWS)
+        ]
+        entries: List[Dict[str, Any]] = []
+        completed_rows = completed_rows_before
+        bytes_written = bytes_before
+        source_path = self.ensure_context().canonical_h5_path
+        try:
+            with h5py.File(source_path, "r", swmr=True) as source:
+                signals = source[self.ensure_context().signal_key]
+                for shard_id, positions in enumerate(position_groups):
+                    global_indices = indices[positions]
+                    signal_values = read_h5_rows_with_duplicates(signals, global_indices)
+                    self.io_counters["staging_signal_reads_drive"] += int(len(global_indices))
+                    if self.ensure_context().signal_orientation == "channels_last":
+                        signal_values = signal_values.transpose(0, 2, 1)
+                    arrays = {
+                        "signals": np.ascontiguousarray(signal_values, dtype=np.float32),
+                        "global_indices": global_indices.astype(np.int64, copy=False),
+                        "labels": np.asarray(metadata.labels[positions], dtype=np.int16),
+                        "receiver": np.asarray([str(value) for value in metadata.receiver[positions]], dtype=object),
+                        "day": np.asarray([str(value) for value in metadata.day[positions]], dtype=object),
+                        "equalized": np.asarray(metadata.equalized[positions], dtype=np.int8),
+                        "transmitter": np.asarray([str(value) for value in metadata.transmitter_raw[positions]], dtype=object),
+                    }
+                    filename = f"shard_{shard_id:06d}.h5"
+                    temporary, final = building / (filename + ".tmp"), building / filename
+                    with h5py.File(temporary, "w") as shard:
+                        shard.create_dataset("signals", data=arrays["signals"], compression=None)
+                        for name in ("global_indices", "labels", "equalized"):
+                            shard.create_dataset(name, data=arrays[name])
+                        for name in ("receiver", "day", "transmitter"):
+                            shard.create_dataset(name, data=arrays[name], dtype=h5py.string_dtype("utf-8"))
+                        shard.attrs["partition"] = partition
+                        shard.attrs["source_benchmark_sha256"] = EXPECTED_BENCHMARK_SHA256
+                        shard.flush()
+                    os.replace(temporary, final)
+                    with h5py.File(final, "r") as verification:
+                        if not np.array_equal(np.asarray(verification["signals"]), arrays["signals"]):
+                            raise ScientificAbort(f"Local shard signal equivalence failed: {partition}/{filename}")
+                    file_bytes = final.stat().st_size
+                    logical_sha = logical_shard_sha256(arrays)
+                    entry = {
+                        "filename": filename,
+                        "row_count": int(len(positions)),
+                        "first_partition_position": int(positions[0]),
+                        "last_partition_position": int(positions[-1]),
+                        "file_sha256": sha256_file(final),
+                        "logical_content_sha256": logical_sha,
+                        "bytes": file_bytes,
+                        "ordered_global_indices_sha256": sha256_array_values(global_indices.astype(np.int64, copy=False)),
+                    }
+                    entries.append(entry); bytes_written += file_bytes; completed_rows += len(positions)
+                    absolute_shard = completed_shards_before + shard_id + 1
+                    percentage = 100.0 * completed_rows / max(total_expected, 1)
+                    status_fields = {
+                        "partition": partition, "current_shard": absolute_shard,
+                        "total_shards_expected": total_shards_expected,
+                        "completed_shards": absolute_shard, "completed_rows": completed_rows,
+                        "total_rows_expected": total_expected, "bytes_written": bytes_written,
+                        "elapsed_seconds": time.perf_counter() - started, "percentage": percentage,
+                    }
+                    self.write_staging_status("COPYING", **status_fields)
+                    self.write_live_progress("DATA_SHARD_WRITTEN", **status_fields)
+                    print(f"[LOCAL-CACHE] {partition} shard {shard_id + 1}/{len(position_groups)} | {percentage:.1f}%")
+            partition_manifest = {
+                "schema_version": "stage4m_local_shards_v1",
+                "partition": partition,
+                "source_canonical_benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+                "total_authorized_rows": int(len(indices)),
+                "rows_per_shard": [entry["row_count"] for entry in entries],
+                "actual_shard_count": len(entries),
+                "ordered_global_indices_sha256": sha256_array_values(indices),
+                "metadata_hashes": self.partition_metadata_hashes(metadata),
+                "signal_shape": [2, 256], "signal_dtype": "float32",
+                "shards": entries,
+            }
+            atomic_json(building / "LOCAL_SHARD_MANIFEST.json", partition_manifest, building)
+            (building / "INCOMPLETE").unlink()
+            if partition_root.exists():
+                shutil.rmtree(partition_root)
+            os.replace(building, partition_root)
+            self.write_live_progress("DATA_PARTITION_STAGED", partition=partition, rows=len(indices), shards=len(entries))
+            return partition_manifest
+        finally:
+            if building.exists():
+                shutil.rmtree(building)
+
+    def _activate_local_cache(self, payload: Mapping[str, Any]) -> None:
+        benchmark = self.ensure_context()
+        for partition in payload["allowed_partitions"]:
+            manifest_path = self.local_cache_root / partition / "LOCAL_SHARD_MANIFEST.json"
+            benchmark.partition_backends[partition] = "sharded_local"
+            benchmark.shard_manifests[partition] = manifest_path
+        self.local_cache_active = True
+        self.local_cache_manifest_sha = sha256_file(self.local_cache_root / "cache_manifest.json")
+        self.local_cache_aggregate_sha = str(payload["cache_aggregate_sha256"])
+        self.local_cache_identity_sha = sha256_file(self.local_cache_identity_path) if self.local_cache_identity_path.is_file() else None
+
+    def verify_local_data_cache(self, require_existing: bool = True) -> bool:
+        local_manifest = self.local_cache_root / "cache_manifest.json"
+        if not local_manifest.is_file() or not self.local_cache_manifest_path.is_file():
+            if require_existing:
+                raise ScientificAbort("Stage 4M local data cache is missing")
+            return False
+        try:
+            if sha256_file(self.local_cache_manifest_path) != sha256_file(local_manifest):
+                return False
+            payload = json.loads(local_manifest.read_text(encoding="utf-8"))
+            benchmark = self.ensure_context()
+            expected = {
+                "pipeline_version": PIPELINE_VERSION,
+                "executable_sha256": self.script_sha,
+                "runtime_io_policy_sha256": self.runtime_io_policy_sha,
+                "scientific_configuration_sha256": self.config.configuration_sha256(),
+                "canonical_benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+                "allowed_partitions": list(AUTHORIZED_LOCAL_PARTITIONS),
+            }
+            if any(payload.get(key) != value for key, value in expected.items()):
+                return False
+            if any(int(value) != 0 for value in payload.get("strict_access_counters", {}).values()) or any(self.guard.counters().values()):
+                return False
+            if int(payload.get("total_shard_count", -1)) != sum(
+                math.ceil(len(benchmark.partitions[name].indices) / LOCAL_SHARD_ROWS)
+                for name in AUTHORIZED_LOCAL_PARTITIONS
+            ):
+                return False
+            logical_rows = []
+            for partition in AUTHORIZED_LOCAL_PARTITIONS:
+                metadata = benchmark.partitions[partition]
+                info = payload["partitions"][partition]
+                if int(info["row_count"]) != len(metadata.indices) or info["metadata_hashes"] != self.partition_metadata_hashes(metadata):
+                    return False
+                manifest_path = self.local_cache_root / partition / "LOCAL_SHARD_MANIFEST.json"
+                partition_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if partition_manifest.get("shards") != info["shards"]:
+                    return False
+                globals_stored, labels_stored, receivers, days, equalized, transmitters = [], [], [], [], [], []
+                for shard_index, entry in enumerate(info["shards"]):
+                    expected_name = f"shard_{shard_index:06d}.h5"
+                    path = self.local_cache_root / partition / entry["filename"]
+                    if entry["filename"] != expected_name or not path.is_file():
+                        return False
+                    if path.stat().st_size != int(entry["bytes"]) or sha256_file(path) != entry["file_sha256"]:
+                        return False
+                    with h5py.File(path, "r") as shard:
+                        shard_arrays = {
+                            "signals": np.asarray(shard["signals"], dtype=np.float32),
+                            "global_indices": np.asarray(shard["global_indices"], dtype=np.int64),
+                            "labels": np.asarray(shard["labels"], dtype=np.int16),
+                            "receiver": np.asarray([value.decode() if isinstance(value, bytes) else str(value) for value in np.asarray(shard["receiver"])], dtype=object),
+                            "day": np.asarray([value.decode() if isinstance(value, bytes) else str(value) for value in np.asarray(shard["day"])], dtype=object),
+                            "equalized": np.asarray(shard["equalized"], dtype=np.int8),
+                            "transmitter": np.asarray([value.decode() if isinstance(value, bytes) else str(value) for value in np.asarray(shard["transmitter"])], dtype=object),
+                        }
+                    if logical_shard_sha256(shard_arrays) != entry["logical_content_sha256"]:
+                        return False
+                    globals_stored.append(shard_arrays["global_indices"])
+                    labels_stored.append(shard_arrays["labels"])
+                    receivers.extend(shard_arrays["receiver"])
+                    days.extend(shard_arrays["day"])
+                    equalized.append(shard_arrays["equalized"])
+                    transmitters.extend(shard_arrays["transmitter"])
+                    logical_rows.append({"partition": partition, "filename": entry["filename"], "logical_content_sha256": entry["logical_content_sha256"]})
+                if not (
+                    np.array_equal(np.concatenate(globals_stored), np.asarray(metadata.indices, dtype=np.int64))
+                    and np.array_equal(np.concatenate(labels_stored), np.asarray(metadata.labels, dtype=np.int16))
+                    and np.array_equal(np.asarray(receivers), np.asarray(metadata.receiver, dtype=str))
+                    and np.array_equal(np.asarray(days), np.asarray(metadata.day, dtype=str))
+                    and np.array_equal(np.concatenate(equalized), np.asarray(metadata.equalized, dtype=np.int8))
+                    and np.array_equal(np.asarray(transmitters), np.asarray(metadata.transmitter_raw, dtype=str))
+                ):
+                    return False
+            if sha256_object(logical_rows) != payload.get("cache_aggregate_sha256"):
+                return False
+            self._activate_local_cache(payload)
+            return True
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+
+    def ensure_local_data_cache(self) -> Mapping[str, Any]:
+        atomic_json(self.local_io_policy_path, {**self.config.runtime_io_payload(), "runtime_io_policy_sha256": self.runtime_io_policy_sha}, self.output)
+        if self.verify_local_data_cache(require_existing=False):
+            print("STAGE4M_LOCAL_DATA_CACHE_READY")
+            return json.loads((self.local_cache_root / "cache_manifest.json").read_text(encoding="utf-8"))
+        self.remove_disposable_local_cache(); self.local_cache_root.mkdir(parents=True, exist_ok=True)
+        started = time.perf_counter(); benchmark = self.ensure_context()
+        total_rows = sum(len(benchmark.partitions[name].indices) for name in AUTHORIZED_LOCAL_PARTITIONS)
+        capacity = local_capacity_evidence(self.local_cache_root.parent, total_rows)
+        total_shards = sum(math.ceil(len(benchmark.partitions[name].indices) / LOCAL_SHARD_ROWS) for name in AUTHORIZED_LOCAL_PARTITIONS)
+        self.write_staging_status("INITIALIZING", total_shards_expected=total_shards, total_rows_expected=total_rows, completed_shards=0, completed_rows=0, bytes_written=0, percentage=0.0)
+        self.write_live_progress("DATA_STAGING_STARTED", total_shards=total_shards, total_rows=total_rows)
+        partitions: Dict[str, Any] = {}; completed_rows = 0; completed_shards = 0; bytes_written = 0
+        try:
+            for partition in AUTHORIZED_LOCAL_PARTITIONS:
+                partition_manifest = self._write_partition_shards(
+                    partition, benchmark.partitions[partition], total_shards, completed_rows,
+                    completed_shards, bytes_written, total_rows, started,
+                )
+                partitions[partition] = {
+                    "row_count": partition_manifest["total_authorized_rows"],
+                    "shard_count": partition_manifest["actual_shard_count"],
+                    "metadata_hashes": partition_manifest["metadata_hashes"],
+                    "ordered_global_indices_sha256": partition_manifest["ordered_global_indices_sha256"],
+                    "shards": partition_manifest["shards"],
+                }
+                completed_rows += partition_manifest["total_authorized_rows"]
+                completed_shards += partition_manifest["actual_shard_count"]
+                bytes_written += sum(entry["bytes"] for entry in partition_manifest["shards"])
+            self.write_staging_status("VERIFYING", total_shards_expected=total_shards, total_rows_expected=total_rows, completed_shards=total_shards, completed_rows=completed_rows, percentage=100.0)
+            self.write_live_progress("DATA_STAGING_VERIFYING")
+            logical_rows = [
+                {"partition": partition, "filename": entry["filename"], "logical_content_sha256": entry["logical_content_sha256"]}
+                for partition in AUTHORIZED_LOCAL_PARTITIONS for entry in partitions[partition]["shards"]
+            ]
+            total_bytes = sum(entry["bytes"] for partition in AUTHORIZED_LOCAL_PARTITIONS for entry in partitions[partition]["shards"])
+            payload = {
+                "pipeline_version": PIPELINE_VERSION, "executable_sha256": self.script_sha,
+                "runtime_io_policy_sha256": self.runtime_io_policy_sha,
+                "scientific_configuration_sha256": self.config.configuration_sha256(),
+                "canonical_branch_root": str(self.root),
+                "canonical_benchmark_path": str(benchmark.canonical_h5_path),
+                "canonical_benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+                "local_cache_root": str(self.local_cache_root), "local_cache_format": LOCAL_CACHE_FORMAT,
+                "shard_size_policy": {"rows_per_shard": LOCAL_SHARD_ROWS},
+                "allowed_partitions": list(AUTHORIZED_LOCAL_PARTITIONS),
+                "forbidden_partitions": list(FORBIDDEN_LOCAL_PARTITIONS),
+                "partitions": partitions, "partition_row_counts": {name: partitions[name]["row_count"] for name in AUTHORIZED_LOCAL_PARTITIONS},
+                "partition_shard_counts": {name: partitions[name]["shard_count"] for name in AUTHORIZED_LOCAL_PARTITIONS},
+                "total_shard_count": total_shards, "total_cached_samples": total_rows, "total_cached_bytes": total_bytes,
+                "average_shard_bytes": total_bytes / max(total_shards, 1),
+                "signal_dtype": "float32", "signal_shape_schema": [2, 256], "label_dtype": "int16",
+                "global_index_coverage_checks": "EXACT_ORDER_NO_DUPLICATES_NO_MISSING_NO_UNAUTHORIZED",
+                "receiver_day_metadata_checks": "EXACT", "cache_aggregate_sha256": sha256_object(logical_rows),
+                "strict_access_counters": self.guard.counters(), **capacity,
+                "cache_created_at": utc_now(), "cache_validation_status": "READY",
+                "staging_duration_seconds": time.perf_counter() - started,
+                "data_loader_workers": self.config.num_workers,
+                "gpu_model": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+            }
+            atomic_json(self.local_cache_root / "cache_manifest.json", payload, self.local_cache_root)
+            atomic_json(self.local_cache_root / "runtime_policy.json", {**self.config.runtime_io_payload(), "runtime_io_policy_sha256": self.runtime_io_policy_sha}, self.local_cache_root)
+            atomic_json(self.local_cache_manifest_path, payload, self.output)
+            identity = {
+                "pipeline_version": PIPELINE_VERSION, "runtime_io_policy_sha256": self.runtime_io_policy_sha,
+                "scientific_configuration_sha256": self.config.configuration_sha256(),
+                "canonical_benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+                "cache_aggregate_sha256": payload["cache_aggregate_sha256"],
+                "partition_metadata_hashes": {name: partitions[name]["metadata_hashes"] for name in AUTHORIZED_LOCAL_PARTITIONS},
+            }
+            atomic_json(self.local_cache_identity_path, identity, self.output)
+            if not self.verify_local_data_cache():
+                raise ScientificAbort("Stage 4M local cache verification failed after build")
+            self.write_staging_status("READY", total_shards_expected=total_shards, total_rows_expected=total_rows, completed_shards=total_shards, completed_rows=total_rows, bytes_written=total_bytes, percentage=100.0)
+            self.persist_io_counters()
+            self.write_live_progress("DATA_STAGING_READY", total_shards=total_shards, total_rows=total_rows, total_bytes=total_bytes)
+            print("STAGE4M_LOCAL_DATA_CACHE_READY")
+            return payload
+        except BaseException:
+            self.write_staging_status("FAILED", total_shards_expected=total_shards, total_rows_expected=total_rows, completed_rows=completed_rows)
+            raise
+
+    def stage_local_data(self) -> None:
+        self.ensure_local_data_cache()
+
+    def verify_local_data(self) -> None:
+        if not self.verify_local_data_cache(require_existing=True):
+            raise ScientificAbort("STAGE4M_LOCAL_DATA_CACHE_INVALID")
+        print("STAGE4M_LOCAL_DATA_CACHE_VERIFIED")
+
+    def ensure_calibration_local_cache(self) -> Path:
+        lock = self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json"
+        if not lock.is_file() or json.loads(lock.read_text(encoding="utf-8")).get("post_selection_model_changes_permitted") is not False:
+            raise ScientificAbort("Calibration Unknown local staging requires the immutable canonical selection lock")
+        metadata = self.ensure_context().partitions["calibration_unknown"]
+        manifest_path = self.local_cache_root / "calibration_unknown" / "LOCAL_SHARD_MANIFEST.json"
+        valid = False
+        if manifest_path.is_file():
+            try:
+                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                valid = (
+                    payload.get("source_canonical_benchmark_sha256") == EXPECTED_BENCHMARK_SHA256
+                    and payload.get("metadata_hashes") == self.partition_metadata_hashes(metadata)
+                    and all(
+                        (manifest_path.parent / row["filename"]).is_file()
+                        and sha256_file(manifest_path.parent / row["filename"]) == row["file_sha256"]
+                        for row in payload["shards"]
+                    )
+                )
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                valid = False
+        if not valid:
+            started = time.perf_counter()
+            payload = self._write_partition_shards(
+                "calibration_unknown", metadata, math.ceil(len(metadata.indices) / LOCAL_SHARD_ROWS),
+                0, 0, 0, len(metadata.indices), started,
+            )
+            atomic_json(
+                self.output / "manifests" / "STAGE4M_CALIBRATION_LOCAL_CACHE_MANIFEST.json",
+                {**payload, "selection_lock_sha256": sha256_file(lock), "selection_role": "POST_SELECTION_DIAGNOSTIC_ONLY"},
+                self.output,
+            )
+        benchmark = self.ensure_context()
+        benchmark.partition_backends["calibration_unknown"] = "sharded_local"
+        benchmark.shard_manifests["calibration_unknown"] = manifest_path
+        return manifest_path
 
     def complete_stage(self, stage: int, name: str, outputs: Sequence[Path], inputs: Sequence[Path] = ()) -> None:
         missing = [str(path) for path in outputs if not path.is_file()]
@@ -975,6 +1575,9 @@ class Stage4Pipeline:
             "objective_policy_sha256": self.objective_policy_sha if stage >= 2 else None,
             "training_target_policy_sha256": self.training_target_policy_sha if stage >= 2 else None,
             "amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha if stage >= 2 else None,
+            "runtime_io_policy_sha256": self.runtime_io_policy_sha if stage >= 4 else None,
+            "local_cache_identity_sha256": self.local_cache_identity_sha if stage >= 4 else None,
+            "local_cache_aggregate_sha256": self.local_cache_aggregate_sha if stage >= 4 else None,
             "selection_lock_sha256": self.selection_lock_hash if stage >= 9 else None,
             "inputs": [{"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in inputs],
             "outputs": [{"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size} for path in outputs],
@@ -1001,7 +1604,10 @@ class Stage4Pipeline:
                 "architecture_freeze_sha256": self.architecture_freeze_sha if stage >= 2 else None,
                 "objective_policy_sha256": self.objective_policy_sha if stage >= 2 else None,
                 "training_target_policy_sha256": self.training_target_policy_sha if stage >= 2 else None,
-            "amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha if stage >= 2 else None,
+                "amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha if stage >= 2 else None,
+                "runtime_io_policy_sha256": self.runtime_io_policy_sha if stage >= 4 else None,
+                "local_cache_identity_sha256": self.local_cache_identity_sha if stage >= 4 else None,
+                "local_cache_aggregate_sha256": self.local_cache_aggregate_sha if stage >= 4 else None,
                 "selection_lock_sha256": self.selection_lock_hash if stage >= 9 else None,
             }
             if any(payload.get(key) != value for key, value in expected.items()):
@@ -1199,7 +1805,17 @@ class Stage4Pipeline:
         except (OSError, ValueError, KeyError, json.JSONDecodeError): return False
 
     def build_loader(self, partition: str, batches: Optional[Sequence[Sequence[int]]] = None, seed: int = 0) -> Tuple[Any, DataLoader]:
-        benchmark = self.ensure_context(); dataset = self.stage26.WiSigH5Dataset(benchmark, partition, self.guard)
+        if partition not in (*AUTHORIZED_LOCAL_PARTITIONS, "calibration_unknown"):
+            self.guard.reject("signal", f"forbidden DataLoader partition: {partition}")
+        benchmark = self.ensure_context()
+        if partition == "calibration_unknown":
+            self.ensure_calibration_local_cache()
+        elif self.local_cache_active:
+            if benchmark.backend_for(partition) != "sharded_local":
+                raise ScientificAbort(f"Local cache active but {partition} is not local-sharded")
+        elif int(self.execution_context.get("stage") or 0) >= 4:
+            raise ScientificAbort(f"Drive signal hot path forbidden after local-cache activation gate: {partition}")
+        dataset = self.stage26.WiSigH5Dataset(benchmark, partition, self.guard)
         compatibility = self.stage26.Stage26Config(
             branch_root=str(self.root), output_dir=str(self.root / "03_representation_ablation"),
             batch_size=self.config.batch_size, eval_batch_size=self.config.eval_batch_size,
@@ -1220,6 +1836,10 @@ class Stage4Pipeline:
         cursor, use_amp = 0, self.config.amp_enabled and self.device.type == "cuda"
         with torch.inference_mode():
             for batch in loader:
+                if getattr(dataset, "backend", None) != "sharded_local":
+                    dataset.close()
+                    raise ScientificAbort(f"Teacher cache {partition} did not use local sharded data")
+                self.io_counters["evaluation_signal_reads_local"] += int(len(batch["x"]))
                 values = batch["x"].to(self.device, non_blocking=True)
                 with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_amp): outputs = teacher(values)
                 count = len(values); logits[cursor:cursor+count] = outputs["logits"].float().cpu().numpy().astype(np.float16)
@@ -1324,6 +1944,10 @@ class Stage4Pipeline:
         if auxiliary is not None: auxiliary.eval()
         with torch.inference_mode():
             for batch in loader:
+                if getattr(dataset, "backend", None) != "sharded_local":
+                    dataset.close()
+                    raise ScientificAbort(f"Student evaluation {partition} did not use local sharded data")
+                self.io_counters["evaluation_signal_reads_local"] += int(len(batch["x"]))
                 x = batch["x"].to(self.device, non_blocking=True); count = len(x)
                 output = model(x); student_logits[cursor:cursor+count] = output["logits"].float().cpu().numpy()
                 if auxiliary is not None:
@@ -1345,6 +1969,9 @@ class Stage4Pipeline:
             "objective_policy_sha256": self.objective_policy_sha,
             "training_target_policy_sha256": self.training_target_policy_sha,
             "amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha,
+            "runtime_io_policy_sha256": self.runtime_io_policy_sha,
+            "local_cache_identity_sha256": self.local_cache_identity_sha,
+            "local_cache_aggregate_sha256": self.local_cache_aggregate_sha,
             "architecture_freeze_sha256": self.architecture_freeze_sha,
             "predecessor_lock_sha256": self.predecessor_lock_sha,
             "teacher_sha256": EXPECTED_TEACHER_SHA256, "teacher_state_sha256": EXPECTED_TEACHER_STATE_SHA256,
@@ -1358,7 +1985,18 @@ class Stage4Pipeline:
     def validate_training_checkpoint(self, payload: Mapping[str, Any], arm: str, seed: int) -> None:
         expected = self.checkpoint_validation_fields(arm, seed)
         mismatches = [key for key, value in expected.items() if payload.get(key) != value]
-        if mismatches: raise ScientificAbort(f"STALE_STAGE4M_CHECKPOINT {arm}/seed={seed}: {mismatches}")
+        if not mismatches:
+            return
+        runtime_only = {"executable_sha256", "runtime_io_policy_sha256", "local_cache_identity_sha256", "local_cache_aggregate_sha256"}
+        predecessor_compatible = (
+            payload.get("executable_sha256") == LOCAL_IO_COMPATIBLE_PREDECESSOR_SHA256
+            and all(payload.get(key) == value for key, value in expected.items() if key not in runtime_only)
+            and payload.get("runtime_io_policy_sha256") in (None, "")
+            and payload.get("local_cache_identity_sha256") in (None, "")
+            and payload.get("local_cache_aggregate_sha256") in (None, "")
+        )
+        if not predecessor_compatible:
+            raise ScientificAbort(f"STALE_STAGE4M_CHECKPOINT {arm}/seed={seed}: {mismatches}")
 
     @staticmethod
     def known_pre_amp_checkpoint_requires_restart(payload: Mapping[str, Any], arm: str, seed: int) -> bool:
@@ -1432,6 +2070,9 @@ class Stage4Pipeline:
     def train_arm_seed(self, arm: str, seed: int) -> Dict[str, Any]:
         base = self.training_checkpoint_dir(arm, seed); base.mkdir(parents=True, exist_ok=True)
         latest, best_path = base / "latest.pt", base / "best.pt"
+        history_path, epoch_status_path = base / "history.csv", base / "epoch_status.json"
+        self.execution_context.update({"arm": arm, "seed": seed, "epoch": None})
+        self.write_live_progress("ARM_SEED_STARTED")
         model, auxiliary, optimizer, scheduler, scaler = self.create_training_objects(arm, seed)
         start_epoch, best_metrics, stale_epochs = 0, None, 0
         amp_runtime_state = new_amp_runtime_state()
@@ -1459,21 +2100,32 @@ class Stage4Pipeline:
         prototypes = self.teacher_prototypes().to(self.device) if arm == "K3" else None
         augmentation = self.stage26.RFAugmentation(self.compatibility_config())
         history: List[Dict[str, Any]] = []
+        if start_epoch and history_path.is_file():
+            history = pd.read_csv(history_path).to_dict("records")
+            history = [row for row in history if int(row.get("epoch", 0)) <= start_epoch]
         teacher_value_before = teacher_state_value_sha(self.load_teacher())
         for epoch in range(start_epoch + 1, self.config.max_epochs + 1):
+            epoch_started = time.perf_counter()
+            self.execution_context["epoch"] = epoch
+            self.write_live_progress("EPOCH_STARTED", latest_completed_epoch=epoch - 1)
             sampler = self.stage26.DomainBalancedTxSampler(
                 train_meta.labels, train_meta.receiver, train_meta.day, train_meta.equalized,
                 self.config.batch_size, self.config.samples_per_tx, seed, epoch,
             )
             batches = list(iter(sampler)); exposure_sha = self.stage26.batch_exposure_sha256(batches)
             dataset, loader = self.build_loader("train_known", batches=batches, seed=seed * 1000 + epoch)
+            if getattr(dataset, "backend", None) != "sharded_local":
+                dataset.close()
+                raise ScientificAbort("Training DataLoader did not use the verified local sharded backend")
             model.train()
             if auxiliary is not None: auxiliary.train()
             augmentation_generator = torch.Generator(device=self.device.type); augmentation_generator.manual_seed(seed * 1_000_003 + epoch)
             sums = {name: 0.0 for name in ("total", "ce", "kd", "repr", "proto")}; samples = 0
             epoch_amp_accounting = new_epoch_amp_accounting()
             trainable_parameters = list(model.parameters()) + (list(auxiliary.parameters()) if auxiliary is not None else [])
+            last_finite_loss: Optional[float] = None
             for batch_index, batch in enumerate(loader, start=1):
+                self.io_counters["training_signal_reads_local"] += int(len(batch["x"]))
                 raw_input = batch["x"].to(self.device, non_blocking=True); labels = batch["y"].to(self.device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 use_amp = self.config.amp_enabled and self.device.type == "cuda"
@@ -1485,6 +2137,7 @@ class Stage4Pipeline:
                 with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_amp):
                     loss, parts = compute_kd_losses(arm, output, target_logits, target_embedding, labels, auxiliary, prototypes)
                 if not torch.isfinite(loss): raise ScientificAbort(f"Non-finite loss for {arm}/seed={seed}/epoch={epoch}")
+                last_finite_loss = float(loss.detach().cpu())
                 scaler.scale(loss).backward(); scaler.unscale_(optimizer)
                 gradient_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, self.config.gradient_clip_norm)
                 finite = gradients_finite(trainable_parameters, gradient_norm)
@@ -1493,9 +2146,17 @@ class Stage4Pipeline:
                     f"arm={arm} seed={seed} epoch={epoch} batch={batch_index}", self.logger,
                 )
                 if not updated:
+                    self.write_live_progress(
+                        "AMP_OVERFLOW_EVENT", batch=batch_index, total_batches=len(loader),
+                        amp_runtime_state=dict(amp_runtime_state), epoch_amp_accounting=dict(epoch_amp_accounting),
+                    )
+                    if batch_index % HEARTBEAT_EVERY_BATCHES == 0:
+                        self.write_heartbeat(batch_index, len(loader), last_finite_loss, epoch_amp_accounting, amp_runtime_state, scaler)
                     continue
                 count = len(augmented); samples += count; sums["total"] += float(loss.detach().cpu()) * count
                 for name, value in parts.items(): sums[name] += float(value.detach().cpu()) * count
+                if batch_index % HEARTBEAT_EVERY_BATCHES == 0:
+                    self.write_heartbeat(batch_index, len(loader), last_finite_loss, epoch_amp_accounting, amp_runtime_state, scaler)
             dataset.close()
             assert_epoch_has_optimizer_step(epoch_amp_accounting, f"{arm}/seed={seed}/epoch={epoch}")
             scheduler.step()
@@ -1506,6 +2167,7 @@ class Stage4Pipeline:
             row = {
                 **p0, **{f"train_{name}": value / samples for name, value in sums.items()},
                 "exposure_sha256": exposure_sha,
+                "epoch_runtime_seconds": time.perf_counter() - epoch_started,
                 **epoch_amp_accounting,
             }
             history.append(row)
@@ -1514,22 +2176,58 @@ class Stage4Pipeline:
                 latest, arm, seed, epoch, model, auxiliary, optimizer, scheduler, scaler, best_metrics,
                 stale_epochs, loader_state, exposure_sha, amp_runtime_state, epoch_amp_accounting,
             )
-            if improved: shutil.copy2(latest, best_path)
+            if improved:
+                atomic_verified_copy(latest, best_path, self.output)
+            atomic_csv(history_path, pd.DataFrame(history), self.output)
+            epoch_status = {
+                "status": "EPOCH_COMPLETE", "arm": arm, "seed": seed, "epoch": epoch,
+                "best_epoch": int(best_metrics["epoch"]) if best_metrics else None,
+                "latest_checkpoint_sha256": sha256_file(latest),
+                "best_checkpoint_sha256": sha256_file(best_path) if best_path.is_file() else None,
+                "history_sha256": sha256_file(history_path), "stale_epochs": stale_epochs,
+                "runtime_io_policy_sha256": self.runtime_io_policy_sha,
+                "local_cache_identity_sha256": self.local_cache_identity_sha,
+                "local_cache_aggregate_sha256": self.local_cache_aggregate_sha,
+                "amp_runtime_state": dict(amp_runtime_state), "epoch_amp_accounting": dict(epoch_amp_accounting),
+                "io_counters": dict(self.io_counters), "completed_at": utc_now(),
+            }
+            atomic_json(epoch_status_path, epoch_status, self.output)
+            self.persist_io_counters()
+            self.write_live_progress(
+                "EPOCH_COMPLETED", latest_completed_epoch=epoch,
+                latest_checkpoint=str(latest), latest_checkpoint_sha256=epoch_status["latest_checkpoint_sha256"],
+                best_checkpoint=str(best_path) if best_path.is_file() else None,
+                best_checkpoint_sha256=epoch_status["best_checkpoint_sha256"], improved=improved,
+                p0_metrics=p0, p0_teacher_student_agreement=p0["teacher_student_top1_agreement"],
+                p0_kl=p0["teacher_student_kl"], p0_accuracy=p0["student_accuracy"],
+                p0_fixed98_macro_f1=p0["student_fixed98_macro_f1"],
+                train_total_loss=row["train_total"], train_ce=row["train_ce"], train_kd=row["train_kd"],
+                train_repr=row["train_repr"], train_proto=row["train_proto"], learning_rate=optimizer.param_groups[0]["lr"],
+                stale_epochs=stale_epochs, epoch_amp_accounting=dict(epoch_amp_accounting),
+            )
+            if improved:
+                self.write_live_progress("BEST_EPOCH_UPDATED", best_epoch=epoch, best_checkpoint_sha256=sha256_file(best_path))
             self.logger.info("%s seed %d epoch %d | agreement %.5f | KL %.5f | F1 %.5f", arm, seed, epoch,
                              p0["teacher_student_top1_agreement"], p0["teacher_student_kl"], p0["student_fixed98_macro_f1"])
-            if epoch >= self.config.minimum_epochs and stale_epochs >= self.config.patience: break
+            if epoch >= self.config.minimum_epochs and stale_epochs >= self.config.patience:
+                self.write_live_progress("EARLY_STOP_TRIGGERED", stale_epochs=stale_epochs)
+                break
         if not best_path.is_file(): raise ScientificAbort(f"Best checkpoint missing for {arm}/seed={seed}")
         if teacher_state_value_sha(self.load_teacher()) != teacher_value_before or sha256_file(self.teacher_path) != EXPECTED_TEACHER_SHA256:
             raise ScientificAbort("Teacher mutated during student training")
         best_payload = safe_torch_load(best_path, "cpu"); self.validate_training_checkpoint(best_payload, arm, seed)
-        history_path = base / "history.csv"; atomic_csv(history_path, pd.DataFrame(history), self.output)
+        atomic_csv(history_path, pd.DataFrame(history), self.output)
         result = dict(best_payload["best_p0_metrics"]); result.update({
             "arm": arm, "seed": seed, "best_checkpoint_sha256": sha256_file(best_path), "teacher_immutable": True,
             "total_amp_overflows": int(best_payload.get("amp_runtime_state", {}).get("total_amp_overflows", 0)),
         })
+        self.execution_context["epoch"] = int(best_payload["epoch"])
+        self.write_live_progress("ARM_SEED_COMPLETED", result=result)
         return result
 
     def train_arm_stage(self, stage: int, arm: str) -> None:
+        self.execution_context.update({"stage": stage, "arm": arm, "seed": None, "epoch": None})
+        self.write_live_progress("ARM_STARTED")
         results = [self.train_arm_seed(arm, seed) for seed in SEEDS]
         result_path = self.output / "tables" / f"{arm}_P0_RESULTS.csv"
         atomic_csv(result_path, pd.DataFrame(results), self.output)
@@ -1537,11 +2235,13 @@ class Stage4Pipeline:
         for seed in SEEDS:
             base = self.training_checkpoint_dir(arm, seed); outputs.extend((base / "latest.pt", base / "best.pt", base / "history.csv"))
         dependencies = [
-            *self.core_provenance_inputs(), self.output / "manifests" / "STAGE_03_CHECKPOINT.json",
+            *self.core_provenance_inputs(), *self.runtime_data_inputs(), self.output / "manifests" / "STAGE_03_CHECKPOINT.json",
         ]
         if arm == "K3":
             dependencies.append(self.output / "teacher_cache_manifests" / "train_known.json")
         self.complete_stage(stage, f"Train {arm}", outputs, dependencies)
+        self.persist_io_counters()
+        self.write_live_progress("ARM_COMPLETED", result_table_sha256=sha256_file(result_path))
 
     def stage_04(self) -> None: self.train_arm_stage(4, "K0")
     def stage_05(self) -> None: self.train_arm_stage(5, "K1")
@@ -1558,6 +2258,7 @@ class Stage4Pipeline:
         return model, auxiliary, payload
 
     def stage_08(self) -> None:
+        self.write_live_progress("CANONICAL_SELECTION_STARTED")
         seed_rows, summary = [], {}
         for arm in ARMS:
             frame = pd.read_csv(self.output / "tables" / f"{arm}_P0_RESULTS.csv")
@@ -1631,8 +2332,12 @@ class Stage4Pipeline:
             "calibration_unknown_used_for_selection": False, "stage35_strict_used_for_selection": False,
         }
         atomic_json(lock_path, lock, self.output)
+        self.write_live_progress(
+            "CANONICAL_SELECTION_LOCKED", selected_arm=selected_arm, selected_seed=selected_seed,
+            selection_lock_sha256=sha256_file(lock_path),
+        )
         outputs = [selection_path, lock_path, training_path, deploy_path, state_path]
-        inputs = [*self.core_provenance_inputs()]
+        inputs = [*self.core_provenance_inputs(), *self.runtime_data_inputs()]
         for completed_stage, completed_arm in zip(range(4, 8), ARMS):
             inputs.extend((self.stage_checkpoint(completed_stage), self.output / "tables" / f"{completed_arm}_P0_RESULTS.csv"))
             inputs.extend(self.training_checkpoint_dir(completed_arm, seed) / "best.pt" for seed in SEEDS)
@@ -1657,6 +2362,10 @@ class Stage4Pipeline:
         cursor = 0
         with torch.inference_mode():
             for batch in loader:
+                if getattr(dataset, "backend", None) != "sharded_local":
+                    dataset.close()
+                    raise ScientificAbort(f"Student output {partition} did not use local sharded data")
+                self.io_counters["evaluation_signal_reads_local"] += int(len(batch["x"]))
                 output = model(batch["x"].to(self.device, non_blocking=True)); count = len(batch["x"])
                 logits[cursor:cursor+count] = output["logits"].float().cpu().numpy()
                 embedding[cursor:cursor+count] = output["embedding_normalized"].float().cpu().numpy(); cursor += count
@@ -1674,6 +2383,7 @@ class Stage4Pipeline:
     def stage_09(self) -> None:
         model, auxiliary, selection = self.canonical_model(); rows, representation = [], []
         for partition in ("p1", "p2", "p3"):
+            self.write_live_progress(f"{partition.upper()}_DIAGNOSTIC_STARTED")
             metrics = self.evaluate_student(model, partition, auxiliary)
             metrics.update({"selected_arm": selection["selected_arm"], "selected_seed": selection["selected_seed"], "selection_role": "REPORTING_ONLY"}); rows.append(metrics)
             logits, embedding, labels = self.student_outputs(model, partition)
@@ -1687,12 +2397,13 @@ class Stage4Pipeline:
                 projected_cosine = float(np.mean(np.sum(projected * target, axis=1)))
                 cka = self.linear_cka(projected, target)
             representation.append({"partition": partition, "projected_teacher_cosine": projected_cosine, "linear_cka": cka, "rows_sampled": len(positions), "selection_role": "REPORTING_ONLY"})
+            self.write_live_progress(f"{partition.upper()}_DIAGNOSTIC_COMPLETED")
         fidelity_path = self.output / "tables" / "KNOWN_DOMAIN_FIDELITY.csv"
         representation_path = self.output / "tables" / "REPRESENTATION_FIDELITY.csv"
         atomic_csv(fidelity_path, pd.DataFrame(rows), self.output); atomic_csv(representation_path, pd.DataFrame(representation), self.output)
         self.complete_stage(
             9, "P1-P3 external known-domain diagnostics", [fidelity_path, representation_path],
-            [*self.core_provenance_inputs(), self.stage_checkpoint(8),
+            [*self.core_provenance_inputs(), *self.runtime_data_inputs(), self.stage_checkpoint(8),
              self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json",
              self.output / "checkpoints" / "canonical" / "canonical_surrogate_deploy.pt"],
         )
@@ -1708,6 +2419,7 @@ class Stage4Pipeline:
         return np.column_stack((msp, energy, cosine, mahalanobis, nll))
 
     def stage_10(self) -> None:
+        self.write_live_progress("CALIBRATED_DIAGNOSTIC_STARTED")
         lock = self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json"
         if not lock.is_file() or json.loads(lock.read_text(encoding="utf-8")).get("post_selection_model_changes_permitted") is not False:
             raise ScientificAbort("Calibration diagnostic requires an immutable canonical selection lock")
@@ -1744,9 +2456,10 @@ class Stage4Pipeline:
         if before != after: raise ScientificAbort("Calibration Unknown mutated the canonical surrogate")
         self.complete_stage(
             10, "Optional ZD_CALIBRATED_DIAGNOSTIC", [diagnostic],
-            [*self.core_provenance_inputs(), self.stage_checkpoint(8), self.stage_checkpoint(9), lock,
+            [*self.core_provenance_inputs(), *self.runtime_data_inputs(), self.stage_checkpoint(8), self.stage_checkpoint(9), lock,
              self.output / "checkpoints" / "canonical" / "canonical_surrogate_deploy.pt"],
         )
+        self.write_live_progress("CALIBRATED_DIAGNOSTIC_COMPLETED")
 
     def latency_rows(self, name: str, model: nn.Module) -> List[Dict[str, Any]]:
         rows = []
@@ -1772,6 +2485,7 @@ class Stage4Pipeline:
         return rows
 
     def stage_11(self) -> None:
+        self.write_live_progress("PERFORMANCE_STARTED")
         model, auxiliary, selection = self.canonical_model(); teacher = self.load_teacher()
         freeze = architecture_freeze_payload()
         deploy_path = self.output / "checkpoints" / "canonical" / "canonical_surrogate_deploy.pt"
@@ -1831,12 +2545,13 @@ class Stage4Pipeline:
         outputs = [compression_path, latency_path, seed_path, summary_path, report, workbook, pdf, *figures]
         self.complete_stage(
             11, "Compression, preliminary latency, publication", outputs,
-            [*self.core_provenance_inputs(), self.stage_checkpoint(8), self.stage_checkpoint(9), self.stage_checkpoint(10),
+            [*self.core_provenance_inputs(), *self.runtime_data_inputs(), self.stage_checkpoint(8), self.stage_checkpoint(9), self.stage_checkpoint(10),
              self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json", deploy_path,
              self.output / "tables" / "KNOWN_DOMAIN_FIDELITY.csv",
              self.output / "tables" / "REPRESENTATION_FIDELITY.csv",
              self.output / "tables" / "ZD_CALIBRATED_DIAGNOSTIC.csv"],
         )
+        self.write_live_progress("PERFORMANCE_COMPLETED")
 
     def create_final_hash_manifest(self) -> Path:
         manifest = self.output / "manifests" / "STAGE4M_HASH_MANIFEST.json"
@@ -1854,6 +2569,7 @@ class Stage4Pipeline:
         return final_hash_manifest_current(self.output)
 
     def stage_12(self) -> None:
+        self.write_live_progress("STAGE_12_STARTED")
         ready, not_ready = self.output / "MANYTX_STAGE4M_READY.txt", self.output / "MANYTX_STAGE4M_NOT_READY.txt"
         if ready.exists(): ready.unlink()
         for stage in range(1, 12):
@@ -1875,12 +2591,22 @@ class Stage4Pipeline:
             "canonical_surrogate_frozen": lock["status"] == "LOCKED", "compression_gate_pass": compression["compression_gate_pass"],
             "p0_fidelity_gate_pass": selected["teacher_student_top1_agreement"] >= 0.90 and selected["student_accuracy"] >= 0.8193773268 and selected["student_fixed98_macro_f1"] >= 0.8168258758,
             "publication_complete": (self.output / "publication" / "Stage4M_tables.xlsx").is_file() and (self.output / "publication" / "Stage4M_report.pdf").is_file(),
+            "local_cache_identity_bound": bool(self.local_cache_identity_sha and self.local_cache_aggregate_sha),
+            "ordinary_training_drive_signal_reads_zero": self.io_counters["training_signal_reads_drive"] == 0,
+            "training_local_signal_reads_positive": self.io_counters["training_signal_reads_local"] > 0,
         }
         if not all(gates.values()): raise ScientificAbort(f"Stage 4M final gates failed: {gates}")
         final = self.output / "manifests" / "STAGE4M_FINAL_STATUS.json"
         atomic_json(final, {"status": "MANYTX_STAGE4M_READY", "pipeline_version": PIPELINE_VERSION, "selected_arm": selection["selected_arm"],
                             "selected_seed": selection["selected_seed"], "gates": gates, "stage35_strict_violation_counters": self.guard.counters(),
                             "amp_runtime_safety_policy_sha256": self.amp_runtime_safety_policy_sha,
+                            "runtime_io_policy_sha256": self.runtime_io_policy_sha,
+                            "local_cache_identity_sha256": self.local_cache_identity_sha,
+                            "local_cache_aggregate_sha256": self.local_cache_aggregate_sha,
+                            "io_counters": dict(self.io_counters),
+                            "total_stage4_runtime_seconds": time.perf_counter() - self.started_at,
+                            "gpu_model": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+                            "data_loader_workers": self.config.num_workers,
                             "generated_at": utc_now()}, self.output)
         manifest = self.create_final_hash_manifest()
         ready_text = "\n".join([
@@ -1889,6 +2615,9 @@ class Stage4Pipeline:
             f"selected_kd_arm={selection['selected_arm']}", f"selected_seed={selection['selected_seed']}",
             f"canonical_surrogate_sha256={lock['canonical_surrogate_sha256']}", f"canonical_surrogate_state_sha256={lock['canonical_surrogate_state_sha256']}",
             f"amp_runtime_safety_policy_sha256={self.amp_runtime_safety_policy_sha}",
+            f"runtime_io_policy_sha256={self.runtime_io_policy_sha}",
+            f"local_cache_identity_sha256={self.local_cache_identity_sha}",
+            f"local_cache_aggregate_sha256={self.local_cache_aggregate_sha}",
             f"student_deployed_parameter_count={compression['student_deployed_parameter_count']}", f"teacher_parameter_count={EXPECTED_TEACHER_PARAMETERS}",
             f"parameter_compression_ratio={compression['parameter_compression_ratio']}", "student_native_embedding_dim=64", "teacher_embedding_dim=128",
             "calibration_unknown_used_for_training=NO", "calibration_unknown_used_for_selection=NO", "strict_zero_day_evaluation_performed=NO",
@@ -1900,11 +2629,13 @@ class Stage4Pipeline:
         stage_dependencies = [self.stage_checkpoint(stage) for stage in range(1, 12)]
         self.complete_stage(
             12, "Final audit, hash manifest, READY transaction", [final, manifest, ready],
-            [*stage_dependencies, self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json"],
+            [*stage_dependencies, *self.runtime_data_inputs(), self.output / "manifests" / "CANONICAL_SURROGATE_SELECTION_LOCK.json"],
         )
         if not self.stage_current(12): raise ScientificAbort("Stage 12 durable checkpoint verification failed")
         if not_ready.exists(): not_ready.unlink()
         if not ready.is_file() or not_ready.exists(): raise ScientificAbort("READY-only final state verification failed")
+        self.persist_io_counters()
+        self.write_live_progress("STAGE4M_READY", ready_sha256=sha256_file(ready))
         print("MANYTX_STAGE4M_READY")
 
     def hydrate_provenance(self) -> None:
@@ -1920,6 +2651,20 @@ class Stage4Pipeline:
         self.training_target_policy_sha = sha256_file(targets) if targets.is_file() else None
         self.amp_runtime_safety_policy_sha = sha256_file(amp_policy) if amp_policy.is_file() else None
         self.selection_lock_hash = sha256_file(selection) if selection.is_file() else None
+        self.local_cache_identity_sha = sha256_file(self.local_cache_identity_path) if self.local_cache_identity_path.is_file() else None
+        if self.local_cache_identity_path.is_file():
+            identity = json.loads(self.local_cache_identity_path.read_text(encoding="utf-8"))
+            self.local_cache_aggregate_sha = identity.get("cache_aggregate_sha256")
+        if self.local_cache_manifest_path.is_file():
+            self.local_cache_manifest_sha = sha256_file(self.local_cache_manifest_path)
+        io_path = self.output / "manifests" / "STAGE4M_IO_COUNTERS.json"
+        if io_path.is_file():
+            try:
+                saved = json.loads(io_path.read_text(encoding="utf-8")).get("counters", {})
+                for key in self.io_counters:
+                    self.io_counters[key] = max(int(self.io_counters[key]), int(saved.get(key, 0)))
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                raise ScientificAbort("Stage 4M I/O counter manifest is corrupt")
 
     def preflight(self) -> None:
         benchmark = self.root / "01_benchmark_engineering" / "benchmark" / f"{CANONICAL_BENCHMARK}.h5"
@@ -1929,7 +2674,12 @@ class Stage4Pipeline:
             "gpu_available": torch.cuda.is_available(), "teacher_checkpoint_sha": self.teacher_path.is_file() and sha256_file(self.teacher_path) == EXPECTED_TEACHER_SHA256,
             "benchmark_sha": benchmark.is_file() and sha256_file(benchmark) == EXPECTED_BENCHMARK_SHA256,
             "ready_absent": not (self.output / "MANYTX_STAGE4M_READY.txt").exists(),
+            "runtime_io_policy_sha256": len(self.runtime_io_policy_sha) == 64,
+            "local_cache_not_on_drive": "drive" not in {part.lower() for part in self.local_cache_root.parts},
         }
+        checks["local_capacity"] = local_capacity_evidence(
+            self.local_cache_root.parent, sum(EXPECTED_COUNTS[name] for name in AUTHORIZED_LOCAL_PARTITIONS)
+        )["capacity_check_passed"]
         stage35 = self.verify_stage35_metadata(); checks["stage35_ready"] = stage35["ready"].get("marker") == "MANYTX_STAGE3_5M_READY"
         stage3 = parse_ready(self.stage3_root / "MANYTX_STAGE3M_READY.txt"); checks["stage3_ready"] = stage3.get("marker") == "MANYTX_STAGE3M_READY"
         with h5py.File(benchmark, "r", swmr=True) as handle:
@@ -1946,7 +2696,9 @@ class Stage4Pipeline:
         atomic_json(report, {"status": "STAGE4M_PREFLIGHT_PASS", "pipeline_version": PIPELINE_VERSION,
                              "executable_sha256": self.script_sha, "configuration_sha256": self.config.configuration_sha256(),
                              "checks": checks, "runtime": runtime_manifest(), "student_architecture": architecture_freeze_payload(),
+                             "runtime_io_policy": self.config.runtime_io_payload(),
                              "training_performed": False, "teacher_target_cache_created": False,
+                             "local_cache_staged": False,
                              "calibration_unknown_accessed": False, "strict_index_contents_accessed": False,
                              "stage04_plus_executed": False, "ready_created": False, "generated_at": utc_now()}, self.output)
         print("STAGE4M_PREFLIGHT_PASS")
@@ -1957,9 +2709,41 @@ class Stage4Pipeline:
                   7: self.stage_07, 8: self.stage_08, 9: self.stage_09, 10: self.stage_10, 11: self.stage_11, 12: self.stage_12}
         for stage in range(self.config.stage_start, self.config.stage_end + 1):
             self.hydrate_provenance()
+            self.execution_context.update({"stage": stage, "arm": None, "seed": None, "epoch": None})
+            if stage >= 4 and not self.local_cache_active:
+                self.ensure_local_data_cache()
+                self.hydrate_provenance()
             if self.config.resume and self.stage_current(stage):
+                self.write_live_progress("STAGE_REUSED")
                 print(f"[REUSE] Stage {stage:02d} — hash-current"); continue
-            stages[stage](); print(f"[PASS] Stage {stage:02d}")
+            self.write_live_progress(f"STAGE_{stage:02d}_STARTED")
+            stages[stage](); self.write_live_progress(f"STAGE_{stage:02d}_PASS"); print(f"[PASS] Stage {stage:02d}")
+
+    def record_interruption(self) -> Path:
+        latest = None
+        arm, seed = self.execution_context.get("arm"), self.execution_context.get("seed")
+        if arm in ARMS and seed in SEEDS:
+            candidate = self.training_checkpoint_dir(str(arm), int(seed)) / "latest.pt"
+            if candidate.is_file():
+                latest = {"path": str(candidate), "sha256": sha256_file(candidate)}
+        payload = {
+            "status": "INTERRUPTED_SAFE_TO_RESUME", "pipeline_version": PIPELINE_VERSION,
+            **self.execution_context, "epoch_in_progress": self.execution_context.get("epoch"),
+            "latest_completed_epoch": (int(self.execution_context["epoch"]) - 1) if self.execution_context.get("epoch") else None,
+            "latest_checkpoint_path": latest["path"] if latest else None,
+            "latest_checkpoint_sha256": latest["sha256"] if latest else None,
+            "latest_completed_epoch_checkpoint": latest,
+            "local_cache_manifest_sha256": self.local_cache_manifest_sha,
+            "local_cache_identity_sha256": self.local_cache_identity_sha,
+            "executable_sha256": self.script_sha,
+            "strict_counters": self.guard.counters(), "io_counters": dict(self.io_counters),
+            "resume_policy": "REPLAY_INTERRUPTED_EPOCH_FROM_LAST_COMPLETED_EPOCH",
+            "interrupted_at": utc_now(),
+        }
+        path = self.output / "manifests" / "STAGE4M_INTERRUPTED.json"
+        atomic_json(path, payload, self.output)
+        self.write_live_progress("INTERRUPTED", interruption_manifest_sha256=sha256_file(path))
+        return path
 
 
 def runtime_manifest() -> Dict[str, Any]:
@@ -1996,7 +2780,13 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--branch-root"); parser.add_argument("--repository-root", default=str(Path(__file__).resolve().parent))
     parser.add_argument("--output-dir"); parser.add_argument("--config"); parser.add_argument("--profile", choices=("full", "pilot"), default="full")
     parser.add_argument("--device", default="auto"); parser.add_argument("--stage-start", type=int, default=1); parser.add_argument("--stage-end", type=int, default=12)
-    parser.add_argument("--no-resume", action="store_true"); parser.add_argument("--preflight", action="store_true"); parser.add_argument("--synthetic-validation", action="store_true")
+    parser.add_argument("--no-resume", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--preflight", action="store_true")
+    modes.add_argument("--stage-local-data", action="store_true")
+    modes.add_argument("--verify-local-data", action="store_true")
+    modes.add_argument("--run", action="store_true")
+    parser.add_argument("--synthetic-validation", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -2013,7 +2803,7 @@ def config_from_args(args: argparse.Namespace) -> Stage4Config:
     return Stage4Config(**values)
 
 
-def write_not_ready(config: Stage4Config, exc: BaseException) -> bool:
+def write_not_ready(config: Stage4Config, exc: BaseException, pipeline: Optional[Stage4Pipeline] = None) -> bool:
     output = config.output_root
     if completed_state_current(output):
         print("STAGE4M_COMPLETED_STATE_PROTECTED")
@@ -2023,8 +2813,25 @@ def write_not_ready(config: Stage4Config, exc: BaseException) -> bool:
     if ready.exists(): ready.unlink()
     atomic_text(output / "MANYTX_STAGE4M_NOT_READY.txt", f"MANYTX_STAGE4M_NOT_READY\n{type(exc).__name__}: {exc}\n", output)
     manifests = output / "manifests"; manifests.mkdir(parents=True, exist_ok=True)
-    atomic_json(manifests / "STAGE4M_FAILURE.json", {"status": "MANYTX_STAGE4M_NOT_READY", "error_type": type(exc).__name__,
-                                                       "error": str(exc), "traceback": traceback.format_exc(), "generated_at": utc_now()}, output)
+    context = dict(pipeline.execution_context) if pipeline is not None else {"stage": None, "arm": None, "seed": None, "epoch": None}
+    latest = None
+    if pipeline is not None and context.get("arm") in ARMS and context.get("seed") in SEEDS:
+        candidate = pipeline.training_checkpoint_dir(str(context["arm"]), int(context["seed"])) / "latest.pt"
+        if candidate.is_file(): latest = {"path": str(candidate), "sha256": sha256_file(candidate)}
+    atomic_json(manifests / "STAGE4M_FAILURE.json", {
+        "status": "MANYTX_STAGE4M_NOT_READY",
+        "failure_class": "SCIENTIFIC_ABORT" if isinstance(exc, ScientificAbort) else "RUNTIME_ERROR",
+        "exception_type": type(exc).__name__, "message": str(exc) or repr(exc),
+        "error_type": type(exc).__name__, "error": str(exc) or repr(exc), "traceback": traceback.format_exc(),
+        **context, "latest_completed_checkpoint": latest,
+        "local_cache_manifest_sha256": pipeline.local_cache_manifest_sha if pipeline is not None else None,
+        "local_cache_active": pipeline.local_cache_active if pipeline is not None else False,
+        "strict_counters": pipeline.guard.counters() if pipeline is not None else None,
+        "resume_policy": "REPAIR_CAUSE_THEN_RESUME_FROM_HASH_CURRENT_STAGE",
+        "timestamp": utc_now(), "generated_at": utc_now(),
+    }, output)
+    if pipeline is not None:
+        pipeline.write_live_progress("SCIENTIFIC_ABORT" if isinstance(exc, ScientificAbort) else "RUNTIME_ERROR", message=str(exc) or repr(exc))
     return True
 
 
@@ -2042,16 +2849,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     if args.synthetic_validation: synthetic_validation(); return 0
     config: Optional[Stage4Config] = None
+    pipeline: Optional[Stage4Pipeline] = None
     try:
         config = config_from_args(args)
-        if completed_state_current(config.output_root):
+        if completed_state_current(config.output_root) and not (args.stage_local_data or args.verify_local_data):
             print("MANYTX_STAGE4M_ALREADY_READY" if not args.preflight else "STAGE4M_COMPLETED_STATE_PROTECTED")
             return 0
         print("=" * 100 + "\nSTAGE 4M — WISIG MANYTX SURROGATE KNOWLEDGE DISTILLATION\n" + "=" * 100)
         pipeline = Stage4Pipeline(config)
         if args.preflight: pipeline.preflight()
+        elif args.stage_local_data: pipeline.stage_local_data()
+        elif args.verify_local_data: pipeline.verify_local_data()
         else: pipeline.run()
         return 0
+    except KeyboardInterrupt:
+        if pipeline is not None:
+            path = pipeline.record_interruption()
+            print(f"INTERRUPTED_SAFE_TO_RESUME\nInterruption manifest: {path}")
+        else:
+            print("INTERRUPTED_SAFE_TO_RESUME")
+        return 130
     except BaseException as exc:
         output = invocation_output(args, config)
         if output is not None and completed_state_current(output):
@@ -2059,7 +2876,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"{type(exc).__name__}: {exc}")
             return 1
         if config is not None:
-            write_not_ready(config, exc)
+            write_not_ready(config, exc, pipeline)
         print(f"MANYTX_STAGE4M_NOT_READY\n{type(exc).__name__}: {exc}")
         traceback.print_exc()
         return 1

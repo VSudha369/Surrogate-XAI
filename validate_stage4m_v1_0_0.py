@@ -10,9 +10,11 @@ import io
 import json
 import py_compile
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
 
 import torch
 
@@ -75,6 +77,99 @@ def main() -> int:
     check("teacher parameter count", module.EXPECTED_TEACHER_PARAMETERS == 849634)
     check("teacher embedding", module.TEACHER_EMBEDDING_DIM == 128)
     check("known classes", module.EXPECTED_KNOWN_CLASSES == 98)
+    policy = module.local_io_policy()
+    check("local I/O policy version", policy["policy_version"] == "1.0.0")
+    check("Drive remains canonical input", policy["canonical_data_source"] == "GOOGLE_DRIVE")
+    check("local SSD is runtime input", policy["runtime_training_source"] == "COLAB_LOCAL_SSD")
+    check("Drive remains canonical output", policy["canonical_results_destination"] == "GOOGLE_DRIVE")
+    check("local cache disposable", policy["local_cache_disposable"] is True)
+    check("ordinary Drive training reads forbidden", policy["ordinary_training_drive_signal_reads_allowed"] is False)
+    check("strict cache forbidden", policy["strict_cache_allowed"] is False)
+    check("authorized local partition set", tuple(policy["allowed_partitions"]) == module.AUTHORIZED_LOCAL_PARTITIONS)
+    check("calibration excluded from ordinary cache", "calibration_unknown" not in policy["allowed_partitions"])
+    check("deterministic shard rows", module.LOCAL_SHARD_ROWS == 1024)
+    expected_shards = sum((module.EXPECTED_COUNTS[name] + module.LOCAL_SHARD_ROWS - 1) // module.LOCAL_SHARD_ROWS for name in module.AUTHORIZED_LOCAL_PARTITIONS)
+    check("shard count target range", expected_shards == 633 and 500 <= expected_shards <= 5000)
+    check("heartbeat cadence", module.HEARTBEAT_EVERY_BATCHES == 25)
+    check("cache format uncompressed HDF5", module.LOCAL_CACHE_FORMAT == "uncompressed_hdf5_shards_v1")
+    check("local cache canonical basename", module.LOCAL_CACHE_DIRECTORY_NAME == "wisig_stage4m_local_v1_0_0")
+    capacity = module.local_capacity_evidence(Path(tempfile.gettempdir()), 100, available_bytes=2**30 + 10**7)
+    check("capacity evidence pass", capacity["capacity_check_passed"] is True)
+    insufficient = False
+    try: module.local_capacity_evidence(Path(tempfile.gettempdir()), 1_000_000, available_bytes=1)
+    except module.ScientificAbort: insufficient = True
+    check("insufficient local capacity abort", insufficient)
+    arrays = {
+        "signals": module.np.arange(24, dtype=module.np.float32).reshape(3, 2, 4),
+        "global_indices": module.np.array([5, 7, 9], dtype=module.np.int64),
+        "labels": module.np.array([1, 2, 3], dtype=module.np.int16),
+        "receiver": module.np.array(["r0", "r1", "r0"], dtype=object),
+        "day": module.np.array(["d0", "d0", "d1"], dtype=object),
+        "equalized": module.np.array([0, 1, 0], dtype=module.np.int8),
+        "transmitter": module.np.array(["t1", "t2", "t3"], dtype=object),
+    }
+    logical_a = module.logical_shard_sha256(arrays); logical_b = module.logical_shard_sha256({key: value.copy() for key, value in arrays.items()})
+    check("logical shard hash deterministic", logical_a == logical_b and len(logical_a) == 64)
+    changed_arrays = {key: value.copy() for key, value in arrays.items()}; changed_arrays["labels"][0] = 9
+    check("logical shard hash detects metadata change", module.logical_shard_sha256(changed_arrays) != logical_a)
+    with tempfile.TemporaryDirectory() as directory:
+        h5_path = Path(directory) / "rows.h5"
+        with module.h5py.File(h5_path, "w") as handle: handle.create_dataset("x", data=module.np.arange(20).reshape(10, 2))
+        with module.h5py.File(h5_path, "r") as handle: duplicate_rows = module.read_h5_rows_with_duplicates(handle["x"], module.np.array([4, 1, 4]))
+        check("duplicate HDF5 row reads preserve order", duplicate_rows.tolist() == [[8, 9], [2, 3], [8, 9]])
+    with tempfile.TemporaryDirectory() as directory:
+        temporary_root = Path(directory); branch = temporary_root / "branch"; output_root = branch / "06_surrogate_kd"
+        output_root.mkdir(parents=True); source_h5 = temporary_root / "canonical.h5"
+        source_signals = module.np.arange(7 * 2 * 256, dtype=module.np.float32).reshape(7, 2, 256)
+        with module.h5py.File(source_h5, "w") as handle: handle.create_dataset("signals/X", data=source_signals)
+        metadata = SimpleNamespace(
+            indices=module.np.array([6, 1, 4, 0, 3], dtype=module.np.int64),
+            labels=module.np.array([6, 1, 4, 0, 3], dtype=module.np.int16),
+            receiver=module.np.array(["r1", "r0", "r1", "r0", "r2"], dtype=object),
+            day=module.np.array(["d1", "d0", "d1", "d0", "d2"], dtype=object),
+            equalized=module.np.array([1, 0, 1, 0, 1], dtype=module.np.int8),
+            transmitter_raw=module.np.array(["t6", "t1", "t4", "t0", "t3"], dtype=object),
+        )
+        cache_fixture = object.__new__(module.Stage4Pipeline)
+        cache_fixture.root = branch; cache_fixture.output = output_root
+        cache_fixture.config = module.Stage4Config(
+            branch_root=str(branch), output_dir=str(output_root),
+            local_cache_root=str(temporary_root / module.LOCAL_CACHE_DIRECTORY_NAME),
+        )
+        cache_fixture.benchmark = SimpleNamespace(
+            canonical_h5_path=source_h5, signal_key="signals/X", signal_orientation="channels_first",
+            partitions={"train_known": metadata},
+        )
+        cache_fixture.guard = module.Stage35StrictGuard(branch, output_root)
+        cache_fixture.execution_context = {"stage": 4, "arm": None, "seed": None, "epoch": None}
+        cache_fixture.started_at = time.perf_counter(); cache_fixture.script_sha = "fixture-script"
+        cache_fixture.local_cache_manifest_sha = None; cache_fixture.runtime_io_policy_sha = "fixture-runtime"
+        cache_fixture.io_counters = {"training_signal_reads_local": 0, "training_signal_reads_drive": 0, "evaluation_signal_reads_local": 0, "staging_signal_reads_drive": 0}
+        partition_manifest = cache_fixture._write_partition_shards("train_known", metadata, 1, 0, 0, 0, 5, time.perf_counter())
+        shard_path = cache_fixture.local_cache_root / "train_known" / "shard_000000.h5"
+        check("synthetic authorized shard created", shard_path.is_file() and partition_manifest["actual_shard_count"] == 1)
+        with module.h5py.File(shard_path, "r") as handle:
+            check("synthetic shard signal equivalence", module.np.array_equal(handle["signals"][:], source_signals[metadata.indices]))
+            check("synthetic shard global-index identity", module.np.array_equal(handle["global_indices"][:], metadata.indices))
+            check("synthetic shard labels preserved", module.np.array_equal(handle["labels"][:], metadata.labels))
+            check("synthetic shard is uncompressed", handle["signals"].compression is None)
+            check("synthetic shard metadata fields", set(handle) == {"signals", "global_indices", "labels", "receiver", "day", "equalized", "transmitter"})
+        check("synthetic staging reads counted", cache_fixture.io_counters["staging_signal_reads_drive"] == 5)
+        strict_blocked = False
+        try: cache_fixture._write_partition_shards("strict_zero_day_test", metadata, 1, 0, 0, 0, 5, time.perf_counter())
+        except module.ScientificAbort: strict_blocked = True
+        check("synthetic strict shard request blocked", strict_blocked and not (cache_fixture.local_cache_root / "strict_zero_day_test").exists())
+    config_a = module.Stage4Config(branch_root=str(ROOT), output_dir=str(ROOT / "06_surrogate_kd"), local_cache_root=str(Path(tempfile.gettempdir()) / "a" / module.LOCAL_CACHE_DIRECTORY_NAME))
+    config_b = module.Stage4Config(branch_root=str(ROOT), output_dir=str(ROOT / "06_surrogate_kd"), local_cache_root=str(Path(tempfile.gettempdir()) / "b" / module.LOCAL_CACHE_DIRECTORY_NAME))
+    check("local path excluded from scientific configuration", config_a.configuration_sha256() == config_b.configuration_sha256())
+    drive_cache_rejected = False
+    try:
+        module.Stage4Config(branch_root=str(ROOT), output_dir=str(ROOT / "06_surrogate_kd"), local_cache_root="/content/drive/wisig_stage4m_local_v1_0_0").validate()
+    except module.ScientificAbort: drive_cache_rejected = True
+    check("Drive cache root rejected", drive_cache_rejected)
+    check("main stage-local-data CLI", module.parse_args(["--stage-local-data"]).stage_local_data is True)
+    check("main verify-local-data CLI", module.parse_args(["--verify-local-data"]).verify_local_data is True)
+    check("main explicit run CLI", module.parse_args(["--run"]).run is True)
     fixture = "MANYTX_STAGE3_5M_READY\nteacher_seed=123\nstrict_scores_recomputed=NO\n"
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "READY.txt"; path.write_text(fixture)
@@ -275,6 +370,33 @@ def main() -> int:
     check("predecessor mutation rejection", '"predecessor_lock_sha256"' in source)
     check("selection mutation rejection", '"selection_lock_sha256"' in source)
     check("training checkpoint target-policy binding", '"training_target_policy_sha256"' in source)
+    compatibility = object.__new__(module.Stage4Pipeline)
+    compatibility.config = config_a; compatibility.script_sha = "new-local-io-script"
+    compatibility.objective_policy_sha = "objective"; compatibility.training_target_policy_sha = "targets"
+    compatibility.amp_runtime_safety_policy_sha = "amp"; compatibility.runtime_io_policy_sha = "runtime-io"
+    compatibility.local_cache_identity_sha = "cache-identity"; compatibility.local_cache_aggregate_sha = "cache-aggregate"
+    compatibility.architecture_freeze_sha = "architecture"; compatibility.predecessor_lock_sha = "predecessor"
+    current_checkpoint = compatibility.checkpoint_validation_fields("K2", 123)
+    check("current local-I/O checkpoint accepted", lambda: compatibility.validate_training_checkpoint(current_checkpoint, "K2", 123) is None)
+    predecessor_checkpoint = dict(current_checkpoint)
+    predecessor_checkpoint["executable_sha256"] = module.LOCAL_IO_COMPATIBLE_PREDECESSOR_SHA256
+    for key in ("runtime_io_policy_sha256", "local_cache_identity_sha256", "local_cache_aggregate_sha256"): predecessor_checkpoint.pop(key)
+    check("approved pre-local-I/O checkpoint accepted", lambda: compatibility.validate_training_checkpoint(predecessor_checkpoint, "K2", 123) is None)
+    unknown_checkpoint = dict(predecessor_checkpoint); unknown_checkpoint["executable_sha256"] = "f" * 64
+    unknown_rejected = False
+    try: compatibility.validate_training_checkpoint(unknown_checkpoint, "K2", 123)
+    except module.ScientificAbort: unknown_rejected = True
+    check("arbitrary executable checkpoint rejected", unknown_rejected)
+    benchmark_mismatch = dict(predecessor_checkpoint); benchmark_mismatch["benchmark_sha256"] = "0" * 64
+    benchmark_rejected = False
+    try: compatibility.validate_training_checkpoint(benchmark_mismatch, "K2", 123)
+    except module.ScientificAbort: benchmark_rejected = True
+    check("compatible predecessor benchmark mismatch rejected", benchmark_rejected)
+    objective_mismatch = dict(predecessor_checkpoint); objective_mismatch["objective"] = module.ARM_OBJECTIVES["K1"]
+    objective_rejected = False
+    try: compatibility.validate_training_checkpoint(objective_mismatch, "K2", 123)
+    except module.ScientificAbort: objective_rejected = True
+    check("compatible predecessor objective mismatch rejected", objective_rejected)
     with tempfile.TemporaryDirectory() as directory:
         branch = Path(directory) / "branch"; output_root = branch / "06_surrogate_kd"; manifests = output_root / "manifests"
         manifests.mkdir(parents=True)
@@ -285,6 +407,8 @@ def main() -> int:
             "TRAINING_TARGET_POLICY.json": "targets\n",
             "AMP_RUNTIME_SAFETY_POLICY.json": "amp-runtime\n",
             "CANONICAL_SURROGATE_SELECTION_LOCK.json": "selection\n",
+            "STAGE4M_LOCAL_IO_POLICY.json": "runtime-io\n",
+            "STAGE4M_LOCAL_DATA_IDENTITY.json": json.dumps({"cache_aggregate_sha256": "cache-aggregate"}),
         }
         for name, value in files.items(): (manifests / name).write_text(value, encoding="utf-8")
         bound_input = output_root / "bound_input.bin"; bound_output = output_root / "bound_output.bin"
@@ -292,6 +416,10 @@ def main() -> int:
         fixture = object.__new__(module.Stage4Pipeline)
         fixture.output = output_root; fixture.script_sha = "current-script"
         fixture.config = module.Stage4Config(branch_root=str(branch), output_dir=str(output_root))
+        fixture.runtime_io_policy_sha = "runtime-io-sha"
+        fixture.local_cache_identity_sha = fixture.local_cache_aggregate_sha = None
+        fixture.local_cache_manifest_sha = None
+        fixture.io_counters = {"training_signal_reads_local": 0, "training_signal_reads_drive": 0, "evaluation_signal_reads_local": 0, "staging_signal_reads_drive": 0}
         fixture.predecessor_lock_sha = fixture.architecture_freeze_sha = fixture.objective_policy_sha = None
         fixture.training_target_policy_sha = fixture.amp_runtime_safety_policy_sha = fixture.selection_lock_hash = None
         fixture.hydrate_provenance()
@@ -306,6 +434,9 @@ def main() -> int:
                 "objective_policy_sha256": fixture.objective_policy_sha if stage >= 2 else None,
                 "training_target_policy_sha256": fixture.training_target_policy_sha if stage >= 2 else None,
                 "amp_runtime_safety_policy_sha256": fixture.amp_runtime_safety_policy_sha if stage >= 2 else None,
+                "runtime_io_policy_sha256": fixture.runtime_io_policy_sha if stage >= 4 else None,
+                "local_cache_identity_sha256": fixture.local_cache_identity_sha if stage >= 4 else None,
+                "local_cache_aggregate_sha256": fixture.local_cache_aggregate_sha if stage >= 4 else None,
                 "selection_lock_sha256": fixture.selection_lock_hash if stage >= 9 else None,
                 "inputs": [{"path": str(bound_input), "sha256": sha256(bound_input), "bytes": bound_input.stat().st_size}],
                 "outputs": [{"path": str(bound_output), "sha256": sha256(bound_output), "bytes": bound_output.stat().st_size}],
@@ -327,6 +458,7 @@ def main() -> int:
         (manifests / "STAGE_04_CHECKPOINT.json").write_text(json.dumps(checkpoint_payload(4)), encoding="utf-8")
         fixture.predecessor_lock_sha = fixture.architecture_freeze_sha = fixture.objective_policy_sha = None
         fixture.training_target_policy_sha = fixture.amp_runtime_safety_policy_sha = fixture.selection_lock_hash = None
+        fixture.local_cache_identity_sha = fixture.local_cache_aggregate_sha = None
         check("K fresh-process provenance hydration", fixture.stage_current(4) and all((fixture.predecessor_lock_sha, fixture.architecture_freeze_sha, fixture.objective_policy_sha, fixture.training_target_policy_sha, fixture.amp_runtime_safety_policy_sha, fixture.selection_lock_hash)))
         stage9 = checkpoint_payload(9); (manifests / "STAGE_09_CHECKPOINT.json").write_text(json.dumps(stage9), encoding="utf-8")
         check("selection-bound stage baseline current", fixture.stage_current(9))
@@ -352,20 +484,33 @@ def main() -> int:
         lock = {"status": "LOCKED", "canonical_surrogate_sha256": "deploy-sha", "canonical_surrogate_state_sha256": "state-sha"}
         lock_path = manifests / "CANONICAL_SURROGATE_SELECTION_LOCK.json"; lock_path.write_text(json.dumps(lock))
         provenance = {}
-        for name in ("STAGE4M_PREDECESSOR_LOCK.json", "STUDENT_ARCHITECTURE_FREEZE.json", "KD_OBJECTIVE_POLICY.json", "TRAINING_TARGET_POLICY.json", "AMP_RUNTIME_SAFETY_POLICY.json"):
+        for name in ("STAGE4M_PREDECESSOR_LOCK.json", "STUDENT_ARCHITECTURE_FREEZE.json", "KD_OBJECTIVE_POLICY.json", "TRAINING_TARGET_POLICY.json", "AMP_RUNTIME_SAFETY_POLICY.json", "STAGE4M_LOCAL_IO_POLICY.json"):
             path = manifests / name; path.write_text(name); provenance[name] = path
+        runtime_policy_identity = "runtime-policy-identity"
+        provenance["STAGE4M_LOCAL_IO_POLICY.json"].write_text(json.dumps({"runtime_io_policy_sha256": runtime_policy_identity}))
+        identity_path = manifests / "STAGE4M_LOCAL_DATA_IDENTITY.json"
+        identity_path.write_text(json.dumps({"cache_aggregate_sha256": "cache-aggregate"})); provenance[identity_path.name] = identity_path
         prior_checkpoints = []
         for stage in range(1, 12):
             row = {"path": str(lock_path), "sha256": sha256(lock_path), "bytes": lock_path.stat().st_size}
             path = manifests / f"STAGE_{stage:02d}_CHECKPOINT.json"
             path.write_text(json.dumps({"stage": stage, "status": "PASS", "inputs": [row], "outputs": [row]})); prior_checkpoints.append(path)
         final_path = manifests / "STAGE4M_FINAL_STATUS.json"
-        final_path.write_text(json.dumps({"status": "MANYTX_STAGE4M_READY", "selected_arm": "K2", "selected_seed": 123, "amp_runtime_safety_policy_sha256": sha256(provenance["AMP_RUNTIME_SAFETY_POLICY.json"])}))
+        final_path.write_text(json.dumps({
+            "status": "MANYTX_STAGE4M_READY", "selected_arm": "K2", "selected_seed": 123,
+            "amp_runtime_safety_policy_sha256": sha256(provenance["AMP_RUNTIME_SAFETY_POLICY.json"]),
+            "runtime_io_policy_sha256": runtime_policy_identity,
+            "local_cache_identity_sha256": sha256(identity_path), "local_cache_aggregate_sha256": "cache-aggregate",
+        }))
         ready_path = completed / "MANYTX_STAGE4M_READY.txt"
         ready_path.write_text("\n".join(("MANYTX_STAGE4M_READY", f"teacher_sha256={module.EXPECTED_TEACHER_SHA256}",
                                          f"benchmark_sha256={module.EXPECTED_BENCHMARK_SHA256}", "selected_kd_arm=K2", "selected_seed=123",
                                          "canonical_surrogate_sha256=deploy-sha", "canonical_surrogate_state_sha256=state-sha",
                                          f"amp_runtime_safety_policy_sha256={sha256(provenance['AMP_RUNTIME_SAFETY_POLICY.json'])}", "")))
+        ready_path.write_text(ready_path.read_text() + "\n".join((
+            f"runtime_io_policy_sha256={runtime_policy_identity}",
+            f"local_cache_identity_sha256={sha256(identity_path)}", "local_cache_aggregate_sha256=cache-aggregate", "",
+        )))
         manifest_path = manifests / "STAGE4M_HASH_MANIFEST.json"
         manifest_rows = [{"relative_path": path.relative_to(completed).as_posix(), "sha256": sha256(path), "bytes": path.stat().st_size}
                          for path in (lock_path, final_path)]
@@ -379,6 +524,8 @@ def main() -> int:
             "objective_policy_sha256": sha256(provenance["KD_OBJECTIVE_POLICY.json"]),
             "training_target_policy_sha256": sha256(provenance["TRAINING_TARGET_POLICY.json"]),
             "amp_runtime_safety_policy_sha256": sha256(provenance["AMP_RUNTIME_SAFETY_POLICY.json"]),
+            "runtime_io_policy_sha256": runtime_policy_identity,
+            "local_cache_identity_sha256": sha256(identity_path), "local_cache_aggregate_sha256": "cache-aggregate",
             "selection_lock_sha256": sha256(lock_path),
             "inputs": [{"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size} for path in (*prior_checkpoints, lock_path)],
             "outputs": [{"path": str(path), "sha256": sha256(path), "bytes": path.stat().st_size}
@@ -437,6 +584,71 @@ def main() -> int:
     check("O preflight write probe deleted", "probe.unlink()" in preflight_body)
     check("O preflight strict counters zero", "self.guard.assert_zero()" in preflight_body)
     check("preflight marker", "STAGE4M_PREFLIGHT_PASS" in preflight_body)
+    check("preflight does not stage local cache", "ensure_local_data_cache" not in preflight_body and '"local_cache_staged": False' in preflight_body)
+    check("preflight checks local capacity", "local_capacity_evidence" in preflight_body)
+    check("launcher stage-local-data route", 'modes.add_argument("--stage-local-data"' in launcher_source and 'command.append("--stage-local-data")' in launcher_source)
+    check("launcher verify-local-data route", 'modes.add_argument("--verify-local-data"' in launcher_source and 'command.append("--verify-local-data")' in launcher_source)
+    check("launcher canonical run route", 'command.extend(("--run"' in launcher_source)
+    check("normal run activates cache before Stage 04", "if stage >= 4 and not self.local_cache_active" in source and "self.ensure_local_data_cache()" in source)
+    check("training backend local assertion", "Training DataLoader did not use the verified local sharded backend" in source)
+    check("teacher cache backend local assertion", "did not use local sharded data" in source)
+    check("training local read counter", 'self.io_counters["training_signal_reads_local"]' in source)
+    check("training Drive read counter remains instrumented", '"training_signal_reads_drive"' in source)
+    check("staging Drive read counter", 'self.io_counters["staging_signal_reads_drive"]' in source)
+    check("I/O counter persistence", "STAGE4M_IO_COUNTERS.json" in source and "persist_io_counters" in source)
+    check("local cache persistent manifest", "STAGE4M_LOCAL_DATA_CACHE_MANIFEST.json" in source)
+    check("stable local cache identity", "STAGE4M_LOCAL_DATA_IDENTITY.json" in source)
+    check("local I/O policy manifest", "STAGE4M_LOCAL_IO_POLICY.json" in source)
+    check("staging status manifest", "STAGE4M_DATA_STAGING_STATUS.json" in source)
+    check("local cache manifest binds executable", '"executable_sha256": self.script_sha' in source)
+    check("local cache manifest binds benchmark", '"canonical_benchmark_sha256": EXPECTED_BENCHMARK_SHA256' in source)
+    check("local cache manifest binds scientific configuration", '"scientific_configuration_sha256": self.config.configuration_sha256()' in source)
+    check("per-shard content hash", '"logical_content_sha256"' in source and '"file_sha256"' in source)
+    check("global index exact coverage", "EXACT_ORDER_NO_DUPLICATES_NO_MISSING_NO_UNAUTHORIZED" in source)
+    check("source metadata hashes persisted", '"metadata_hashes": self.partition_metadata_hashes(metadata)' in source)
+    check("cache corruption rebuild local only", "self.remove_disposable_local_cache()" in source and "shutil.rmtree(target)" in source)
+    remove_body = source[source.index("    def remove_disposable_local_cache"):source.index("    def _write_partition_shards")]
+    check("cache cleanup preserves teacher targets", '"teacher_targets"' not in remove_body)
+    check("ordinary cache excludes calibration", 'AUTHORIZED_LOCAL_PARTITIONS = ("train_known", "p0", "p1", "p2", "p3")' in source)
+    check("calibration requires selection lock", "Calibration Unknown local staging requires the immutable canonical selection lock" in source)
+    check("calibration separate manifest", "STAGE4M_CALIBRATION_LOCAL_CACHE_MANIFEST.json" in source)
+    check("forbidden partition rejected before source open", source.index('self.guard.reject("signal", f"forbidden local staging request: {partition}")') < source.index("source_path = self.ensure_context().canonical_h5_path"))
+    check("checkpoint binds runtime I/O policy", '"runtime_io_policy_sha256": self.runtime_io_policy_sha' in source)
+    check("checkpoint binds cache identity", '"local_cache_identity_sha256": self.local_cache_identity_sha' in source)
+    check("checkpoint binds cache aggregate", '"local_cache_aggregate_sha256": self.local_cache_aggregate_sha' in source)
+    check("legacy executable compatibility narrow", "LOCAL_IO_COMPATIBLE_PREDECESSOR_SHA256" in source and "runtime_only" in source)
+    check("unknown executable still rejected", "if not predecessor_compatible" in source and "STALE_STAGE4M_CHECKPOINT" in source)
+    check("latest checkpoint every epoch", source.index("self.save_training_checkpoint(") < source.index("atomic_csv(history_path"))
+    check("epoch history every epoch", "atomic_csv(history_path, pd.DataFrame(history), self.output)" in source)
+    check("epoch status every epoch", "epoch_status.json" in source and '"status": "EPOCH_COMPLETE"' in source)
+    check("best checkpoint atomic verified", "atomic_verified_copy(latest, best_path" in source and "shutil.copy2(latest, best_path)" not in source)
+    check("heartbeat artifact", "STAGE4M_HEARTBEAT.json" in source)
+    check("heartbeat every 25 batches", "batch_index % HEARTBEAT_EVERY_BATCHES == 0" in source)
+    check("heartbeat does not save model", "save_training_checkpoint" not in source[source.index("    def write_heartbeat"):source.index("    def completed_arm_seed_jobs")])
+    required_events = {
+        "DATA_STAGING_STARTED", "DATA_SHARD_WRITTEN", "DATA_PARTITION_STAGED", "DATA_STAGING_VERIFYING", "DATA_STAGING_READY",
+        "STAGE_01_STARTED", "STAGE_01_PASS", "STAGE_02_STARTED", "STAGE_02_PASS", "STAGE_03_STARTED", "STAGE_03_PASS",
+        "ARM_SEED_STARTED", "EPOCH_STARTED", "TRAINING_HEARTBEAT", "AMP_OVERFLOW_EVENT", "EPOCH_COMPLETED",
+        "BEST_EPOCH_UPDATED", "EARLY_STOP_TRIGGERED", "ARM_SEED_COMPLETED", "ARM_COMPLETED", "CANONICAL_SELECTION_LOCKED",
+        "P1_DIAGNOSTIC_STARTED", "P1_DIAGNOSTIC_COMPLETED", "P2_DIAGNOSTIC_STARTED", "P2_DIAGNOSTIC_COMPLETED",
+        "P3_DIAGNOSTIC_STARTED", "P3_DIAGNOSTIC_COMPLETED", "CALIBRATED_DIAGNOSTIC_STARTED",
+        "CALIBRATED_DIAGNOSTIC_COMPLETED", "PERFORMANCE_STARTED", "PERFORMANCE_COMPLETED", "STAGE_12_STARTED",
+        "STAGE4M_READY", "INTERRUPTED", "SCIENTIFIC_ABORT", "RUNTIME_ERROR",
+    }
+    check("required live progress events", all(event in source for event in required_events))
+    check("KeyboardInterrupt separate classification", "except KeyboardInterrupt:" in source and "INTERRUPTED_SAFE_TO_RESUME" in source)
+    check("interruption replay policy", "REPLAY_INTERRUPTED_EPOCH_FROM_LAST_COMPLETED_EPOCH" in source)
+    check("interruption does not call NOT_READY", "write_not_ready" not in source[source.index("    def record_interruption"):source.index("def runtime_manifest")])
+    check("failure class scientific abort", '"SCIENTIFIC_ABORT" if isinstance(exc, ScientificAbort)' in source)
+    check("failure class runtime error", 'else "RUNTIME_ERROR"' in source)
+    check("final gate Drive training reads zero", '"ordinary_training_drive_signal_reads_zero"' in source)
+    check("final binds local cache identity", '"local_cache_identity_bound"' in source)
+    check("final READY records runtime policy", "runtime_io_policy_sha256=" in source)
+    check("staging performance evidence", '"staging_duration_seconds"' in source and '"average_shard_bytes"' in source)
+    check("epoch runtime evidence", '"epoch_runtime_seconds"' in source)
+    check("GPU and worker runtime evidence", '"gpu_model"' in source and '"data_loader_workers"' in source)
+    check("temporary checkpoint readability verified", 'safe_torch_load(temporary, "cpu")' in source)
+    check("strict denylist absent from allowed cache", not set(module.FORBIDDEN_LOCAL_PARTITIONS) & set(module.AUTHORIZED_LOCAL_PARTITIONS))
     with zipfile.ZipFile(ZIP) as archive:
         check("ZIP CRC", archive.testzip() is None)
         check("ZIP member set", set(archive.namelist()) == EXPECTED_MEMBERS)

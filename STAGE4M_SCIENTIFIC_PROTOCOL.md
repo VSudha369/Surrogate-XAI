@@ -20,6 +20,8 @@ For every training batch, RF augmentation is applied exactly once. K1-K3 pass th
 
 All 12 canonical trainings use Train Known only for seeds 42, 123, and 2026. P0 alone controls early stopping, best epoch, arm selection, and seed selection. P1-P3 are evaluated only after freeze. Calibration Unknown is opened only after the immutable selection lock and is labelled `ZD_CALIBRATED_DIAGNOSTIC`; it cannot alter model weights or selection.
 
+The canonical HDF5 benchmark remains read-only on Google Drive. Before Stage 04, only Train Known and P0-P3 are copied into deterministic, uncompressed 1,024-row HDF5 shards under `/content/wisig_stage4m_local_v1_0_0`; scientific membership, order, global indices, labels, receiver/day/equalization, transmitter metadata, sampler exposure, and augmentation are unchanged. This cache is a disposable runtime representation, not a scientific independent variable. Ordinary training signal reads from Drive after activation are forbidden and instrumented. Calibration Unknown has a separate post-lock cache; strict/final data cannot be staged.
+
 Best epoch maximizes P0 teacher/student agreement with absolute tolerance 0.002, then minimizes P0 KL, maximizes fixed-98 macro-F1, and chooses the earlier epoch. Arm selection uses median agreement, median KL, agreement standard deviation, median F1, then K0<K1<K2<K3. The selected arm must meet the 40% parameter, 0.90 agreement, 0.8193773268 accuracy, and 0.8168258758 fixed-98 F1 gates.
 
 ## Optimization
@@ -29,6 +31,8 @@ The fixed schedule inherits Stage 2.6M’s AdamW (`lr=0.001`, `weight_decay=0.00
 ## AMP numerical-safety policy
 
 CUDA AMP remains frozen and enabled. Numerical overflow handling is runtime safety, not a scientific independent variable: after unscale and norm-5 clipping, a detected non-finite AMP gradient causes `GradScaler.step` to skip the underlying optimizer update, the scaler to back off, gradients to be cleared, and training to continue with the next batch. The run aborts only after more than 32 consecutive AMP overflows. With AMP disabled, any non-finite gradient remains an immediate scientific abort. The scheduler remains epoch-scoped, and a completed epoch must contain at least one successful optimizer update. Per-epoch and cumulative overflow accounting is persisted in checkpoints and history.
+
+After every completed epoch, Drive receives an atomic exact-resume checkpoint, history, epoch status, and any improved best checkpoint. A tiny heartbeat is written every 25 batches without saving model state. Interruption during an epoch resumes from the preceding completed epoch and deterministically replays the incomplete epoch.
 
 The pre-hotfix K0/seed-42 epoch-1 checkpoint from executable `a770fe52a83a408eedd7e8affaff120dd1d56eb5f243da52f05501252e4b4de3` is **not resume-compatible** because the new executable and regenerated preflight/predecessor provenance change the dependency graph. It is explicitly rejected, audit-recorded, removed, and K0/seed-42 restarts from epoch 1. Unknown stale checkpoints remain hard failures.
 

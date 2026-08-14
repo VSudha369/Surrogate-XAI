@@ -4,13 +4,13 @@
   "files": [
     {
       "path": "Stage4M_WiSig_ManyTx_Surrogate_KD_v1_0_0.py",
-      "bytes": 127695,
-      "sha256": "de660a0a280de59ceacfff77e723c62ae8b39767704a8a89fa85c7967d234855"
+      "bytes": 180218,
+      "sha256": "9f1889f2cd5efa2d38776f7524c52ce6989379c7717501ae9a9239949f8550d0"
     },
     {
       "path": "Stage4M_Colab_Launcher_v1_0_0.py",
-      "bytes": 4001,
-      "sha256": "8c81690c29920ea08441fe3b4aff1f58cf7857d5718807acd6d5e01888ed460d"
+      "bytes": 4420,
+      "sha256": "753174972de4fa08ce95abd9fa82c713f99ad191de21be715aaefcb61986480a"
     },
     {
       "path": "Stage4M_WiSig_ManyTx_Surrogate_KD_v1_0_0.ipynb",
@@ -19,13 +19,13 @@
     },
     {
       "path": "validate_stage4m_v1_0_0.py",
-      "bytes": 40079,
-      "sha256": "431ea6e5ef0081d5d049f41eab6af88401b9ee6e2c6a6825de7cd9cda987e098"
+      "bytes": 60036,
+      "sha256": "d118737c91a45c1159f8cc5f1337ea5b37d994e6df5c2d03330ae6d3ecb71bf6"
     },
     {
       "path": "stage4m_config_v1_0_0.example.json",
-      "bytes": 416,
-      "sha256": "2d2af0d4e1b4a7ac0e1d621af0d5a98dae76605dae16b3c46aac712591c51eba"
+      "bytes": 423,
+      "sha256": "c2bcea370565ece71ae7007eab0773cf302ad679ebffebda61c102565cf03f5b"
     },
     {
       "path": "requirements_stage4m.txt",
@@ -34,23 +34,23 @@
     },
     {
       "path": "STAGE4M_SCIENTIFIC_PROTOCOL.md",
-      "bytes": 4547,
-      "sha256": "aafff7c4f22ca086880803e9bb9fcaa52bdfb98b40d0769b04717dce5ac81d70"
+      "bytes": 5523,
+      "sha256": "ca34f585b3895836fea8c571211ff87db509a0510b1d80ca1db0a31479a4c073"
     },
     {
       "path": "STAGE4M_OUTPUT_SCHEMA.md",
-      "bytes": 2637,
-      "sha256": "78a0c1d4eace63b1fc8b9a5dc94fd2b5307140cb80948ad710f71687bffee1cd"
+      "bytes": 3747,
+      "sha256": "872fb08652475cd7d7777b1a3af6289cab7fd77c1bbf0aee33800e9327606b7f"
     },
     {
       "path": "STAGE4M_VALIDATION_CHECKLIST.md",
-      "bytes": 2190,
-      "sha256": "8ba582fb17c0b21c99795d6e9961a1f638cbb0cda0b2d2b0cdee1ab0cb7bfd7b"
+      "bytes": 3397,
+      "sha256": "89e3d6863fbce5962f7a5ab9b181d39d4f081541e2b365467d6877e96ce65988"
     },
     {
       "path": "STAGE4M_README.md",
-      "bytes": 2240,
-      "sha256": "719900796c1146537d5b3a8bb0ef71a8e27955582c8a7132f2b1b8a1ebf45fae"
+      "bytes": 3766,
+      "sha256": "021e33b8c352a69442ff79d55650222531a6a8e6378c38cef5f3399bbd70a4b9"
     },
     {
       "path": "STAGE4M_PREDECESSOR_DRIVE_AUDIT.json",

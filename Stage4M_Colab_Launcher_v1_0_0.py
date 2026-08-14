@@ -48,7 +48,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--branch-root"); parser.add_argument("--repository-root", default=str(Path(__file__).resolve().parent))
     parser.add_argument("--config"); parser.add_argument("--profile", choices=("full", "pilot"), default="full")
-    parser.add_argument("--preflight", action="store_true"); parser.add_argument("--resume", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--preflight", action="store_true")
+    modes.add_argument("--stage-local-data", action="store_true")
+    modes.add_argument("--verify-local-data", action="store_true")
+    modes.add_argument("--run", action="store_true")
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--stage-start", type=int, default=1); parser.add_argument("--stage-end", type=int, default=12)
     return parser.parse_args(argv)
 
@@ -66,8 +71,14 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     else: print("GPU: NOT AVAILABLE")
     command = [sys.executable, "-u", str(pipeline), "--branch-root", str(root), "--repository-root", str(repository), "--profile", args.profile]
     if args.config: command.extend(("--config", args.config))
-    if args.preflight: command.append("--preflight")
-    else: command.extend(("--stage-start", str(args.stage_start), "--stage-end", str(args.stage_end)))
+    if args.preflight:
+        command.append("--preflight")
+    elif args.stage_local_data:
+        command.append("--stage-local-data")
+    elif args.verify_local_data:
+        command.append("--verify-local-data")
+    else:
+        command.extend(("--run", "--stage-start", str(args.stage_start), "--stage-end", str(args.stage_end)))
     environment = os.environ.copy(); environment["WISIG_BRANCH_ROOT"] = str(root); environment["PYTHONUNBUFFERED"] = "1"
     subprocess.check_call(command, env=environment)
 

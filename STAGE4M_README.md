@@ -22,6 +22,23 @@ Canonical K1-K3 training uses online frozen-teacher targets from the exact once-
 
 Canonical training remains gated on review of this code and the Drive-backed preflight result.
 
+## Local-SSD staging and resumable execution
+
+Google Drive remains the canonical benchmark source and Stage 4M output destination. Before Stage 04, the launcher deterministically stages only `train_known`, P0, P1, P2, and P3 into 1,024-row uncompressed HDF5 shards under `/content/wisig_stage4m_local_v1_0_0`. The expected frozen layout is 633 shards. Every shard retains canonical global indices and domain metadata and is verified against a Drive-persisted manifest. Calibration Unknown is excluded and can be staged separately only after the canonical selection lock; strict/final partitions are rejected before source data are opened.
+
+Run the explicit modes in the same Colab runtime:
+
+```python
+import subprocess, sys
+launcher = "/content/Surrogate-XAI/Stage4M_Colab_Launcher_v1_0_0.py"
+common = [sys.executable, "-u", launcher, "--repository-root", "/content/Surrogate-XAI"]
+subprocess.check_call(common + ["--stage-local-data"])
+subprocess.check_call(common + ["--verify-local-data"])
+subprocess.check_call(common + ["--run", "--resume"])
+```
+
+Canonical results and recovery state remain under Drive `06_surrogate_kd`. Every completed epoch atomically updates `latest.pt`, `history.csv`, and `epoch_status.json`, with `best.pt` updated only on improvement. `STAGE4M_LIVE_PROGRESS.json` records lifecycle events and `STAGE4M_HEARTBEAT.json` is refreshed every 25 batches. A `KeyboardInterrupt` records `STAGE4M_INTERRUPTED.json` and resumes from the last completed epoch; it is not classified as a scientific failure.
+
 ## AMP-overflow recovery hotfix
 
 The canonical Colab run exposed a CUDA-AMP overflow in K0/seed 42 after epoch 1. The hotfix preserves the frozen scientific design and AMP setting while treating isolated fp16 overflows as bounded numerical events: the underlying optimizer update is skipped, GradScaler backs off, counters are persisted, and the next batch proceeds. More than 32 consecutive overflows abort. The old epoch-1 checkpoint is intentionally rejected under the new executable/provenance and K0/seed 42 restarts cleanly.
