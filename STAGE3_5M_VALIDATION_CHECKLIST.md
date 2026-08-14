@@ -22,6 +22,14 @@
 - [x] Strict stores bind the current lock and exact sealed index sequence
 - [x] Stage 3M→Stage 3.5M P0-P3 inference-equivalence mutation matrix
 - [x] Stages 09-11 require current known and strict score bundles
+- [x] Strict shift is enforced as an exact unique subset of strict main before fresh scoring
+- [x] Strict shift rows outside main, partial overlap, duplicates, and non-strict overlap abort
+- [x] No concatenated/double-counted `strict_combined` population exists
+- [x] Post-lock recovery preflight is read-only and requires the exact reviewed NOT_READY failure
+- [x] Recovery rejects modified lock, Stage 03-07 evidence, fit, thresholds, known bundle, strict stores, or store-lock binding
+- [x] Recovery rejects any strict-label file and contains no strict-signal/teacher/fitting path
+- [x] Persisted overlapping predictions and score vectors pass exact/tolerance integrity checks
+- [x] READY schema discloses post-lock recovery and all no-recomputation flags
 - [x] Stage-11 transaction writes READY before its checkpoint and validates final hashes
 - [x] Logging formatting regression
 - [x] Frozen Stage 3M and Stage 2.6M validators remain passing

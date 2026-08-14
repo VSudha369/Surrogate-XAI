@@ -28,6 +28,12 @@ Stages 01-07 cannot open strict index arrays or signals. Stage 04 first proves S
 
 Violation counters independently cover signal, label, embedding, metric, threshold, and fit access. All are violation counters and must remain zero. Stages 09-11 refuse to proceed unless both score bundles and the evaluation lock remain recursively hash-current. Stage 11 writes READY only after every stage and final hash manifest are current.
 
+## Strict shifted-subset semantics and post-lock recovery
+
+The frozen `strict_zero_day_shift_test` partition is a 3,000-row sensitivity subset of the 216,000-row `strict_zero_day_test`, not a disjoint peer. Fresh executions validate uniqueness, non-strict disjointness, and the exact subset relationship immediately after sealed indices are verified and before strict signal scoring. Metrics and confidence intervals are reported separately for the overall strict test and nested shift subset; no concatenated or double-counted `strict_combined` population exists.
+
+The reviewed canonical run scored both strict stores once under its original lock before the earlier disjointness assertion aborted. `Stage3_5M_PostLock_Recovery_v1_0_0.py` therefore verifies and reuses those immutable stores. It cannot open strict signals, execute the teacher, fit scorers or thresholds, read strict labels, or replace the original lock. Recovery provenance and the original NOT_READY evidence are disclosed in the recovery manifest, final status, strict bundle, and READY marker.
+
 ## Metrics
 
 Every scorer reports AUROC, AUPRC, unknown F1, known F1, macro-F1, FPR@95TPR, minimum detection error, OSCR, threshold, known acceptance, and unknown rejection. Deterministic stratified bootstrap confidence intervals are produced for AUROC, AUPRC, macro-F1, and OSCR. Closed-set known correctness remains separate and Stage 3M metrics are never overwritten.

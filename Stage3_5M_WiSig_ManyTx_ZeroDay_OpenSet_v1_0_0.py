@@ -137,6 +137,44 @@ def sha256_int64_array(values: np.ndarray) -> str:
     return hashlib.sha256(array.tobytes()).hexdigest()
 
 
+def validate_strict_subset_relationship(
+    main_indices: np.ndarray,
+    shift_indices: np.ndarray,
+    non_strict_indices: Optional[np.ndarray] = None,
+    expected_main_rows: int = 216_000,
+    expected_shift_rows: int = 3_000,
+) -> Dict[str, Any]:
+    """Validate the frozen contract: the shifted strict partition is nested in main."""
+    main = np.asarray(main_indices, dtype=np.int64).reshape(-1)
+    shift = np.asarray(shift_indices, dtype=np.int64).reshape(-1)
+    main_unique = len(np.unique(main)) == len(main)
+    shift_unique = len(np.unique(shift)) == len(shift)
+    intersection = np.intersect1d(main, shift, assume_unique=main_unique and shift_unique)
+    shift_outside = np.setdiff1d(shift, main, assume_unique=main_unique and shift_unique)
+    main_outside = np.setdiff1d(main, shift, assume_unique=main_unique and shift_unique)
+    non_strict_overlap = 0
+    if non_strict_indices is not None:
+        non_strict = np.asarray(non_strict_indices, dtype=np.int64).reshape(-1)
+        non_strict_overlap = int(np.intersect1d(main, non_strict).size + np.intersect1d(shift, non_strict).size)
+    audit = {
+        "main_rows": int(len(main)), "shift_rows": int(len(shift)),
+        "main_unique": main_unique, "shift_unique": shift_unique,
+        "intersection_rows": int(len(intersection)),
+        "shift_subset_of_main": bool(len(shift_outside) == 0),
+        "shift_rows_outside_main": int(len(shift_outside)),
+        "main_rows_outside_shift": int(len(main_outside)),
+        "non_strict_overlap_rows": non_strict_overlap,
+    }
+    required = (
+        len(main) == expected_main_rows and len(shift) == expected_shift_rows
+        and main_unique and shift_unique and len(intersection) == len(shift)
+        and len(shift_outside) == 0 and non_strict_overlap == 0
+    )
+    if not required:
+        raise ScientificAbort(f"Frozen strict subset relationship mismatch: {audit}")
+    return audit
+
+
 def parse_ready_marker(path: Path) -> Dict[str, str]:
     if not path.is_file():
         raise ScientificAbort(f"Required READY marker missing: {path}")
@@ -1159,6 +1197,9 @@ class Stage35Pipeline:
             "scorer_fit_sha256": fit_sha, "scorer_definitions_sha256": sha256_object(SCORER_DEFINITIONS),
             "configuration_sha256": self.config.configuration_sha256(), "executable_sha256": self.script_sha,
             "evaluation_lock_sha256": lock_sha, "strict_labels_included": False,
+            "partition_relationship": validate_strict_subset_relationship(
+                strict_indices["strict_zero_day_test"], strict_indices["strict_zero_day_shift_test"],
+            ),
             "partitions": partitions, "generated_at": utc_now(),
         }
         canonical = dict(payload); canonical.pop("generated_at")
@@ -1186,6 +1227,7 @@ class Stage35Pipeline:
             canonical = dict(payload); canonical.pop("canonical_content_sha256", None); canonical.pop("generated_at", None)
             if payload.get("canonical_content_sha256") != sha256_object(canonical):
                 return False
+            verified_indices: Dict[str, np.ndarray] = {}
             for partition, record in payload["partitions"].items():
                 sealed = Path(record["sealed_index_path"])
                 if not sealed.is_file() or sha256_file(sealed) != record.get("sealed_index_sha256"):
@@ -1198,6 +1240,7 @@ class Stage35Pipeline:
                     if not artifact.is_file() or artifact.stat().st_size != int(evidence["bytes"]) or sha256_file(artifact) != evidence["sha256"]:
                         return False
                 indices = np.asarray(np.load(Path(files["global_indices.npy"]["path"]), mmap_mode="r"), dtype=np.int64)
+                verified_indices[partition] = indices
                 if len(indices) != int(record.get("rows", -1)) or record.get("global_index_values_sha256") != sha256_int64_array(indices):
                     return False
                 if any(record.get(key) != files[name]["sha256"] for key, name in {
@@ -1207,6 +1250,11 @@ class Stage35Pipeline:
                     return False
                 if record.get("teacher_sha256") != EXPECTED_TEACHER_SHA256 or record.get("fit_sha256") != fit_sha or record.get("configuration_sha256") != self.config.configuration_sha256() or record.get("executable_sha256") != self.script_sha or record.get("evaluation_lock_sha256") != lock_sha:
                     return False
+            relationship = validate_strict_subset_relationship(
+                verified_indices["strict_zero_day_test"], verified_indices["strict_zero_day_shift_test"],
+            )
+            if payload.get("partition_relationship") != relationship:
+                return False
             return True
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             return False
@@ -1575,16 +1623,17 @@ class Stage35Pipeline:
                 raise ScientificAbort(f"Strict partition overlaps a non-strict partition: {partition}")
             strict_indices[partition] = values
             sealed_paths[partition] = path
+        relationship = validate_strict_subset_relationship(
+            strict_indices["strict_zero_day_test"], strict_indices["strict_zero_day_shift_test"], authorized_non_strict,
+        )
+        for partition, values in strict_indices.items():
             self.extract_strict_scores(partition, values)
-        if np.intersect1d(strict_indices["strict_zero_day_test"], strict_indices["strict_zero_day_shift_test"]).size:
-            raise ScientificAbort("Strict main and strict shift partitions overlap")
         threshold_path = self.config.output_root / "thresholds" / "ZD_STRICT_THRESHOLDS.json"
         threshold_payload = json.loads(threshold_path.read_text(encoding="utf-8"))["thresholds"]
         known_scores = np.concatenate([np.load(self.score_store(partition) / "scores.npy", mmap_mode="r") for partition in KNOWN_VALIDATION], axis=0)
         known_correct = np.concatenate([np.load(self.score_store(partition) / "known_correct.npy", mmap_mode="r") for partition in KNOWN_VALIDATION]).astype(bool)
         rows: List[Dict[str, Any]] = []
         unknown_by_partition = {partition: np.load(self.score_store(partition) / "scores.npy", mmap_mode="r") for partition in STRICT_PARTITIONS}
-        unknown_by_partition["strict_combined"] = np.concatenate(list(unknown_by_partition.values()), axis=0)
         for partition, unknown in unknown_by_partition.items():
             for index, scorer in enumerate(SCORER_ORDER):
                 metrics = open_set_metrics(known_scores[:, index], known_correct, unknown[:, index], threshold_payload[scorer]["canonical_threshold"])
@@ -1595,6 +1644,7 @@ class Stage35Pipeline:
         atomic_json(audit, {
             "status": "PASS", "evaluation_lock_sha256": lock_sha, "strict_signal_access_first_stage": 8,
             "strict_partitions": {key: {"rows": len(value), "index_sha256": sha256_file(Path(evidence[key]["path"]))} for key, value in strict_indices.items()},
+            "strict_partition_relationship": relationship, "shift_is_nested_subset": True,
             "strict_labels_loaded": False, "semantic_target": "UNKNOWN_BY_FROZEN_PARTITION_MEMBERSHIP",
             "scorer_fitting_after_lock": False, "threshold_fitting_after_lock": False,
             "teacher_state_immutable": state_tensor_sha256(self.ensure_teacher().state_dict()) == self.teacher_state_sha,
@@ -1618,23 +1668,24 @@ class Stage35Pipeline:
         self.guard.activate_final_lock(9, True); self.guard.authorize_strict("metric", 9, True)
         known_scores = np.concatenate([np.load(self.score_store(partition) / "scores.npy", mmap_mode="r") for partition in KNOWN_VALIDATION], axis=0)
         known_correct = np.concatenate([np.load(self.score_store(partition) / "known_correct.npy", mmap_mode="r") for partition in KNOWN_VALIDATION]).astype(bool)
-        unknown_scores = np.concatenate([np.load(self.score_store(partition) / "scores.npy", mmap_mode="r") for partition in STRICT_PARTITIONS], axis=0)
         thresholds = json.loads((self.config.output_root / "thresholds" / "ZD_STRICT_THRESHOLDS.json").read_text(encoding="utf-8"))["thresholds"]
         rng = np.random.default_rng(self.config.random_seed); rows: List[Dict[str, Any]] = []
-        known_pool = np.arange(len(known_scores)); unknown_pool = np.arange(len(unknown_scores))
-        known_size = min(len(known_pool), self.config.bootstrap_max_per_group); unknown_size = min(len(unknown_pool), self.config.bootstrap_max_per_group)
-        for scorer_index, scorer in enumerate(SCORER_ORDER):
-            samples: Dict[str, List[float]] = {key: [] for key in (
-                "auroc", "auprc", "unknown_f1", "known_f1", "macro_f1", "fpr_at_95_tpr",
-                "detection_error", "oscr", "known_acceptance_rate", "unknown_rejection_rate",
-            )}
-            for _ in range(self.config.bootstrap_replicates):
-                known_idx = rng.choice(known_pool, size=known_size, replace=True); unknown_idx = rng.choice(unknown_pool, size=unknown_size, replace=True)
-                metrics = open_set_metrics(known_scores[known_idx, scorer_index], known_correct[known_idx], unknown_scores[unknown_idx, scorer_index], thresholds[scorer]["canonical_threshold"])
-                for key in samples:
-                    samples[key].append(metrics[key])
-            for metric, values in samples.items():
-                rows.append({"protocol": "ZD_STRICT", "scorer": scorer, "metric": metric, "bootstrap_replicates": self.config.bootstrap_replicates, "bootstrap_known_rows": known_size, "bootstrap_unknown_rows": unknown_size, "ci_low": float(np.quantile(values, 0.025)), "ci_high": float(np.quantile(values, 0.975)), "bootstrap_mean": float(np.mean(values))})
+        known_pool = np.arange(len(known_scores)); known_size = min(len(known_pool), self.config.bootstrap_max_per_group)
+        for partition in STRICT_PARTITIONS:
+            unknown_scores = np.load(self.score_store(partition) / "scores.npy", mmap_mode="r")
+            unknown_pool = np.arange(len(unknown_scores)); unknown_size = min(len(unknown_pool), self.config.bootstrap_max_per_group)
+            for scorer_index, scorer in enumerate(SCORER_ORDER):
+                samples: Dict[str, List[float]] = {key: [] for key in (
+                    "auroc", "auprc", "unknown_f1", "known_f1", "macro_f1", "fpr_at_95_tpr",
+                    "detection_error", "oscr", "known_acceptance_rate", "unknown_rejection_rate",
+                )}
+                for _ in range(self.config.bootstrap_replicates):
+                    known_idx = rng.choice(known_pool, size=known_size, replace=True); unknown_idx = rng.choice(unknown_pool, size=unknown_size, replace=True)
+                    measured = open_set_metrics(known_scores[known_idx, scorer_index], known_correct[known_idx], unknown_scores[unknown_idx, scorer_index], thresholds[scorer]["canonical_threshold"])
+                    for key in samples:
+                        samples[key].append(measured[key])
+                for metric, values in samples.items():
+                    rows.append({"protocol": "ZD_STRICT", "strict_partition": partition, "scorer": scorer, "metric": metric, "bootstrap_replicates": self.config.bootstrap_replicates, "bootstrap_known_rows": known_size, "bootstrap_unknown_rows": unknown_size, "ci_low": float(np.quantile(values, 0.025)), "ci_high": float(np.quantile(values, 0.975)), "bootstrap_mean": float(np.mean(values))})
         output = self.config.output_root / "statistics" / "strict_bootstrap_confidence_intervals.csv"
         atomic_csv(output, pd.DataFrame(rows), self.config.output_root)
         self.guard.assert_zero()
@@ -1654,30 +1705,32 @@ class Stage35Pipeline:
         known = pd.read_csv(self.config.output_root / "tables" / "known_validation_score_characterization.csv")
         closed = pd.read_csv(self.config.output_root / "tables" / "closed_set_teacher_metrics.csv")
         known_scores = np.concatenate([np.load(self.score_store(partition) / "scores.npy", mmap_mode="r") for partition in KNOWN_VALIDATION], axis=0)
-        unknown_scores = np.concatenate([np.load(self.score_store(partition) / "scores.npy", mmap_mode="r") for partition in STRICT_PARTITIONS], axis=0)
         separation_rows = []
-        for index, scorer in enumerate(SCORER_ORDER):
-            known_values = np.asarray(known_scores[:, index], dtype=np.float64); unknown_values = np.asarray(unknown_scores[:, index], dtype=np.float64)
-            pooled = math.sqrt(max((known_values.var() + unknown_values.var()) / 2.0, 1e-18))
-            separation_rows.append({
-                "protocol": "ZD_STRICT", "scorer": scorer, "known_mean": float(known_values.mean()),
-                "known_std": float(known_values.std()), "unknown_mean": float(unknown_values.mean()),
-                "unknown_std": float(unknown_values.std()), "mean_separation": float(unknown_values.mean() - known_values.mean()),
-                "standardized_separation": float((unknown_values.mean() - known_values.mean()) / pooled),
-            })
+        for partition in STRICT_PARTITIONS:
+            unknown_scores = np.load(self.score_store(partition) / "scores.npy", mmap_mode="r")
+            for index, scorer in enumerate(SCORER_ORDER):
+                known_values = np.asarray(known_scores[:, index], dtype=np.float64); unknown_values = np.asarray(unknown_scores[:, index], dtype=np.float64)
+                pooled = math.sqrt(max((known_values.var() + unknown_values.var()) / 2.0, 1e-18))
+                separation_rows.append({
+                    "protocol": "ZD_STRICT", "strict_partition": partition, "scorer": scorer, "known_mean": float(known_values.mean()),
+                    "known_std": float(known_values.std()), "unknown_mean": float(unknown_values.mean()),
+                    "unknown_std": float(unknown_values.std()), "mean_separation": float(unknown_values.mean() - known_values.mean()),
+                    "standardized_separation": float((unknown_values.mean() - known_values.mean()) / pooled),
+                })
         separation = pd.DataFrame(separation_rows)
         separation_path = self.config.output_root / "tables" / "strict_score_distribution_summary.csv"
         atomic_csv(separation_path, separation, self.config.output_root)
         figures: List[Path] = []
-        combined = metrics[metrics.strict_partition == "strict_combined"]
+        main_metrics = metrics[metrics.strict_partition == "strict_zero_day_test"]
         for metric in ("auroc", "auprc", "macro_f1", "oscr"):
-            fig, ax = plt.subplots(figsize=(9, 5)); frame = combined.sort_values("scorer")
-            ax.bar(frame.scorer, frame[metric]); ax.set_ylim(0, 1); ax.set_ylabel(metric.upper()); ax.set_title(f"ZD-STRICT {metric.upper()} — frozen teacher")
+            fig, ax = plt.subplots(figsize=(9, 5)); frame = main_metrics.sort_values("scorer")
+            ax.bar(frame.scorer, frame[metric]); ax.set_ylim(0, 1); ax.set_ylabel(metric.upper()); ax.set_title(f"ZD-STRICT overall {metric.upper()} — frozen teacher")
             ax.tick_params(axis="x", rotation=25); ax.grid(axis="y", alpha=0.25); fig.tight_layout()
             for suffix in ("png", "pdf"):
                 path = self.config.output_root / "figures" / f"strict_{metric}.{suffix}"; fig.savefig(path, dpi=240 if suffix == "png" else None); figures.append(path)
             plt.close(fig)
         rng = np.random.default_rng(self.config.random_seed)
+        unknown_scores = np.load(self.score_store("strict_zero_day_test") / "scores.npy", mmap_mode="r")
         fig, axes = plt.subplots(len(SCORER_ORDER), 1, figsize=(9, 15))
         for index, scorer in enumerate(SCORER_ORDER):
             known_index = rng.choice(len(known_scores), size=min(20_000, len(known_scores)), replace=False)
@@ -1690,7 +1743,7 @@ class Stage35Pipeline:
             path = self.config.output_root / "figures" / f"strict_score_distributions.{suffix}"; fig.savefig(path, dpi=240 if suffix == "png" else None); figures.append(path)
         plt.close(fig)
         report = self.config.output_root / "reports" / "STAGE3_5M_SCIENTIFIC_REPORT.md"
-        atomic_text(report, "# Stage 3.5M zero-day/open-set report\n\n## Measured facts\n\nAll rows below use the frozen Stage 3M A3 seed-123 teacher. The ZD-STRICT scorer definitions and known-only thresholds were locked before strict access. All five scorers are reported without post-hoc winner selection.\n\n" + combined.to_markdown(index=False) + "\n\n### Closed-set teacher metrics (independent of rejection)\n\n" + closed.to_markdown(index=False) + "\n\n### Known-vs-unknown score separation\n\n" + separation.to_markdown(index=False) + "\n\n## Interpretation\n\nInterpretation must follow the measured tables and confidence intervals. Calibration Unknown, when enabled, is a separate ZD-CALIBRATED analysis and never changes ZD-STRICT policy. Closed-set teacher behavior is reported separately and Stage 3M outputs were not overwritten.\n", self.config.output_root)
+        atomic_text(report, "# Stage 3.5M zero-day/open-set report\n\n## Measured facts\n\nAll rows below use the frozen Stage 3M A3 seed-123 teacher. The ZD-STRICT scorer definitions and known-only thresholds were locked before strict access. All five scorers are reported without post-hoc winner selection. The 3,000-row shifted partition is a nested sensitivity subset of the 216,000-row overall strict test; no combined population is constructed.\n\n" + metrics.to_markdown(index=False) + "\n\n### Closed-set teacher metrics (independent of rejection)\n\n" + closed.to_markdown(index=False) + "\n\n### Known-vs-unknown score separation\n\n" + separation.to_markdown(index=False) + "\n\n## Interpretation\n\nInterpretation must follow the measured tables and confidence intervals. Calibration Unknown, when enabled, is a separate ZD-CALIBRATED analysis and never changes ZD-STRICT policy. Closed-set teacher behavior is reported separately and Stage 3M outputs were not overwritten.\n", self.config.output_root)
         workbook = self.config.output_root / "publication" / "Stage3_5M_tables.xlsx"
         with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
             metrics.to_excel(writer, sheet_name="strict_metrics", index=False); confidence.to_excel(writer, sheet_name="bootstrap_ci", index=False); known.to_excel(writer, sheet_name="known_scores", index=False); closed.to_excel(writer, sheet_name="closed_set", index=False); separation.to_excel(writer, sheet_name="score_separation", index=False)
