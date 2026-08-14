@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+03_representation_ablation/
+*.pt
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.zip.tmp

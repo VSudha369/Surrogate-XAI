@@ -1,71 +1,107 @@
-# Surrogate-XAI
+# Stage 2.6M — WiSig ManyTx controlled representation ablation
 
-Research code for **Ultra-Low Latency Surrogate-Assisted Explainable AI for Zero-Day Threat Detection in Non-Stationary Physical Layer Communications**.
+This repository contains the executable Stage 2.6M v1.0.2 performance-engineered experiment for the frozen `WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3` benchmark. Versioned v1.0.1 sources remain as historical provenance. The scientific experiment still compares exactly four representation objectives under one common RF temporal network:
 
-## Project status
+## Repository context
 
-The repository is organized around two clearly separated research branches:
+This work belongs to **Ultra-Low Latency Surrogate-Assisted Explainable AI for Zero-Day Threat Detection in Non-Stationary Physical Layer Communications**. The active path is the WiSig ManyTx transmitter-centric zero-day branch; earlier RadioML/AMC code is legacy provenance only. Stage 1B and Stage 2M are frozen, Stage 2.6M v1.0.2 is the current controlled-representation implementation candidate, and Stage 3M remains contingent on the Stage 2.6M selection result.
 
-- **Active ManyTx zero-day branch** — WiSig ManyTx benchmark engineering and diagnostics for transmitter-centric zero-day evaluation under receiver/day/equalization shift.
-- **Legacy RadioML branch** — earlier AMC-focused diagnostics and representation-ablation code retained only for provenance and auxiliary low-SNR robustness work.
+| Arm | Objective |
+|---|---|
+| A0 | CE |
+| A1 | CE + supervised contrastive loss |
+| A2 | CE + EMA-prototype compactness loss |
+| A3 | CE + supervised contrastive + EMA-prototype loss |
 
-Current active progression:
+The supplied prior notebook was reviewed for project history and engineering conventions. Its embedded Stage 2 diagnostic bundle is RadioML-oriented, so it is not used as the active experiment. This implementation is purpose-built for WiSig ManyTx: 2×256 I/Q, 98 known transmitters, P0–P3 domain protocols, receiver/day/equalization metadata, and calibration-unknown diagnostics.
 
-| Stage | Status | Canonical artifact |
-|---|---|---|
-| Stage 1B | Frozen | `WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3` |
-| Stage 2M | Frozen / READY | Diagnostics v1.0.5 |
-| Stage 2.6M | Design frozen; implementation pending | Controlled CE / SupCon / Prototype ablation |
-| Stage 3M+ | Not yet canonical | Pending Stage 2.6M selection |
+## Safety boundary
 
-## Repository layout
+Training reads only `Train Known`. P0–P3 are frozen validation protocols. Calibration Unknown is embedded only after training and never contributes gradients, prototypes, covariance fitting, thresholds, or primary model selection.
 
-```text
-src/
-  manytx/
-    stage1b_benchmark/       # Canonical ManyTx benchmark-engineering source
-    stage2m_diagnostics/     # Canonical ManyTx scientific diagnostics source
-legacy/
-  radioml/
-    stage2_5_diagnostics/    # Superseded RadioML diagnostics
-    stage2_6_representation/ # Superseded RadioML representation ablation
-notebooks/
-  manytx/stage2m/            # Thin Colab launcher notebook
-docs/
-  PROJECT_STATUS.md
-  TEST_ACCESS_POLICY.md
-  REPRODUCIBILITY.md
-  ARTIFACT_REGISTRY.md
-  STAGE2_6M_DESIGN.md
-```
+`strict_zero_day_test_indices.npy` and `strict_zero_day_shift_test_indices.npy` are never loaded. The guard verifies only their existence, byte-stream hash, and count declared in frozen Stage 1B manifests. Hashes are accepted only from records bound to the exact strict filename; counts may also use the frozen canonical split keys `strict_zero_day` and `strict_zero_day_shift`. This prevents unrelated manifest digests or split counts from being mistaken for strict-array declarations. Its strict signal/label/embedding/metric/threshold fields are violation counters, while the primary evidence is structural: an authorized partition allowlist, strict-path prohibition, frozen-index-only resolution, output scanning, and a static forbidden-artifact guard.
 
-## Scientific data policy
-
-Datasets, benchmark HDF5 files, checkpoints, generated embeddings, final-test predictions, and large experiment outputs are intentionally **not stored in GitHub**. Canonical artifacts are identified by hashes and reproduced/validated against external storage.
-
-The strict zero-day test partition is protected throughout model development. Training, representation selection, threshold selection, and diagnostics must not use strict-zero-day signals or labels before final model selection is frozen.
-
-## Canonical hashes
-
-- WiSig ManyTx source SHA-256: `a8fc3e35134a240bfb4dab8862a6e482cef44de000b813d42417b853c47ccc7e`
-- Stage 1B benchmark SHA-256: `9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9`
-- Canonical Stage 2M script SHA-256: `46c95bbf9fb6806a5f463b4e173434a5f03f013367b1bcd38ebb73c07d0f67ba`
-- Stage 2M artifact hash-manifest SHA-256: `0a8853d782006ce8af2d7b798a61c1e141afbeb55066cb70115ae41c8d24f16a`
-
-## Active Stage 2M conclusion
-
-Stage 2M completed all safety gates with zero strict-test reads and recommended:
+## Canonical layout
 
 ```text
-PROCEED_STAGE_2_6M_WITH_CAUTION
+MANYTX_ZERO_DAY_BRANCH_v1.0.3/
+├── 01_benchmark_engineering/
+│   └── benchmark/
+│       └── WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3.h5
+├── 02_benchmark_diagnostics/
+└── 03_representation_ablation/          # created by this pipeline only
 ```
 
-The next active experiment is a **single-backbone controlled representation ablation** using CE, CE+SupCon, CE+Prototype, and CE+SupCon+Prototype. The older RadioML Stage 2.6 code in `legacy/` must not be used as the active ManyTx Stage 2.6M pipeline.
+Stage 1B and Stage 2M are opened read-only. `manifests/STAGE2M_FINAL_STATUS.json` must satisfy the exact structured readiness, version, script/benchmark hash, proceed recommendation, failed-gate, final-test prohibition, and strict-guard contract. `manifests/HASH_MANIFEST.json` is hashed independently and must match the frozen Stage 2M artifact-manifest SHA-256.
 
-## Reproducibility
+## Colab execution
 
-See [`docs/REPRODUCIBILITY.md`](docs/REPRODUCIBILITY.md) and the stage-specific manifests/checklists. All canonical stages use explicit versioning, SHA-256 provenance, deterministic seeds where practical, resume-safe checkpoints, and frozen-test discipline.
+Mount Google Drive once in the parent Colab notebook and use `Stage2_6M_Colab_Launcher_v1_0_2.py`. The launcher detects an accessible existing mount, installs only missing dependencies, verifies upstream inputs, reports the GPU, and invokes the standalone program with `subprocess.check_call`.
 
-## Contributing
+```bash
+git pull --ff-only origin codex/stage2-6m
+git rev-parse HEAD
+python -u Stage2_6M_Colab_Launcher_v1_0_2.py --performance-preflight
+python -u Stage2_6M_Colab_Launcher_v1_0_2.py --reset-seed 42
+python -u Stage2_6M_Colab_Launcher_v1_0_2.py
+```
 
-Please keep active and legacy branches separated, never commit datasets/checkpoints/test predictions, and use pull requests for scientifically meaningful changes. See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+The preflight performs no model training and cannot create READY. It makes an opaque SHA-verified local copy, builds only authorized Train Known shards, checks bitwise backend/exposure/model-input equivalence, benchmarks storage, tunes execution-only loader/evaluation settings, and writes measured performance reports. The full v1.0.2 run requires a passing current preflight status.
+
+Full-profile training resumes only from a complete synchronized four-arm epoch checkpoint. Two alternating resume slots retain the current and preceding epoch so an interruption during one arm rolls back to the latest common epoch. Checkpoints written by predecessor script SHA-256 values `421e3c64ce33b3b7929e10d5af84debe9e735c9b2a8709475080cfa0346fd6ac`, `7493e709bf0cd4a41b990b950f8603900ce4904299497c400ab5df7de346a141`, the pre-audit v1.0.2 script `3a7f795a07163a590f1b24d66ba9cc1574de1e6966bc87157886e8668a79d5d1`, and the integration-audit script `f5af2c7a364a6303c62f3c5875ea0b1dabeb9a6974dd46d40b9a758ae1ac09da` are resume-compatible. Training resume and Stage 05–10 evaluation loading use the same centralized script-SHA compatibility policy. Every other benchmark, Stage 2M, configuration, architecture, arm, and seed provenance gate remains mandatory, a fresh patched-script preflight is still required, and all newly written checkpoints record the current script SHA-256. AMP gradient overflows use GradScaler's canonical skipped-step recovery and abort only after 32 consecutive overflows without a successful optimizer step; non-finite forward losses retain their stricter abort gate.
+
+Environment overrides are explicit:
+
+```python
+import os
+os.environ["WISIG_BRANCH_ROOT"] = "/content/drive/MyDrive/.../MANYTX_ZERO_DAY_BRANCH_v1.0.3"
+os.environ["WISIG_STAGE2_6M_SCRIPT"] = "/content/Surrogate-XAI/Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py"
+os.environ["WISIG_STAGE2_6M_PROFILE"] = "full"
+```
+
+Never invoke the standalone pipeline with `%run`; that can leak Jupyter's `-f kernel.json` into argument parsing.
+
+## Direct execution
+
+```bash
+python Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py \
+  --branch-root "/path/to/MANYTX_ZERO_DAY_BRANCH_v1.0.3" \
+  --profile full
+```
+
+Resume is enabled by default. A checkpoint is rejected unless benchmark, Stage 2M, script, configuration, arm, seed, architecture, and loss signatures all match. Use `--no-resume` to start a fresh synchronized run in the configured output directory.
+
+For dependency and finite-gradient validation without benchmark access:
+
+```bash
+python Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py \
+  --synthetic-validation --device cpu
+```
+
+This command produces no scientific metrics and cannot create READY.
+
+## v1.0.2 storage and security design
+
+The canonical HDF5 identity never changes. `/content/wisig_stage2_6m_cache` is disposable execution storage and is excluded from scientific configuration identity. The whole-HDF5 local operation is an opaque filesystem copy plus SHA-256 verification; it does not parse rows.
+
+Shard generation accepts only an explicit authorized partition name and the already-verified frozen index array. Train Known is the only partition eligible for the sharded runtime optimization. P0–P3 and Calibration Unknown always use the verified single local HDF5 (or the canonical Drive file only when `single_drive` is explicitly requested); they are never expanded into 128 small shards. Strict-zero-day names are absent from the authorization enum, rejected by path guards, never supplied by split discovery, and never passed to an HDF5 signal reader. Local shards are never persisted to Drive.
+
+`storage-mode=auto` selects Train Known sharded-local storage only after equivalence passes, measured samples/s improves by at least 10%, and P95 latency remains within its gate. Otherwise Train Known uses the verified single local HDF5. Shard initialization receives an already-resolved benchmark and cannot recurse through context initialization. `single_drive` is available only as an explicit controlled fallback; insufficient local disk never triggers a silent fallback.
+
+GPU phase telemetry uses CUDA events sampled every 50 batches and synchronizes once at the end of a sampled batch. The persisted `sampled_gpu_*_ms` fields are device-duration measurements. CPU-side transfer/augmentation/forward/objective/backward/optimizer observations are labeled `cpu_enqueue_*` and are not reported as GPU kernel durations. Hardware rows explicitly label CPU interval samples and instantaneous `nvidia-smi` utilization samples; epoch wall time, DataLoader wait percentage, throughput, RSS, available RAM, and Torch allocated/reserved/peak memory remain independently reported.
+
+## Controlled training design
+
+For each seed (42, 123, 2026), all arms start from the identical model state. Every epoch materializes one deterministic Tx-balanced list of training indices; every arm consumes that same ordered list and the same epoch augmentation seed. Group-level early stopping stops all arms together, preserving equal exposure and budget.
+
+The network contains a learned I/Q mixing frontend, residual and dilated temporal blocks, global mean/standard-deviation pooling, a 128-dimensional projection, normalized embeddings, and a 98-class head. It stays within the requested compact parameter budget and has no architecture branches.
+
+## Outputs
+
+The ten internal stages create the required reports, tables, figures in PNG and PDF, manifests, three checkpoint types per arm/seed, memory-mapped embedding stores, Excel/LaTeX/PDF publication artifacts, and `CANONICAL_STAGE3M_OBJECTIVE.json`. See `OUTPUT_SCHEMA.md` for the complete contract.
+
+`MANYTX_STAGE2_6M_READY.txt` is created only after all gates pass under the full profile. An unresolved scientific result is valid and is represented by `NO_OBJECTIVE_CLEARLY_SUPERIOR`; it is not replaced with a fabricated winner.
+
+## Scientific interpretation
+
+The final report separates measured facts, statistical inference, scientific interpretation, and the Stage 3M recommendation. Calibration Unknown is explicitly labeled a precursor diagnostic—not final zero-day evidence.

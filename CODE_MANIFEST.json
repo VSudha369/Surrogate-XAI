@@ -1,0 +1,114 @@
+{
+  "artifact": "Stage 2.6M - WiSig ManyTx Controlled Representation Learning & Domain-Robust Embedding Ablation",
+  "version": "1.0.2",
+  "generated_date": "2026-08-11",
+  "canonical_benchmark": "WiSig_ManyTx_ZeroDay_Benchmark_v1.0.3",
+  "canonical_benchmark_sha256": "9cce10dcee47c81dad855da3bd5ff845af2b955cee1a0fe03084609560cbd3b9",
+  "source_provenance": [
+    {
+      "name": "Surrogate_XAI (2).ipynb",
+      "sha256": "f6c291149cb4f058fc9199dacb31a8cfd43d502dbbd996ec786db97f6b30252f",
+      "role": "Prior-work review only; its RadioML-oriented diagnostic bundle is not the active Stage 2.6M pipeline"
+    },
+    {
+      "name": "Stage 2.6M master generation prompt",
+      "sha256": "c225368963152c882b1637ab0055547406efdd9329d1430226087e2e807fd631",
+      "role": "Authoritative scientific and engineering specification"
+    },
+    {
+      "name": "Stage 2.6M v1.0.2 performance-engineering task",
+      "sha256": "7b086d6d47075f4617dec017193ad2e34c304b7e5716e76fb679f610da3ed3f7",
+      "role": "Authoritative execution-engine and strict authorized-sharding specification"
+    },
+    {
+      "name": "Stage 2.6M v1.0.2 integration audit fix",
+      "sha256": "33b828797265820a34ef7488a21a729d268e76c78de47aa15a9266b6891b7d2c",
+      "role": "Authoritative non-recursive shard initialization, partition backend, and telemetry correction"
+    },
+    {
+      "name": "Stage 05 Colab device-mismatch failure log",
+      "sha256": "6a22c1705919c93fdf327ec765869caa9bd80cb04f9a6ce47efa0b7749b93b9c",
+      "role": "Runtime evidence for the streaming-metrics label-device integration correction"
+    }
+  ],
+  "files": [
+    {
+      "path": ".gitignore",
+      "bytes": 144,
+      "sha256": "1b0c67532e073ad3cd1be5eb47fe61d453be4390580775907fad5f4e2a63c958"
+    },
+    {
+      "path": "README.md",
+      "bytes": 9897,
+      "sha256": "25476ffe2872a4c24a3e630dcc9793c72d896eae597fb319e9bc48bd96255580"
+    },
+    {
+      "path": "SCIENTIFIC_PROTOCOL.md",
+      "bytes": 10529,
+      "sha256": "32f0fdb54768e1738708a84ba7645782c6731d7d563309bf2f34b2111046f252"
+    },
+    {
+      "path": "OUTPUT_SCHEMA.md",
+      "bytes": 6863,
+      "sha256": "bb3718cc3725c299d2b9dd7cef84224ef891c05f427eaae2b50d94b0aa5c3a8a"
+    },
+    {
+      "path": "VALIDATION_CHECKLIST.md",
+      "bytes": 6561,
+      "sha256": "eba9b1167e92b4b717a2481014a15651d46251e289a126fcb88ea42644f44e1e"
+    },
+    {
+      "path": "requirements.txt",
+      "bytes": 159,
+      "sha256": "d2c8fc63ae8c2df2fbc5e98b6f06a73f69cd24daa397c400028585aaa95063c9"
+    },
+    {
+      "path": "stage2_6m_config_v1_0_2.example.json",
+      "bytes": 665,
+      "sha256": "4e71ba86faaf0bfcbf3334e0bad3816dfff18f086f984fe556fef4975b72a5fb"
+    },
+    {
+      "path": "Stage2_6M_Colab_Launcher_v1_0_2.py",
+      "bytes": 10957,
+      "sha256": "822d135e0ae7168611bc6ea8b85a413810cd9de193880dcfc0a850b72a99509e"
+    },
+    {
+      "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.py",
+      "bytes": 229498,
+      "sha256": "843623a6260304d048ed1627c18a0f8849b498b3d1b9b8a6ecdb5cb5c7dd58bc"
+    },
+    {
+      "path": "Stage2_6M_WiSig_ManyTx_Controlled_Representation_Ablation_v1_0_2.ipynb",
+      "bytes": 2470,
+      "sha256": "b72301746e189abc8a00d6ce29e432e5ce55d23bc646fb2fd40ac220ca0b86b3"
+    },
+    {
+      "path": "stage2_6m_performance_v1_0_2.py",
+      "bytes": 42328,
+      "sha256": "6ad7256a6a1907873078d606685b6bad880b07cce37fe5bf7e5aa82a25626e71"
+    },
+    {
+      "path": "validate_stage2_6m_v1_0_2.py",
+      "bytes": 26180,
+      "sha256": "57ee8f1bd2f5c8b7676fd4308c33d0d7de9f08d735497be725f8502b0763bb5d"
+    }
+  ],
+  "validation": {
+    "python_ast_parse": "PASS",
+    "notebook_json_parse": "PASS",
+    "undefined_name_audit": "PASS (pyflakes)",
+    "benchmark_independent_runtime_equivalence": "PASS",
+    "sharded_full_run_context_initialization": "PASS",
+    "storage_context_cases_a_b_c_d": "PASS",
+    "streaming_metrics_cross_device_label_alignment": "PASS",
+    "evaluation_checkpoint_compatible_script_sha": "PASS",
+    "evaluation_checkpoint_current_script_sha": "PASS",
+    "evaluation_checkpoint_unknown_script_sha_rejected": "PASS",
+    "evaluation_checkpoint_provenance_mismatch_matrix_rejected": "PASS",
+    "evaluation_checkpoint_strict_model_state_rejected": "PASS",
+    "incomplete_stage05_store_rebuild_gate": "PASS",
+    "strict_zero_day_zero_access": "PASS",
+    "synthetic_four_arm_finite_gradient": "PASS",
+    "scientific_execution": "NOT_RUN_LOCALLY - frozen canonical WiSig benchmark and Stage 2M artifacts are not present in this workspace"
+  }
+}
