@@ -48,11 +48,11 @@
     "prototype_momentum": 0.95
   },
   "files": [
-    {"path": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.py", "bytes": 82055, "sha256": "571ff7e29ce655649eb1a7fb66afe533aabbe83c4ef4b820aa543b45028be41f"},
+    {"path": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.py", "bytes": 82429, "sha256": "6628975ba5d3234e573ca3c1df050cd9e4654f06f68813522077ff9573511521"},
     {"path": "Stage3M_Colab_Launcher_v1_0_0.py", "bytes": 8825, "sha256": "f3bcd9f4dd6dc2e2cfe242609a423e3f4f0f4e19e79ce417f442dc78fd1b7b44"},
     {"path": "stage3m_drive_audit_v1_0_0.py", "bytes": 33245, "sha256": "6088d5d86820f0030449ce6ac56eed0be2075be1463d4b51262f895e5ed11c2f"},
     {"path": "stage3m_config_v1_0_0.example.json", "bytes": 638, "sha256": "e41982dcaa3dcf257e10a4a090fe10d30566394a08dd834461cf47f73d8328ca"},
-    {"path": "validate_stage3m_v1_0_0.py", "bytes": 24869, "sha256": "180d3d0f0035f6fa8376239c97e0b77bf881f154ed340a4a3ff556cf5346150d"},
+    {"path": "validate_stage3m_v1_0_0.py", "bytes": 25082, "sha256": "8f53a58d738b36292702a15dbf910c56c314022e74e063496db9bcafd0ffc23c"},
     {"path": "Stage3M_WiSig_ManyTx_Canonical_Teacher_v1_0_0.ipynb", "bytes": 2055, "sha256": "a989214cdbff69286f6584cf23664f7effb19ddd0ed69cc492b6cd409c7b94a2"},
     {"path": "STAGE3M_SCIENTIFIC_PROTOCOL.md", "bytes": 5582, "sha256": "ad5ea24a00fe03c3cf5ce9bc27cf0ebe14a8c71bcdb3d4e95895304f09679735"},
     {"path": "STAGE3M_OUTPUT_SCHEMA.md", "bytes": 3175, "sha256": "645867a522ff79edefdba0f40abdf9d023d878d8f8c20ece22325edb48965fe8"},
@@ -71,6 +71,7 @@
     "pyflakes": "PASS",
     "notebook_json": "PASS",
     "architecture_equivalence": "PASS",
+    "stage03_positive_boolean_gate_regression": "PASS (gradients_disabled=True; no inverted false-valued pass gate)",
     "parameter_count_equivalence": "PASS (849634)",
     "checkpoint_provenance_regressions": "PASS",
     "deterministic_selection_regressions": "PASS",

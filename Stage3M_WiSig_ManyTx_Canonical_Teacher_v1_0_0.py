@@ -471,6 +471,26 @@ def model_schema(model: nn.Module) -> List[Dict[str, Any]]:
     return [{"key": name, "shape": list(value.shape), "dtype": str(value.dtype)} for name, value in model.state_dict().items()]
 
 
+def teacher_architecture_checks(reference: nn.Module, teacher: nn.Module) -> Dict[str, bool]:
+    """Return positive-only Stage-03 architecture and forward-contract gates."""
+    x = torch.linspace(-1, 1, 4 * 2 * 256, dtype=torch.float32).reshape(4, 2, 256)
+    with torch.inference_mode():
+        first, second = teacher(x), teacher(x)
+    norms = first["embedding_normalized"].norm(2, dim=1)
+    return {
+        "parameter_count_equivalent": sum(p.numel() for p in reference.parameters()) == sum(p.numel() for p in teacher.parameters()) == EXPECTED_PARAMETER_COUNT,
+        "architecture_signature_equivalent": architecture_signature(reference) == architecture_signature(teacher),
+        "ordered_state_dict_keys_equivalent": list(reference.state_dict()) == list(teacher.state_dict()),
+        "state_dict_tensor_shapes_equivalent": model_schema(reference) == model_schema(teacher),
+        "logits_shape": list(first["logits"].shape) == [4, 98],
+        "embedding_shape": list(first["embedding_normalized"].shape) == [4, 128],
+        "normalized_embedding": bool(torch.allclose(norms, torch.ones_like(norms), atol=2e-5, rtol=2e-5)),
+        "finite_outputs": all(torch.isfinite(value).all().item() for value in first.values()),
+        "deterministic_eval_forward": all(torch.equal(first[key], second[key]) for key in first),
+        "gradients_disabled": all(not value.requires_grad for value in first.values()),
+    }
+
+
 class StreamingMetrics:
     def __init__(self, classes: int = 98, bins: int = 15):
         self.classes, self.bins = classes, bins
@@ -844,21 +864,8 @@ class Stage3MPipeline:
         frozen = load_stage26_module(self.config.repository_root_path)
         reference = frozen.WiSigRepresentationNet(98, 128, 0.1).eval()
         teacher = WiSigRepresentationNet(98, 128, 0.1).eval()
-        x = torch.linspace(-1, 1, 4 * 2 * 256, dtype=torch.float32).reshape(4, 2, 256)
-        with torch.inference_mode():
-            first, second = teacher(x), teacher(x)
-        norms = first["embedding_normalized"].norm(2, dim=1)
-        checks = {
-            "parameter_count_equivalent": sum(p.numel() for p in reference.parameters()) == sum(p.numel() for p in teacher.parameters()) == EXPECTED_PARAMETER_COUNT,
-            "architecture_signature_equivalent": architecture_signature(reference) == architecture_signature(teacher) == self.stage26_status["architecture_signature"],
-            "ordered_state_dict_keys_equivalent": list(reference.state_dict()) == list(teacher.state_dict()),
-            "state_dict_tensor_shapes_equivalent": model_schema(reference) == model_schema(teacher),
-            "logits_shape": list(first["logits"].shape) == [4, 98], "embedding_shape": list(first["embedding_normalized"].shape) == [4, 128],
-            "normalized_embedding": bool(torch.allclose(norms, torch.ones_like(norms), atol=2e-5, rtol=2e-5)),
-            "finite_outputs": all(torch.isfinite(value).all().item() for value in first.values()),
-            "deterministic_eval_forward": all(torch.equal(first[key], second[key]) for key in first),
-            "gradient_required": False,
-        }
+        checks = teacher_architecture_checks(reference, teacher)
+        checks["architecture_signature_equivalent"] = checks["architecture_signature_equivalent"] and architecture_signature(teacher) == self.stage26_status["architecture_signature"]
         if not all(value is True for value in checks.values()):
             raise ScientificAbort(f"Teacher architecture/forward equivalence failed: {checks}")
         output = self.config.output_root / "manifests" / "TEACHER_ARCHITECTURE_EQUIVALENCE.json"

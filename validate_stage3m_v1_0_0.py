@@ -112,6 +112,10 @@ def test_architecture(module: Any, stage26: Any) -> None:
     assert first["logits"].shape == (4, 98) and first["embedding_normalized"].shape == (4, 128)
     assert torch.allclose(first["embedding_normalized"].norm(dim=1), torch.ones(4), atol=2e-5)
     assert all(torch.equal(first[key], second[key]) for key in first)
+    checks = module.teacher_architecture_checks(right, left)
+    assert checks["gradients_disabled"] is True
+    assert "gradient_required" not in checks
+    assert all(value is True for value in checks.values())
 
 
 def test_checkpoint_provenance(module: Any) -> None:
