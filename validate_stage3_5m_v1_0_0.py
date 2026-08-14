@@ -12,7 +12,6 @@ import logging
 import tempfile
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Callable, Dict, Mapping
 
 import numpy as np
@@ -162,22 +161,116 @@ def fake_config(root: Path) -> Any:
     class Config:
         output_root = root
         resume = True
+        energy_temperature = 1.0
+        config_sha = "config-sha"
         def configuration_sha256(self) -> str:
-            return "config-sha"
+            return self.config_sha
     return Config()
+
+
+def make_pipeline(module: Any, root: Path) -> Any:
+    pipeline = module.Stage35Pipeline.__new__(module.Stage35Pipeline)
+    pipeline.config = fake_config(root); pipeline.script_sha = "script-sha"; pipeline.guard = module.StrictZeroDayGuard()
+    return pipeline
+
+
+def write_score_store(
+    module: Any,
+    pipeline: Any,
+    partition: str,
+    indices: np.ndarray,
+    fit_sha: str,
+    strict: bool = False,
+    lock_sha: str | None = None,
+) -> Path:
+    indices = np.asarray(indices, dtype=np.int64)
+    rows, store = len(indices), pipeline.score_store(partition); store.mkdir(parents=True, exist_ok=True)
+    np.save(store / "scores.npy", np.zeros((rows, len(module.SCORER_ORDER)), dtype=np.float32), allow_pickle=False)
+    np.save(store / "predictions.npy", np.arange(rows, dtype=np.int16) % module.EXPECTED_CLASSES, allow_pickle=False)
+    np.save(store / "global_indices.npy", indices, allow_pickle=False)
+    required = ["scores.npy", "predictions.npy", "global_indices.npy"]
+    if not strict:
+        np.save(store / "labels.npy", np.arange(rows, dtype=np.int16) % module.EXPECTED_CLASSES, allow_pickle=False)
+        np.save(store / "known_correct.npy", np.ones(rows, dtype=bool), allow_pickle=False)
+        required.extend(["labels.npy", "known_correct.npy"])
+    payload = {
+        "complete": True, "pipeline_version": module.PIPELINE_VERSION,
+        "executable_sha256": pipeline.script_sha, "configuration_sha256": pipeline.config.configuration_sha256(),
+        "benchmark_sha256": module.EXPECTED_BENCHMARK_SHA256, "teacher_sha256": module.EXPECTED_TEACHER_SHA256,
+        "fit_sha256": fit_sha, "scorer_order": list(module.SCORER_ORDER),
+        "scorer_definitions_sha256": module.sha256_object(module.SCORER_DEFINITIONS),
+        "energy_temperature": pipeline.config.energy_temperature, "partition": partition, "rows": rows,
+        "strict": strict, "global_indices_sha256": module.sha256_int64_array(indices),
+        "files": {name: {"sha256": sha256_file(store / name), "bytes": (store / name).stat().st_size} for name in required},
+    }
+    if strict:
+        payload["evaluation_lock_sha256"] = lock_sha
+    (store / "store_manifest.json").write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    return store
+
+
+def prepare_lock_fixture(module: Any, root: Path) -> Any:
+    for directory in (root / "manifests", root / "thresholds", root / "scores/fitted"):
+        directory.mkdir(parents=True, exist_ok=True)
+    pipeline = make_pipeline(module, root)
+    (root / "scores/fitted/known_only_scorer_state.npz").write_bytes(b"fit")
+    (root / "thresholds/ZD_STRICT_THRESHOLDS.json").write_text("{}", encoding="utf-8")
+    (root / "manifests/SCORER_POLICY_FREEZE.json").write_text("{}", encoding="utf-8")
+    (root / "manifests/STAGE02_TEACHER_PARTITION_EXPOSURE_AUDIT.json").write_text("{}", encoding="utf-8")
+    (root / "manifests/STAGE3M_STAGE35_INFERENCE_EQUIVALENCE.json").write_text(json.dumps({
+        "status": "PASS", "teacher_seed": module.EXPECTED_TEACHER_SEED,
+        "teacher_sha256": module.EXPECTED_TEACHER_SHA256, "strict_data_accessed": False,
+    }), encoding="utf-8")
+    fit_sha = sha256_file(pipeline.fit_path())
+    for position, partition in enumerate(module.KNOWN_VALIDATION):
+        write_score_store(module, pipeline, partition, np.arange(4, dtype=np.int64) + position * 10, fit_sha)
+    pipeline.write_known_score_bundle(); pipeline.write_or_verify_lock()
+    assert pipeline.lock_current()
+    return pipeline
 
 
 def test_evaluation_lock(module: Any) -> None:
     with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary) / "05_zero_day_open_set"; (root / "manifests").mkdir(parents=True); (root / "thresholds").mkdir(); (root / "scores/fitted").mkdir(parents=True)
-        pipeline = module.Stage35Pipeline.__new__(module.Stage35Pipeline); pipeline.config = fake_config(root); pipeline.script_sha = "script-sha"; pipeline.guard = module.StrictZeroDayGuard()
-        (root / "scores/fitted/known_only_scorer_state.npz").write_bytes(b"fit")
-        (root / "thresholds/ZD_STRICT_THRESHOLDS.json").write_text("{}", encoding="utf-8")
-        (root / "manifests/SCORER_POLICY_FREEZE.json").write_text("{}", encoding="utf-8")
-        digest = pipeline.write_or_verify_lock(); assert len(digest) == 64 and pipeline.lock_current()
+        root = Path(temporary) / "05_zero_day_open_set"; pipeline = prepare_lock_fixture(module, root)
         pipeline.guard.activate_final_lock(8, True)
         expect_abort(module, pipeline.guard.assert_fitting_allowed)
-        lock = pipeline.lock_paths()[0]; lock.write_text("{}", encoding="utf-8"); assert not pipeline.lock_current()
+        lock, sidecar = pipeline.lock_paths(); lock.write_text("{}", encoding="utf-8"); sidecar.write_text(sha256_file(lock), encoding="utf-8")
+        assert not pipeline.lock_current()
+
+
+def test_lock_mutation_matrix(module: Any) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "05_zero_day_open_set"; pipeline = prepare_lock_fixture(module, root)
+        lock, sidecar = pipeline.lock_paths(); original_lock = lock.read_bytes(); original_sidecar = sidecar.read_bytes()
+        bound_files = [
+            pipeline.fit_path(), root / "thresholds/ZD_STRICT_THRESHOLDS.json",
+            root / "manifests/SCORER_POLICY_FREEZE.json", pipeline.known_bundle_path(),
+            pipeline.inference_equivalence_path(), root / "manifests/STAGE02_TEACHER_PARTITION_EXPOSURE_AUDIT.json",
+        ]
+        for path in bound_files:
+            original = path.read_bytes(); path.write_bytes(original + b"mutation"); assert not pipeline.lock_current(), path
+            path.write_bytes(original); assert pipeline.lock_current(), path
+        def mutate_lock(operation: Callable[[Dict[str, Any]], None]) -> None:
+            payload = json.loads(original_lock); operation(payload); lock.write_text(json.dumps(payload), encoding="utf-8")
+            sidecar.write_text(sha256_file(lock), encoding="utf-8"); assert not pipeline.lock_current()
+            lock.write_bytes(original_lock); sidecar.write_bytes(original_sidecar); assert pipeline.lock_current()
+        mutate_lock(lambda p: p["strict_violation_counters_at_lock"].pop(module.STRICT_COUNTER_KEYS[0]))
+        mutate_lock(lambda p: p["strict_violation_counters_at_lock"].__setitem__(module.STRICT_COUNTER_KEYS[0], 1))
+        mutate_lock(lambda p: p.__setitem__("post_lock_fitting_permitted", True))
+        mutate_lock(lambda p: p.__setitem__("post_lock_calibration_permitted", True))
+        pipeline.script_sha = "mutated-script"; assert not pipeline.lock_current(); pipeline.script_sha = "script-sha"; assert pipeline.lock_current()
+        pipeline.config.config_sha = "mutated-config"; assert not pipeline.lock_current(); pipeline.config.config_sha = "config-sha"; assert pipeline.lock_current()
+
+
+def test_known_bundle_mutation_matrix(module: Any) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "05_zero_day_open_set"; pipeline = prepare_lock_fixture(module, root)
+        for partition in module.KNOWN_VALIDATION:
+            store = pipeline.score_store(partition)
+            for name in ("scores.npy", "predictions.npy", "labels.npy", "known_correct.npy", "global_indices.npy", "store_manifest.json"):
+                path = store / name; original = path.read_bytes(); path.write_bytes(original + b"mutation")
+                assert not pipeline.known_score_bundle_current() and not pipeline.lock_current(), (partition, name)
+                path.write_bytes(original); assert pipeline.known_score_bundle_current() and pipeline.lock_current(), (partition, name)
 
 
 def test_protocol_separation(module: Any) -> None:
@@ -209,15 +302,51 @@ def test_resume_hash_invalidation(module: Any) -> None:
 
 def test_incomplete_score_store(module: Any) -> None:
     with tempfile.TemporaryDirectory() as temporary:
-        root = Path(temporary) / "05_zero_day_open_set"; store = root / "scores/p0"; store.mkdir(parents=True)
-        pipeline = module.Stage35Pipeline.__new__(module.Stage35Pipeline); pipeline.config = SimpleNamespace(output_root=root)
-        rows, fit_sha = 3, "fit"
-        np.save(store / "scores.npy", np.zeros((rows, 5), dtype=np.float32)); np.save(store / "predictions.npy", np.zeros(rows)); np.save(store / "labels.npy", np.zeros(rows)); np.save(store / "known_correct.npy", np.ones(rows)); np.save(store / "global_indices.npy", np.arange(rows))
-        names = ("scores.npy", "predictions.npy", "labels.npy", "known_correct.npy", "global_indices.npy")
-        files = {name: {"sha256": sha256_file(store / name), "bytes": (store / name).stat().st_size} for name in names}
-        (store / "store_manifest.json").write_text(json.dumps({"complete": True, "partition": "p0", "rows": rows, "fit_sha256": fit_sha, "teacher_sha256": module.EXPECTED_TEACHER_SHA256, "strict": False, "scorer_order": list(module.SCORER_ORDER), "files": files}), encoding="utf-8")
-        (store / "INCOMPLETE").write_text("partial", encoding="utf-8"); assert not pipeline.score_store_current("p0", rows, fit_sha)
-        (store / "INCOMPLETE").unlink(); assert pipeline.score_store_current("p0", rows, fit_sha)
+        root = Path(temporary) / "05_zero_day_open_set"; pipeline = make_pipeline(module, root); indices = np.arange(3, dtype=np.int64)
+        store = write_score_store(module, pipeline, "p0", indices, "fit")
+        (store / "INCOMPLETE").write_text("partial", encoding="utf-8")
+        assert not pipeline.score_store_current("p0", len(indices), "fit", indices)
+        (store / "INCOMPLETE").unlink(); assert pipeline.score_store_current("p0", len(indices), "fit", indices)
+
+
+def test_score_store_provenance_matrix(module: Any) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary) / "05_zero_day_open_set"; pipeline = make_pipeline(module, root)
+        indices = np.asarray([5, 9, 12], dtype=np.int64); store = write_score_store(module, pipeline, "p0", indices, "fit")
+        assert pipeline.score_store_current("p0", 3, "fit", indices)
+        manifest = store / "store_manifest.json"; original_manifest = manifest.read_bytes()
+        for field, value in (
+            ("teacher_sha256", "mutated"), ("fit_sha256", "mutated"),
+            ("scorer_definitions_sha256", "mutated"), ("energy_temperature", 2.0),
+            ("benchmark_sha256", "mutated"), ("pipeline_version", "mutated"),
+        ):
+            payload = json.loads(original_manifest); payload[field] = value; manifest.write_text(json.dumps(payload), encoding="utf-8")
+            assert not pipeline.score_store_current("p0", 3, "fit", indices), field
+            manifest.write_bytes(original_manifest)
+        pipeline.script_sha = "mutated"; assert not pipeline.score_store_current("p0", 3, "fit", indices); pipeline.script_sha = "script-sha"
+        pipeline.config.config_sha = "mutated"; assert not pipeline.score_store_current("p0", 3, "fit", indices); pipeline.config.config_sha = "config-sha"
+        assert not pipeline.score_store_current("p0", 3, "fit", np.asarray([5, 9, 13], dtype=np.int64))
+        original_indices = (store / "global_indices.npy").read_bytes(); np.save(store / "global_indices.npy", np.asarray([5, 9, 13], dtype=np.int64), allow_pickle=False)
+        assert not pipeline.score_store_current("p0", 3, "fit", indices); (store / "global_indices.npy").write_bytes(original_indices)
+        lock_sha = "lock-sha"; strict_indices = np.asarray([100, 101], dtype=np.int64)
+        strict_store = write_score_store(module, pipeline, "strict_zero_day", strict_indices, "fit", True, lock_sha)
+        assert pipeline.score_store_current("strict_zero_day", 2, "fit", strict_indices, True, lock_sha)
+        assert not pipeline.score_store_current("strict_zero_day", 2, "fit", strict_indices, True, "other-lock")
+        assert not pipeline.score_store_current("strict_zero_day", 2, "fit", np.asarray([100, 102]), True, lock_sha)
+        scores = strict_store / "scores.npy"; original_scores = scores.read_bytes(); scores.write_bytes(original_scores + b"mutation")
+        assert not pipeline.score_store_current("strict_zero_day", 2, "fit", strict_indices, True, lock_sha)
+
+
+def test_inference_equivalence_matrix(module: Any) -> None:
+    indices = np.asarray([10, 20, 30], dtype=np.int64); labels = np.asarray([0, 1, 2], dtype=np.int64); predictions = np.asarray([0, 1, 1], dtype=np.int64)
+    arguments = ["p0", indices, labels, predictions, indices.copy(), labels.copy(), predictions.copy(), 2 / 3, 0.5, 2 / 3, 0.5]
+    assert module.compare_inference_evidence(*arguments)["status"] == "PASS"
+    for position, mutation in (
+        (4, np.asarray([10, 20, 31])), (5, np.asarray([0, 1, 3])), (6, np.asarray([0, 1, 2])),
+    ):
+        changed = list(arguments); changed[position] = mutation; assert module.compare_inference_evidence(*changed)["status"] == "FAIL"
+    changed = list(arguments); changed[9] += 1e-4; assert module.compare_inference_evidence(*changed)["status"] == "FAIL"
+    changed = list(arguments); changed[10] += 1e-4; assert module.compare_inference_evidence(*changed)["status"] == "FAIL"
 
 
 def test_preflight_scope(module: Any) -> None:
@@ -245,6 +374,10 @@ def test_final_transaction_source(module: Any) -> None:
     stage11 = source[source.index("    def stage_11"):source.index("    def run", source.index("    def stage_11"))]
     assert stage11.index("atomic_json(final_status") < stage11.index("atomic_json(manifest") < stage11.index("atomic_text(ready") < stage11.index("self.complete_stage(11")
     assert "final_hash_manifest_current" in stage11 and "self.stage_current(11)" in stage11
+    for stage_name in ("stage_09", "stage_10", "stage_11"):
+        start = source.index(f"    def {stage_name}"); end = source.find("\n    def ", start + 8)
+        stage_source = source[start:end if end >= 0 else None]
+        assert "known_score_bundle_current" in stage_source and "strict_score_bundle_current" in stage_source
 
 
 def main() -> int:
@@ -260,10 +393,14 @@ def main() -> int:
         "known_only_thresholds": lambda: test_threshold_known_only(module),
         "open_set_metrics_and_oscr": lambda: test_open_set_metrics(module),
         "final_evaluation_lock": lambda: test_evaluation_lock(module),
+        "lock_mutation_matrix": lambda: test_lock_mutation_matrix(module),
+        "known_bundle_mutation_matrix": lambda: test_known_bundle_mutation_matrix(module),
         "zd_protocol_separation": lambda: test_protocol_separation(module),
         "teacher_immutability": lambda: test_teacher_immutability(module),
         "resume_hash_invalidation": lambda: test_resume_hash_invalidation(module),
         "incomplete_score_store": lambda: test_incomplete_score_store(module),
+        "score_store_provenance_matrix": lambda: test_score_store_provenance_matrix(module),
+        "stage3m_stage35_inference_equivalence": lambda: test_inference_equivalence_matrix(module),
         "preflight_scope": lambda: test_preflight_scope(module),
         "logging_regression": test_logging_regression,
         "stage11_transaction_order": lambda: test_final_transaction_source(module),

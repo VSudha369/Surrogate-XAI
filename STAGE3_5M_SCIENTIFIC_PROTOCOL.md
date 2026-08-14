@@ -24,9 +24,9 @@ S2-S4 are fit only from frozen-teacher Train Known embeddings. No gradient, opti
 
 ## Final strict transaction
 
-Stages 01-07 cannot open strict index arrays or signals. Immediately before Stage 08, the pipeline writes and verifies `STRICT_ZERO_DAY_EVALUATION_LOCK.json`, binding the teacher, scorer state, threshold manifest, policy, executable, configuration, benchmark, and predecessor hashes. The guard then permanently disables fitting and calibration. Stage 08 verifies sealed strict-index hashes and reads strict signals exactly for the final evaluation. Frozen partition membership supplies the binary unknown semantic; transmitter labels are not loaded.
+Stages 01-07 cannot open strict index arrays or signals. Stage 04 first proves Stage 3M→Stage 3.5M known-inference equivalence for P0-P3 using exact global-index, label, and prediction identity when frozen primitive arrays are available, plus scalar accuracy and fixed-98 macro-F1 agreement. Stage 07 freezes a recursively verified `PRE_STRICT_KNOWN_SCORE_BUNDLE.json` covering every known score-store file, the threshold manifest, and scorer policy. Immediately before Stage 08, the pipeline writes and verifies `STRICT_ZERO_DAY_EVALUATION_LOCK.json`, binding those products together with the teacher, scorer state, executable, configuration, benchmark, predecessor hashes, exact zero-valued violation-counter keyset, and disabled post-lock fitting/calibration flags. The guard then permanently disables fitting and calibration. Stage 08 verifies sealed strict-index hashes, reads strict signals exactly for the final evaluation, and freezes a lock-bound `FINAL_STRICT_SCORE_BUNDLE.json`. Frozen partition membership supplies the binary unknown semantic; transmitter labels are not loaded.
 
-Violation counters independently cover signal, label, embedding, metric, threshold, and fit access. All are violation counters and must remain zero. Stage 11 writes READY only after every stage and final hash manifest are current.
+Violation counters independently cover signal, label, embedding, metric, threshold, and fit access. All are violation counters and must remain zero. Stages 09-11 refuse to proceed unless both score bundles and the evaluation lock remain recursively hash-current. Stage 11 writes READY only after every stage and final hash manifest are current.
 
 ## Metrics
 

@@ -99,6 +99,9 @@ FINAL_REQUIRED = (
     "manifests/STRICT_ZERO_DAY_EVALUATION_LOCK.json",
     "manifests/STRICT_ZERO_DAY_EVALUATION_LOCK.sha256",
     "manifests/SCORER_POLICY_FREEZE.json",
+    "manifests/PRE_STRICT_KNOWN_SCORE_BUNDLE.json",
+    "manifests/FINAL_STRICT_SCORE_BUNDLE.json",
+    "manifests/STAGE3M_STAGE35_INFERENCE_EQUIVALENCE.json",
     "thresholds/ZD_STRICT_THRESHOLDS.json",
     "tables/strict_open_set_metrics.csv",
     "statistics/strict_bootstrap_confidence_intervals.csv",
@@ -127,6 +130,11 @@ def sha256_file(path: Path) -> str:
 def sha256_object(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def sha256_int64_array(values: np.ndarray) -> str:
+    array = np.ascontiguousarray(np.asarray(values, dtype=np.int64).reshape(-1))
+    return hashlib.sha256(array.tobytes()).hexdigest()
 
 
 def parse_ready_marker(path: Path) -> Dict[str, str]:
@@ -523,6 +531,45 @@ def open_set_metrics(known_scores: np.ndarray, known_correct: np.ndarray, unknow
     }
 
 
+def compare_inference_evidence(
+    protocol: str,
+    stage3_indices: np.ndarray,
+    stage3_labels: np.ndarray,
+    stage3_predictions: np.ndarray,
+    stage35_indices: np.ndarray,
+    stage35_labels: np.ndarray,
+    stage35_predictions: np.ndarray,
+    stage3_accuracy: float,
+    stage3_fixed98_macro_f1: float,
+    stage35_accuracy: float,
+    stage35_fixed98_macro_f1: float,
+    tolerance: float = 1e-10,
+) -> Dict[str, Any]:
+    reference_indices = np.asarray(stage3_indices, dtype=np.int64)
+    reference_labels = np.asarray(stage3_labels, dtype=np.int64)
+    reference_predictions = np.asarray(stage3_predictions, dtype=np.int64)
+    measured_indices = np.asarray(stage35_indices, dtype=np.int64)
+    measured_labels = np.asarray(stage35_labels, dtype=np.int64)
+    measured_predictions = np.asarray(stage35_predictions, dtype=np.int64)
+    result: Dict[str, Any] = {
+        "protocol": protocol, "rows": int(len(measured_indices)),
+        "global_indices_equivalent": bool(np.array_equal(reference_indices, measured_indices)),
+        "labels_equivalent": bool(np.array_equal(reference_labels, measured_labels)),
+        "predictions_equivalent": bool(np.array_equal(reference_predictions, measured_predictions)),
+        "stage3_accuracy": float(stage3_accuracy), "stage35_accuracy": float(stage35_accuracy),
+        "accuracy_delta": float(stage35_accuracy - stage3_accuracy),
+        "stage3_fixed98_macro_f1": float(stage3_fixed98_macro_f1),
+        "stage35_fixed98_macro_f1": float(stage35_fixed98_macro_f1),
+        "fixed98_macro_f1_delta": float(stage35_fixed98_macro_f1 - stage3_fixed98_macro_f1),
+        "metric_tolerance": tolerance,
+    }
+    result["status"] = "PASS" if (
+        result["global_indices_equivalent"] and result["labels_equivalent"] and result["predictions_equivalent"]
+        and abs(result["accuracy_delta"]) <= tolerance and abs(result["fixed98_macro_f1_delta"]) <= tolerance
+    ) else "FAIL"
+    return result
+
+
 def final_hash_manifest_current(output_root: Path) -> bool:
     path = output_root / "manifests" / "STAGE3_5M_HASH_MANIFEST.json"
     if not path.is_file():
@@ -764,7 +811,15 @@ class Stage35Pipeline:
     def score_store(self, partition: str) -> Path:
         return self.config.output_root / "scores" / partition
 
-    def score_store_current(self, partition: str, rows: int, fit_sha: str, strict: bool = False) -> bool:
+    def score_store_current(
+        self,
+        partition: str,
+        rows: int,
+        fit_sha: str,
+        expected_indices: np.ndarray,
+        strict: bool = False,
+        expected_lock_sha: Optional[str] = None,
+    ) -> bool:
         store = self.score_store(partition)
         manifest = store / "store_manifest.json"
         required = ("scores.npy", "predictions.npy", "global_indices.npy") if strict else ("scores.npy", "predictions.npy", "labels.npy", "known_correct.npy", "global_indices.npy")
@@ -772,14 +827,33 @@ class Stage35Pipeline:
             return False
         try:
             payload = json.loads(manifest.read_text(encoding="utf-8"))
-            if payload.get("complete") is not True or payload.get("partition") != partition or int(payload.get("rows", -1)) != rows or payload.get("fit_sha256") != fit_sha or payload.get("teacher_sha256") != EXPECTED_TEACHER_SHA256:
+            expected_fields = {
+                "pipeline_version": PIPELINE_VERSION,
+                "executable_sha256": self.script_sha,
+                "configuration_sha256": self.config.configuration_sha256(),
+                "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+                "teacher_sha256": EXPECTED_TEACHER_SHA256,
+                "fit_sha256": fit_sha,
+                "scorer_order": list(SCORER_ORDER),
+                "scorer_definitions_sha256": sha256_object(SCORER_DEFINITIONS),
+                "energy_temperature": self.config.energy_temperature,
+                "partition": partition,
+                "rows": rows,
+                "strict": strict,
+                "global_indices_sha256": sha256_int64_array(expected_indices),
+            }
+            if payload.get("complete") is not True or any(payload.get(key) != value for key, value in expected_fields.items()):
                 return False
-            if bool(payload.get("strict")) != strict or payload.get("scorer_order") != list(SCORER_ORDER):
+            if strict and (not expected_lock_sha or payload.get("evaluation_lock_sha256") != expected_lock_sha):
                 return False
             shapes = {"scores.npy": (rows, len(SCORER_ORDER)), "predictions.npy": (rows,), "global_indices.npy": (rows,)}
             if not strict:
                 shapes.update({"labels.npy": (rows,), "known_correct.npy": (rows,)})
             if not all(tuple(np.load(store / name, mmap_mode="r").shape) == shape for name, shape in shapes.items()):
+                return False
+            stored_indices = np.asarray(np.load(store / "global_indices.npy", mmap_mode="r"), dtype=np.int64)
+            expected_indices_array = np.asarray(expected_indices, dtype=np.int64).reshape(-1)
+            if not np.array_equal(stored_indices, expected_indices_array):
                 return False
             declared = payload.get("files", {})
             return set(declared) == set(required) and all(
@@ -794,7 +868,8 @@ class Stage35Pipeline:
         benchmark, model, fit = self.ensure_benchmark(), self.ensure_teacher(), self.load_fit()
         rows, fit_sha = len(benchmark.partitions[partition].indices), sha256_file(self.fit_path())
         store = self.score_store(partition)
-        if self.score_store_current(partition, rows, fit_sha, strict=False):
+        expected_indices = np.asarray(benchmark.partitions[partition].indices, dtype=np.int64)
+        if self.score_store_current(partition, rows, fit_sha, expected_indices, strict=False):
             return store
         store.mkdir(parents=True, exist_ok=True)
         atomic_text(store / "INCOMPLETE", utc_now() + "\n", self.config.output_root)
@@ -826,8 +901,12 @@ class Stage35Pipeline:
         np.save(store / "global_indices.npy", metadata.indices.astype(np.int64), allow_pickle=False)
         store_files = ("scores.npy", "predictions.npy", "labels.npy", "known_correct.npy", "global_indices.npy")
         atomic_json(store / "store_manifest.json", {
-            "complete": True, "partition": partition, "rows": rows, "strict": False,
-            "teacher_sha256": EXPECTED_TEACHER_SHA256, "fit_sha256": fit_sha, "scorer_order": list(SCORER_ORDER),
+            "complete": True, "pipeline_version": PIPELINE_VERSION, "executable_sha256": self.script_sha,
+            "configuration_sha256": self.config.configuration_sha256(), "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+            "partition": partition, "rows": rows, "strict": False, "teacher_sha256": EXPECTED_TEACHER_SHA256,
+            "fit_sha256": fit_sha, "scorer_order": list(SCORER_ORDER),
+            "scorer_definitions_sha256": sha256_object(SCORER_DEFINITIONS), "energy_temperature": self.config.energy_temperature,
+            "global_indices_sha256": sha256_int64_array(metadata.indices),
             "labels_semantics": "KNOWN_CLASS_0_TO_97" if partition != "calibration_unknown" else "CALIBRATION_UNKNOWN_MINUS_ONE",
             "files": {name: {"sha256": sha256_file(store / name), "bytes": (store / name).stat().st_size} for name in store_files},
             "generated_at": utc_now(),
@@ -865,6 +944,273 @@ class Stage35Pipeline:
             }
         return evidence
 
+    @staticmethod
+    def _file_evidence(path: Path) -> Dict[str, Any]:
+        return {"path": str(path.resolve()), "sha256": sha256_file(path), "bytes": path.stat().st_size}
+
+    def known_bundle_path(self) -> Path:
+        return self.config.output_root / "manifests" / "PRE_STRICT_KNOWN_SCORE_BUNDLE.json"
+
+    def inference_equivalence_path(self) -> Path:
+        return self.config.output_root / "manifests" / "STAGE3M_STAGE35_INFERENCE_EQUIVALENCE.json"
+
+    def write_inference_equivalence(self) -> Tuple[Path, List[Path]]:
+        stage3_table = self.config.stage3m_path / "tables" / "teacher_candidate_known_metrics.csv"
+        if not stage3_table.is_file():
+            raise ScientificAbort("Frozen Stage 3M known-metric table is missing")
+        reference_table = pd.read_csv(stage3_table)
+        stage35_table = pd.read_csv(self.config.output_root / "tables" / "closed_set_teacher_metrics.csv").set_index("partition")
+        tolerance = 1e-10
+        rows: List[Dict[str, Any]] = []
+        inputs: List[Path] = [stage3_table, self.config.output_root / "tables" / "closed_set_teacher_metrics.csv"]
+        overall_pass = True
+        for protocol in KNOWN_VALIDATION:
+            stage35_store = self.score_store(protocol)
+            stage35_indices = np.asarray(np.load(stage35_store / "global_indices.npy", mmap_mode="r"), dtype=np.int64)
+            stage35_labels = np.asarray(np.load(stage35_store / "labels.npy", mmap_mode="r"), dtype=np.int64)
+            stage35_predictions = np.asarray(np.load(stage35_store / "predictions.npy", mmap_mode="r"), dtype=np.int64)
+            stage3_store = self.config.stage3m_path / "embeddings" / f"seed_{EXPECTED_TEACHER_SEED}" / protocol
+            primitives = {
+                "global_indices": stage3_store / "global_indices.npy",
+                "labels": stage3_store / "labels.npy",
+                "logits": stage3_store / "logits.npy",
+            }
+            availability = {name: path.is_file() for name, path in primitives.items()}
+            scalar_reference = reference_table[(reference_table.seed == EXPECTED_TEACHER_SEED) & (reference_table.protocol == protocol)]
+            if len(scalar_reference) != 1:
+                raise ScientificAbort(f"Frozen Stage 3M scalar evidence is not unique: {protocol}")
+            scalar = scalar_reference.iloc[0]
+            stage35_scalar = stage35_table.loc[protocol]
+            scalar_values = {
+                "stage3_accuracy": float(scalar.accuracy), "stage35_accuracy": float(stage35_scalar.accuracy),
+                "stage3_fixed98_macro_f1": float(scalar.fixed98_macro_f1),
+                "stage35_fixed98_macro_f1": float(stage35_scalar.fixed98_macro_f1),
+            }
+            metrics_equal = abs(scalar_values["stage35_accuracy"] - scalar_values["stage3_accuracy"]) <= tolerance and abs(
+                scalar_values["stage35_fixed98_macro_f1"] - scalar_values["stage3_fixed98_macro_f1"]
+            ) <= tolerance
+            if all(availability.values()):
+                inputs.extend(primitives.values())
+                stage3_indices = np.asarray(np.load(primitives["global_indices"], mmap_mode="r"), dtype=np.int64)
+                stage3_labels = np.asarray(np.load(primitives["labels"], mmap_mode="r"), dtype=np.int64)
+                stage3_logits = np.asarray(np.load(primitives["logits"], mmap_mode="r"), dtype=np.float32)
+                stage3_predictions = stage3_logits.argmax(axis=1).astype(np.int64)
+                result = compare_inference_evidence(
+                    protocol, stage3_indices, stage3_labels, stage3_predictions,
+                    stage35_indices, stage35_labels, stage35_predictions,
+                    scalar_values["stage3_accuracy"], scalar_values["stage3_fixed98_macro_f1"],
+                    scalar_values["stage35_accuracy"], scalar_values["stage35_fixed98_macro_f1"], tolerance,
+                )
+                primitive_accuracy = float(np.mean(stage3_predictions == stage3_labels))
+                primitive_f1 = float(f1_score(stage3_labels, stage3_predictions, labels=np.arange(EXPECTED_CLASSES), average="macro", zero_division=0))
+                result.update({
+                    "primitive_availability": availability,
+                    "stage3_primitive_accuracy": primitive_accuracy,
+                    "stage3_primitive_fixed98_macro_f1": primitive_f1,
+                })
+                if abs(primitive_accuracy - scalar_values["stage3_accuracy"]) > tolerance or abs(primitive_f1 - scalar_values["stage3_fixed98_macro_f1"]) > tolerance:
+                    result["status"] = "FAIL"
+            else:
+                result = {
+                    "protocol": protocol, "rows": int(len(stage35_indices)), "primitive_availability": availability,
+                    **scalar_values,
+                    "accuracy_delta": scalar_values["stage35_accuracy"] - scalar_values["stage3_accuracy"],
+                    "fixed98_macro_f1_delta": scalar_values["stage35_fixed98_macro_f1"] - scalar_values["stage3_fixed98_macro_f1"],
+                    "metric_tolerance": tolerance,
+                }
+                for name, available in availability.items():
+                    result[f"{name}_equivalent"] = "NOT_AVAILABLE_IN_FROZEN_STAGE3M" if not available else "AVAILABLE_BUT_INCOMPLETE_PRIMITIVE_SET"
+                result["status"] = "PASS_LIMITED_TO_FROZEN_SCALAR_EVIDENCE" if metrics_equal else "FAIL"
+            overall_pass = overall_pass and result["status"].startswith("PASS")
+            rows.append(result)
+        output = self.inference_equivalence_path()
+        atomic_json(output, {
+            "status": "PASS" if overall_pass else "FAIL", "teacher_seed": EXPECTED_TEACHER_SEED,
+            "teacher_sha256": EXPECTED_TEACHER_SHA256, "known_only": True, "strict_data_accessed": False,
+            "protocols": rows, "generated_at": utc_now(),
+        }, self.config.output_root)
+        if not overall_pass:
+            raise ScientificAbort(f"Stage 3M to Stage 3.5M inference equivalence failed: {rows}")
+        return output, inputs
+
+    def inference_equivalence_current(self, expected_sha: Optional[str] = None) -> bool:
+        path = self.inference_equivalence_path()
+        if not path.is_file() or (expected_sha is not None and sha256_file(path) != expected_sha):
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return payload.get("status") == "PASS" and payload.get("teacher_seed") == EXPECTED_TEACHER_SEED and payload.get("teacher_sha256") == EXPECTED_TEACHER_SHA256 and payload.get("strict_data_accessed") is False
+        except (OSError, json.JSONDecodeError):
+            return False
+
+    def write_known_score_bundle(self) -> Path:
+        partitions: Dict[str, Any] = {}
+        fit_sha = sha256_file(self.fit_path())
+        for partition in KNOWN_VALIDATION:
+            store = self.score_store(partition)
+            indices = np.asarray(np.load(store / "global_indices.npy", mmap_mode="r"), dtype=np.int64)
+            if not self.score_store_current(partition, len(indices), fit_sha, indices, strict=False):
+                raise ScientificAbort(f"Cannot freeze stale known score store: {partition}")
+            names = ("scores.npy", "predictions.npy", "labels.npy", "known_correct.npy", "global_indices.npy", "store_manifest.json")
+            partitions[partition] = {
+                "partition": partition, "rows": len(indices),
+                "store_manifest_sha256": sha256_file(store / "store_manifest.json"),
+                "scores_sha256": sha256_file(store / "scores.npy"),
+                "predictions_sha256": sha256_file(store / "predictions.npy"),
+                "labels_sha256": sha256_file(store / "labels.npy"),
+                "known_correct_sha256": sha256_file(store / "known_correct.npy"),
+                "global_indices_sha256": sha256_file(store / "global_indices.npy"),
+                "global_index_values_sha256": sha256_int64_array(indices),
+                "teacher_sha256": EXPECTED_TEACHER_SHA256, "fit_sha256": fit_sha,
+                "configuration_sha256": self.config.configuration_sha256(), "executable_sha256": self.script_sha,
+                "files": {name: self._file_evidence(store / name) for name in names},
+            }
+        threshold_path = self.config.output_root / "thresholds" / "ZD_STRICT_THRESHOLDS.json"
+        policy_path = self.config.output_root / "manifests" / "SCORER_POLICY_FREEZE.json"
+        payload: Dict[str, Any] = {
+            "status": "FROZEN_BEFORE_STRICT_EVALUATION", "pipeline_version": PIPELINE_VERSION,
+            "benchmark_sha256": EXPECTED_BENCHMARK_SHA256, "teacher_sha256": EXPECTED_TEACHER_SHA256,
+            "scorer_fit_sha256": fit_sha, "zd_strict_thresholds_sha256": sha256_file(threshold_path),
+            "scorer_policy_freeze_sha256": sha256_file(policy_path),
+            "scorer_definitions_sha256": sha256_object(SCORER_DEFINITIONS),
+            "configuration_sha256": self.config.configuration_sha256(), "executable_sha256": self.script_sha,
+            "partitions": partitions, "strict_data_accessed": False, "generated_at": utc_now(),
+        }
+        canonical = dict(payload); canonical.pop("generated_at")
+        payload["canonical_content_sha256"] = sha256_object(canonical)
+        output = self.known_bundle_path(); atomic_json(output, payload, self.config.output_root)
+        if not self.known_score_bundle_current(sha256_file(output)):
+            raise ScientificAbort("Pre-strict known-score bundle failed immediate verification")
+        return output
+
+    def known_score_bundle_current(self, expected_sha: Optional[str] = None) -> bool:
+        path = self.known_bundle_path()
+        if not path.is_file() or (expected_sha is not None and sha256_file(path) != expected_sha):
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            expected = {
+                "status": "FROZEN_BEFORE_STRICT_EVALUATION", "pipeline_version": PIPELINE_VERSION,
+                "benchmark_sha256": EXPECTED_BENCHMARK_SHA256, "teacher_sha256": EXPECTED_TEACHER_SHA256,
+                "scorer_fit_sha256": sha256_file(self.fit_path()),
+                "zd_strict_thresholds_sha256": sha256_file(self.config.output_root / "thresholds" / "ZD_STRICT_THRESHOLDS.json"),
+                "scorer_policy_freeze_sha256": sha256_file(self.config.output_root / "manifests" / "SCORER_POLICY_FREEZE.json"),
+                "scorer_definitions_sha256": sha256_object(SCORER_DEFINITIONS),
+                "configuration_sha256": self.config.configuration_sha256(), "executable_sha256": self.script_sha,
+                "strict_data_accessed": False,
+            }
+            if any(payload.get(key) != value for key, value in expected.items()) or set(payload.get("partitions", {})) != set(KNOWN_VALIDATION):
+                return False
+            canonical = dict(payload); canonical.pop("canonical_content_sha256", None); canonical.pop("generated_at", None)
+            if payload.get("canonical_content_sha256") != sha256_object(canonical):
+                return False
+            for partition, record in payload["partitions"].items():
+                if record.get("partition") != partition or record.get("teacher_sha256") != EXPECTED_TEACHER_SHA256 or record.get("fit_sha256") != expected["scorer_fit_sha256"] or record.get("configuration_sha256") != self.config.configuration_sha256() or record.get("executable_sha256") != self.script_sha:
+                    return False
+                files = record.get("files", {})
+                required = {"scores.npy", "predictions.npy", "labels.npy", "known_correct.npy", "global_indices.npy", "store_manifest.json"}
+                if set(files) != required:
+                    return False
+                for name, evidence in files.items():
+                    artifact = Path(evidence["path"])
+                    if not artifact.is_file() or artifact.stat().st_size != int(evidence["bytes"]) or sha256_file(artifact) != evidence["sha256"]:
+                        return False
+                if any(record.get(key) != files[name]["sha256"] for key, name in {
+                    "store_manifest_sha256": "store_manifest.json", "scores_sha256": "scores.npy",
+                    "predictions_sha256": "predictions.npy", "labels_sha256": "labels.npy",
+                    "known_correct_sha256": "known_correct.npy", "global_indices_sha256": "global_indices.npy",
+                }.items()):
+                    return False
+                indices = np.asarray(np.load(Path(files["global_indices.npy"]["path"]), mmap_mode="r"), dtype=np.int64)
+                if len(indices) != int(record.get("rows", -1)) or record.get("global_index_values_sha256") != sha256_int64_array(indices):
+                    return False
+            return True
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return False
+
+    def strict_bundle_path(self) -> Path:
+        return self.config.output_root / "manifests" / "FINAL_STRICT_SCORE_BUNDLE.json"
+
+    def write_strict_score_bundle(self, strict_indices: Mapping[str, np.ndarray], sealed_paths: Mapping[str, Path]) -> Path:
+        lock_sha = sha256_file(self.lock_paths()[0]); fit_sha = sha256_file(self.fit_path())
+        partitions: Dict[str, Any] = {}
+        for partition in STRICT_PARTITIONS:
+            indices = np.asarray(strict_indices[partition], dtype=np.int64)
+            store = self.score_store(partition)
+            if not self.score_store_current(partition, len(indices), fit_sha, indices, strict=True, expected_lock_sha=lock_sha):
+                raise ScientificAbort(f"Cannot freeze stale strict score store: {partition}")
+            names = ("scores.npy", "predictions.npy", "global_indices.npy", "store_manifest.json")
+            partitions[partition] = {
+                "partition": partition, "rows": len(indices), "sealed_index_path": str(sealed_paths[partition].resolve()),
+                "sealed_index_sha256": sha256_file(sealed_paths[partition]),
+                "global_indices_sha256": sha256_file(store / "global_indices.npy"),
+                "global_index_values_sha256": sha256_int64_array(indices),
+                "scores_sha256": sha256_file(store / "scores.npy"),
+                "predictions_sha256": sha256_file(store / "predictions.npy"),
+                "store_manifest_sha256": sha256_file(store / "store_manifest.json"),
+                "teacher_sha256": EXPECTED_TEACHER_SHA256, "fit_sha256": fit_sha,
+                "configuration_sha256": self.config.configuration_sha256(), "executable_sha256": self.script_sha,
+                "evaluation_lock_sha256": lock_sha,
+                "files": {name: self._file_evidence(store / name) for name in names},
+            }
+        payload: Dict[str, Any] = {
+            "status": "FROZEN_AFTER_STAGE08_EXTRACTION", "pipeline_version": PIPELINE_VERSION,
+            "benchmark_sha256": EXPECTED_BENCHMARK_SHA256, "teacher_sha256": EXPECTED_TEACHER_SHA256,
+            "scorer_fit_sha256": fit_sha, "scorer_definitions_sha256": sha256_object(SCORER_DEFINITIONS),
+            "configuration_sha256": self.config.configuration_sha256(), "executable_sha256": self.script_sha,
+            "evaluation_lock_sha256": lock_sha, "strict_labels_included": False,
+            "partitions": partitions, "generated_at": utc_now(),
+        }
+        canonical = dict(payload); canonical.pop("generated_at")
+        payload["canonical_content_sha256"] = sha256_object(canonical)
+        output = self.strict_bundle_path(); atomic_json(output, payload, self.config.output_root)
+        if not self.strict_score_bundle_current(sha256_file(output)):
+            raise ScientificAbort("Final strict-score bundle failed immediate verification")
+        return output
+
+    def strict_score_bundle_current(self, expected_sha: Optional[str] = None) -> bool:
+        path = self.strict_bundle_path()
+        if not path.is_file() or (expected_sha is not None and sha256_file(path) != expected_sha) or not self.lock_current():
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8")); lock_sha = sha256_file(self.lock_paths()[0]); fit_sha = sha256_file(self.fit_path())
+            expected = {
+                "status": "FROZEN_AFTER_STAGE08_EXTRACTION", "pipeline_version": PIPELINE_VERSION,
+                "benchmark_sha256": EXPECTED_BENCHMARK_SHA256, "teacher_sha256": EXPECTED_TEACHER_SHA256,
+                "scorer_fit_sha256": fit_sha, "scorer_definitions_sha256": sha256_object(SCORER_DEFINITIONS),
+                "configuration_sha256": self.config.configuration_sha256(), "executable_sha256": self.script_sha,
+                "evaluation_lock_sha256": lock_sha, "strict_labels_included": False,
+            }
+            if any(payload.get(key) != value for key, value in expected.items()) or set(payload.get("partitions", {})) != set(STRICT_PARTITIONS):
+                return False
+            canonical = dict(payload); canonical.pop("canonical_content_sha256", None); canonical.pop("generated_at", None)
+            if payload.get("canonical_content_sha256") != sha256_object(canonical):
+                return False
+            for partition, record in payload["partitions"].items():
+                sealed = Path(record["sealed_index_path"])
+                if not sealed.is_file() or sha256_file(sealed) != record.get("sealed_index_sha256"):
+                    return False
+                files = record.get("files", {}); required = {"scores.npy", "predictions.npy", "global_indices.npy", "store_manifest.json"}
+                if set(files) != required:
+                    return False
+                for evidence in files.values():
+                    artifact = Path(evidence["path"])
+                    if not artifact.is_file() or artifact.stat().st_size != int(evidence["bytes"]) or sha256_file(artifact) != evidence["sha256"]:
+                        return False
+                indices = np.asarray(np.load(Path(files["global_indices.npy"]["path"]), mmap_mode="r"), dtype=np.int64)
+                if len(indices) != int(record.get("rows", -1)) or record.get("global_index_values_sha256") != sha256_int64_array(indices):
+                    return False
+                if any(record.get(key) != files[name]["sha256"] for key, name in {
+                    "global_indices_sha256": "global_indices.npy", "scores_sha256": "scores.npy",
+                    "predictions_sha256": "predictions.npy", "store_manifest_sha256": "store_manifest.json",
+                }.items()):
+                    return False
+                if record.get("teacher_sha256") != EXPECTED_TEACHER_SHA256 or record.get("fit_sha256") != fit_sha or record.get("configuration_sha256") != self.config.configuration_sha256() or record.get("executable_sha256") != self.script_sha or record.get("evaluation_lock_sha256") != lock_sha:
+                    return False
+            return True
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return False
+
     def lock_paths(self) -> Tuple[Path, Path]:
         return (
             self.config.output_root / "manifests" / "STRICT_ZERO_DAY_EVALUATION_LOCK.json",
@@ -880,20 +1226,47 @@ class Stage35Pipeline:
             return False
         try:
             payload = json.loads(lock.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            required = {
+                "teacher_sha256": EXPECTED_TEACHER_SHA256,
+                "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+                "stage2_6m_artifact_sha256": EXPECTED_STAGE26_ARTIFACT_SHA256,
+                "stage3m_hash_manifest_sha256": EXPECTED_STAGE3M_HASH_MANIFEST_SHA256,
+                "executable_sha256": self.script_sha,
+                "configuration_sha256": self.config.configuration_sha256(),
+                "canonical_scorer": CANONICAL_SCORER_POLICY,
+                "canonical_threshold_policy": CANONICAL_THRESHOLD_POLICY,
+                "scorer_definitions": SCORER_DEFINITIONS,
+            }
+            if any(payload.get(key) != value for key, value in required.items()):
+                return False
+            counters = payload.get("strict_violation_counters_at_lock")
+            if not isinstance(counters, dict) or set(counters) != set(STRICT_COUNTER_KEYS) or any(counters[key] != 0 for key in STRICT_COUNTER_KEYS):
+                return False
+            if payload.get("post_lock_fitting_permitted") is not False or payload.get("post_lock_calibration_permitted") is not False:
+                return False
+            fit = self.fit_path()
+            thresholds = self.config.output_root / "thresholds" / "ZD_STRICT_THRESHOLDS.json"
+            policy = self.config.output_root / "manifests" / "SCORER_POLICY_FREEZE.json"
+            known_bundle = self.known_bundle_path()
+            equivalence = self.inference_equivalence_path()
+            declaration = self.config.output_root / "manifests" / "STAGE02_TEACHER_PARTITION_EXPOSURE_AUDIT.json"
+            bound = {
+                "scorer_fit_sha256": fit,
+                "threshold_manifest_sha256": thresholds,
+                "policy_freeze_sha256": policy,
+                "known_score_bundle_sha256": known_bundle,
+                "stage3m_stage35_inference_equivalence_sha256": equivalence,
+                "sealed_strict_declaration_sha256": declaration,
+            }
+            if any(not path.is_file() or payload.get(field) != sha256_file(path) for field, path in bound.items()):
+                return False
+            if not self.known_score_bundle_current(payload["known_score_bundle_sha256"]):
+                return False
+            if not self.inference_equivalence_current(payload["stage3m_stage35_inference_equivalence_sha256"]):
+                return False
+            return True
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             return False
-        required = {
-            "teacher_sha256": EXPECTED_TEACHER_SHA256,
-            "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
-            "stage2_6m_artifact_sha256": EXPECTED_STAGE26_ARTIFACT_SHA256,
-            "stage3m_hash_manifest_sha256": EXPECTED_STAGE3M_HASH_MANIFEST_SHA256,
-            "executable_sha256": self.script_sha,
-            "configuration_sha256": self.config.configuration_sha256(),
-            "canonical_scorer": CANONICAL_SCORER_POLICY,
-            "canonical_threshold_policy": CANONICAL_THRESHOLD_POLICY,
-            "scorer_definitions": SCORER_DEFINITIONS,
-        }
-        return all(payload.get(key) == value for key, value in required.items()) and not any(payload.get("strict_violation_counters_at_lock", {}).values())
 
     def write_or_verify_lock(self) -> str:
         lock, sidecar = self.lock_paths()
@@ -905,6 +1278,13 @@ class Stage35Pipeline:
         policy = self.config.output_root / "manifests" / "SCORER_POLICY_FREEZE.json"
         thresholds = self.config.output_root / "thresholds" / "ZD_STRICT_THRESHOLDS.json"
         fit = self.fit_path()
+        known_bundle = self.known_bundle_path()
+        equivalence = self.inference_equivalence_path()
+        declaration = self.config.output_root / "manifests" / "STAGE02_TEACHER_PARTITION_EXPOSURE_AUDIT.json"
+        if not self.known_score_bundle_current(sha256_file(known_bundle)):
+            raise ScientificAbort("Known-score bundle is not current before strict lock")
+        if not self.inference_equivalence_current(sha256_file(equivalence)):
+            raise ScientificAbort("Stage 3M to Stage 3.5M inference equivalence is not current before strict lock")
         payload = {
             "lock_version": "1.0", "created_at": utc_now(), "stage": 8,
             "teacher_sha256": EXPECTED_TEACHER_SHA256, "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
@@ -915,6 +1295,9 @@ class Stage35Pipeline:
             "canonical_threshold_policy": CANONICAL_THRESHOLD_POLICY,
             "scorer_fit_sha256": sha256_file(fit), "threshold_manifest_sha256": sha256_file(thresholds),
             "policy_freeze_sha256": sha256_file(policy), "strict_violation_counters_at_lock": self.guard.counters(),
+            "known_score_bundle_sha256": sha256_file(known_bundle),
+            "stage3m_stage35_inference_equivalence_sha256": sha256_file(equivalence),
+            "sealed_strict_declaration_sha256": sha256_file(declaration),
             "post_lock_fitting_permitted": False, "post_lock_calibration_permitted": False,
         }
         atomic_json(lock, payload, self.config.output_root)
@@ -943,7 +1326,8 @@ class Stage35Pipeline:
         self.guard.authorize_strict("signal", 8, self.lock_current())
         model, fit, fit_sha = self.ensure_teacher(), self.load_fit(), sha256_file(self.fit_path())
         rows, store = len(indices), self.score_store(partition)
-        if self.score_store_current(partition, rows, fit_sha, strict=True):
+        expected_lock_sha = sha256_file(self.lock_paths()[0])
+        if self.score_store_current(partition, rows, fit_sha, indices, strict=True, expected_lock_sha=expected_lock_sha):
             return store
         store.mkdir(parents=True, exist_ok=True)
         atomic_text(store / "INCOMPLETE", utc_now() + "\n", self.config.output_root)
@@ -966,10 +1350,14 @@ class Stage35Pipeline:
         np.save(store / "global_indices.npy", indices.astype(np.int64), allow_pickle=False)
         store_files = ("scores.npy", "predictions.npy", "global_indices.npy")
         atomic_json(store / "store_manifest.json", {
-            "complete": True, "partition": partition, "rows": rows, "strict": True,
-            "teacher_sha256": EXPECTED_TEACHER_SHA256, "fit_sha256": fit_sha, "scorer_order": list(SCORER_ORDER),
+            "complete": True, "pipeline_version": PIPELINE_VERSION, "executable_sha256": self.script_sha,
+            "configuration_sha256": self.config.configuration_sha256(), "benchmark_sha256": EXPECTED_BENCHMARK_SHA256,
+            "partition": partition, "rows": rows, "strict": True, "teacher_sha256": EXPECTED_TEACHER_SHA256,
+            "fit_sha256": fit_sha, "scorer_order": list(SCORER_ORDER),
+            "scorer_definitions_sha256": sha256_object(SCORER_DEFINITIONS), "energy_temperature": self.config.energy_temperature,
+            "global_indices_sha256": sha256_int64_array(indices),
             "semantic_target": "UNKNOWN_BY_FROZEN_STRICT_PARTITION_MEMBERSHIP", "strict_labels_loaded": False,
-            "evaluation_lock_sha256": sha256_file(self.lock_paths()[0]), "generated_at": utc_now(),
+            "evaluation_lock_sha256": expected_lock_sha, "generated_at": utc_now(),
             "files": {name: {"sha256": sha256_file(store / name), "bytes": (store / name).stat().st_size} for name in store_files},
         }, self.config.output_root)
         (store / "INCOMPLETE").unlink()
@@ -1084,7 +1472,8 @@ class Stage35Pipeline:
         atomic_csv(table, pd.DataFrame(rows), self.config.output_root); atomic_csv(closed_table, pd.DataFrame(closed_rows), self.config.output_root); outputs.extend((table, closed_table))
         if state_tensor_sha256(self.ensure_teacher().state_dict()) != teacher_before:
             raise ScientificAbort("Teacher weights changed during known-validation scoring")
-        self.complete_stage(4, "Known-Validation Score Characterization", outputs, [self.fit_path()])
+        equivalence, equivalence_inputs = self.write_inference_equivalence(); outputs.append(equivalence)
+        self.complete_stage(4, "Known-Validation Score Characterization and Stage-3M Equivalence", outputs, [self.fit_path(), *equivalence_inputs])
 
     def stage_05(self) -> None:
         self.assert_prelock_mutation_allowed(); self.guard.assert_fitting_allowed()
@@ -1155,9 +1544,12 @@ class Stage35Pipeline:
         }
         payload["policy_sha256"] = sha256_object(payload)
         atomic_json(output, payload, self.config.output_root)
+        if not self.inference_equivalence_current():
+            raise ScientificAbort("Stage 3M to Stage 3.5M inference equivalence gate is not PASS")
+        known_bundle = self.write_known_score_bundle()
         report = self.config.output_root / "reports" / "PRE_STRICT_POLICY_FREEZE.md"
-        atomic_text(report, "# Pre-strict policy freeze\n\nAll five deterministic scorers are frozen and will be reported. Each scorer uses its own P0-P3-known-only 95% acceptance threshold. Calibration Unknown and strict zero-day data did not select scorers or thresholds. No teacher fitting or unknown training class exists.\n", self.config.output_root)
-        self.complete_stage(7, "Scorer and Policy Freeze", [output, report], [fit, thresholds])
+        atomic_text(report, "# Pre-strict policy freeze\n\nAll five deterministic scorers are frozen and will be reported. Each scorer uses its own P0-P3-known-only 95% acceptance threshold. Calibration Unknown and strict zero-day data did not select scorers or thresholds. The complete known-score bundle and Stage 3M inference-equivalence gate are cryptographically frozen. No teacher fitting or unknown training class exists.\n", self.config.output_root)
+        self.complete_stage(7, "Scorer, Policy, and Known-Score Bundle Freeze", [output, known_bundle, report], [fit, thresholds, self.inference_equivalence_path()])
 
     def stage_08(self) -> None:
         lock_sha = self.write_or_verify_lock()
@@ -1168,6 +1560,7 @@ class Stage35Pipeline:
         benchmark = self.ensure_benchmark()
         authorized_non_strict = np.concatenate([metadata.indices for metadata in benchmark.partitions.values()])
         strict_indices: Dict[str, np.ndarray] = {}
+        sealed_paths: Dict[str, Path] = {}
         strict_inputs: List[Path] = []
         for partition, details in evidence.items():
             self.guard.authorize_strict("signal", 8, self.lock_current())
@@ -1181,6 +1574,7 @@ class Stage35Pipeline:
             if np.intersect1d(values, authorized_non_strict).size:
                 raise ScientificAbort(f"Strict partition overlaps a non-strict partition: {partition}")
             strict_indices[partition] = values
+            sealed_paths[partition] = path
             self.extract_strict_scores(partition, values)
         if np.intersect1d(strict_indices["strict_zero_day_test"], strict_indices["strict_zero_day_shift_test"]).size:
             raise ScientificAbort("Strict main and strict shift partitions overlap")
@@ -1206,15 +1600,21 @@ class Stage35Pipeline:
             "teacher_state_immutable": state_tensor_sha256(self.ensure_teacher().state_dict()) == self.teacher_state_sha,
             "strict_violation_counters": self.guard.counters(), "generated_at": utc_now(),
         }, self.config.output_root)
-        outputs = [table, audit, *self.lock_paths()]
+        strict_bundle = self.write_strict_score_bundle(strict_indices, sealed_paths)
+        outputs = [table, audit, strict_bundle, *self.lock_paths()]
         for partition in STRICT_PARTITIONS:
             outputs.extend(self.score_store(partition) / name for name in ("scores.npy", "predictions.npy", "global_indices.npy", "store_manifest.json"))
         self.guard.assert_zero()
-        self.complete_stage(8, "Final Locked Strict Zero-Day Evaluation", outputs, [self.config.output_root / "manifests" / "SCORER_POLICY_FREEZE.json", threshold_path, *strict_inputs])
+        self.complete_stage(8, "Final Locked Strict Zero-Day Evaluation", outputs, [
+            self.config.output_root / "manifests" / "SCORER_POLICY_FREEZE.json", threshold_path,
+            self.known_bundle_path(), self.inference_equivalence_path(), self.lock_paths()[0], *strict_inputs,
+        ])
 
     def stage_09(self) -> None:
         if not self.lock_current():
             raise ScientificAbort("Stage 09 requires a current final evaluation lock")
+        if not self.known_score_bundle_current() or not self.strict_score_bundle_current():
+            raise ScientificAbort("Stage 09 score provenance bundle is stale")
         self.guard.activate_final_lock(9, True); self.guard.authorize_strict("metric", 9, True)
         known_scores = np.concatenate([np.load(self.score_store(partition) / "scores.npy", mmap_mode="r") for partition in KNOWN_VALIDATION], axis=0)
         known_correct = np.concatenate([np.load(self.score_store(partition) / "known_correct.npy", mmap_mode="r") for partition in KNOWN_VALIDATION]).astype(bool)
@@ -1238,11 +1638,17 @@ class Stage35Pipeline:
         output = self.config.output_root / "statistics" / "strict_bootstrap_confidence_intervals.csv"
         atomic_csv(output, pd.DataFrame(rows), self.config.output_root)
         self.guard.assert_zero()
-        self.complete_stage(9, "Statistical and OSCR Analysis", [output], [self.config.output_root / "tables" / "strict_open_set_metrics.csv", self.lock_paths()[0]])
+        strict_manifests = [self.score_store(partition) / "store_manifest.json" for partition in STRICT_PARTITIONS]
+        self.complete_stage(9, "Statistical and OSCR Analysis", [output], [
+            self.config.output_root / "tables" / "strict_open_set_metrics.csv", self.lock_paths()[0],
+            self.known_bundle_path(), self.strict_bundle_path(), *strict_manifests,
+        ])
 
     def stage_10(self) -> None:
         if not self.lock_current():
             raise ScientificAbort("Publication requires a current strict evaluation lock")
+        if not self.known_score_bundle_current() or not self.strict_score_bundle_current():
+            raise ScientificAbort("Publication score provenance bundle is stale")
         metrics = pd.read_csv(self.config.output_root / "tables" / "strict_open_set_metrics.csv")
         confidence = pd.read_csv(self.config.output_root / "statistics" / "strict_bootstrap_confidence_intervals.csv")
         known = pd.read_csv(self.config.output_root / "tables" / "known_validation_score_characterization.csv")
@@ -1296,7 +1702,12 @@ class Stage35Pipeline:
                     image = plt.imread(path); fig, ax = plt.subplots(figsize=(8.27, 11.69)); ax.imshow(image); ax.axis("off"); document.savefig(fig, bbox_inches="tight"); plt.close(fig)
         figure_manifest = self.config.output_root / "publication" / "FIGURE_MANIFEST.json"
         atomic_json(figure_manifest, {"figures": [{"path": str(path), "sha256": sha256_file(path)} for path in figures], "measured_inputs_only": True}, self.config.output_root)
-        self.complete_stage(10, "Publication Outputs", [report, workbook, pdf, figure_manifest, separation_path, *figures], [self.config.output_root / "tables" / "strict_open_set_metrics.csv", self.config.output_root / "statistics" / "strict_bootstrap_confidence_intervals.csv", self.config.output_root / "tables" / "closed_set_teacher_metrics.csv"])
+        self.complete_stage(10, "Publication Outputs", [report, workbook, pdf, figure_manifest, separation_path, *figures], [
+            self.config.output_root / "tables" / "strict_open_set_metrics.csv",
+            self.config.output_root / "statistics" / "strict_bootstrap_confidence_intervals.csv",
+            self.config.output_root / "tables" / "closed_set_teacher_metrics.csv",
+            self.known_bundle_path(), self.strict_bundle_path(), self.lock_paths()[0],
+        ])
 
     def stage_11(self) -> None:
         ready = self.config.output_root / "MANYTX_STAGE3_5M_READY.txt"; not_ready = self.config.output_root / "MANYTX_STAGE3_5M_NOT_READY.txt"
@@ -1315,6 +1726,9 @@ class Stage35Pipeline:
             "teacher_immutable": True, "no_teacher_training": True, "no_unknown_training_class": True,
             "all_five_scorers_reported": set(metrics.scorer) == set(SCORER_ORDER),
             "strict_thresholds_known_only": True, "scorer_policy_frozen_before_strict": True,
+            "known_score_bundle_current": self.known_score_bundle_current(),
+            "strict_score_bundle_current": self.strict_score_bundle_current(),
+            "stage3m_stage35_inference_equivalence": self.inference_equivalence_current(),
             "final_evaluation_lock_current": True, "strict_evaluation_complete": set(STRICT_PARTITIONS) <= set(metrics.strict_partition),
             "strict_violation_counters_zero": not any(self.guard.counters().values()),
             "surrogate_training_not_performed": True, "xai_not_performed": True,

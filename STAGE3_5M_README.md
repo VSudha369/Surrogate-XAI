@@ -2,7 +2,7 @@
 
 This package implements post-hoc open-set scoring under the scientifically frozen Stage 3M A3 seed-123 teacher. It does not retrain or modify the teacher and does not add an unknown training class.
 
-Five deterministic scorers are compared: MSP, energy, normalized-prototype cosine distance, regularized Mahalanobis distance, and diagonal-Gaussian embedding NLL. Train Known fits embedding statistics; P0-P3 Known Validation freezes strict thresholds. Calibration Unknown is optional and isolated as `ZD-CALIBRATED`. Strict data is inaccessible until the Stage-08 evaluation lock is written and verified.
+Five deterministic scorers are compared: MSP, energy, normalized-prototype cosine distance, regularized Mahalanobis distance, and diagonal-Gaussian embedding NLL. Train Known fits embedding statistics; P0-P3 Known Validation freezes strict thresholds. Before strict access, the pipeline verifies Stage 3M→Stage 3.5M known-inference equivalence and freezes a recursively hash-bound P0-P3 score bundle. Calibration Unknown is optional and isolated as `ZD-CALIBRATED`. Strict data is inaccessible until the Stage-08 evaluation lock is written and verified; Stage 08 then creates a separate lock- and sealed-index-bound strict score bundle required by all later stages.
 
 ## Colab sequence
 
