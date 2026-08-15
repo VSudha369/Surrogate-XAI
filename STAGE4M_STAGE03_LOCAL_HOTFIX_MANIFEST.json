@@ -1,0 +1,39 @@
+{
+  "algorithm": "SHA-256",
+  "canonical_training_performed_during_hotfix_development": false,
+  "files": [
+    {
+      "bytes": 8532,
+      "path": "Stage4M_Stage03_Local_Activation_Hotfix_v1_0_0.py",
+      "sha256": "18e6307485deab52da038d57a28e99db4647bec87dd18d3687a1dad7f2a32876"
+    },
+    {
+      "bytes": 4742,
+      "path": "Stage4M_Colab_Stage03_Local_Hotfix_Launcher_v1_0_0.py",
+      "sha256": "b72d0b0ef2ad83dde37ca23cadb16a4cbe498673e9e23886c6867f24a5351522"
+    },
+    {
+      "bytes": 4483,
+      "path": "validate_stage4m_stage03_local_hotfix_v1_0_0.py",
+      "sha256": "c7ceb3da25dbaf87eeb96058e1def68848bad69ae8de3a1b7a16c09fadc6cd26"
+    },
+    {
+      "bytes": 2492,
+      "path": "Stage4M_Live_Drive_Monitor_v1_0_0.py",
+      "sha256": "b6b8280b45c753efe310b9538a4b0df47bf255ef78922c04fd7a81e14d96743b"
+    },
+    {
+      "bytes": 1683,
+      "path": "STAGE4M_STAGE03_LOCAL_HOTFIX_README.md",
+      "sha256": "cab404c63d92944f3b7cdbf5213b5e08e6bbf194cb4fa2383755b7d3b54e7c59"
+    }
+  ],
+  "parent_commit": "d301b88404fe99bf6efd531cedd45e28eecf8f4d",
+  "purpose": "Activate verified local shards before Stage 03 signal consumption and bind disposable teacher caches to local-shard provenance.",
+  "runtime_hotfix_version": "1.0.0",
+  "scientific_configuration_sha256": "78a6437a153f3a764fd3255bd6625bb350e24643611434deca60bbed9a566a80",
+  "scientific_design_changed": false,
+  "validated_base_executable": "Stage4M_WiSig_ManyTx_Surrogate_KD_v1_0_0.py",
+  "validated_base_executable_sha256": "9f1889f2cd5efa2d38776f7524c52ce6989379c7717501ae9a9239949f8550d0",
+  "validated_base_validator_sha256": "d118737c91a45c1159f8cc5f1337ea5b37d994e6df5c2d03330ae6d3ecb71bf6"
+}
