@@ -13,6 +13,6 @@
   "prefetch_factor": 2,
   "pin_memory": true,
   "persistent_workers": true,
-  "local_cache_root": "/content/wisig_stage4m_cache",
+  "local_cache_root": "/content/wisig_stage4m_local_v1_0_0",
   "seeds": [42, 123, 2026]
 }
